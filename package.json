@@ -1,0 +1,18 @@
+{
+  "name": "agent-harness-experiment",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Parallel native-adapter and owned-harness JOSH/ALLEN prototypes",
+  "scripts": {
+    "setup": "bash tools/prototypes.sh setup",
+    "test": "bash tools/prototypes.sh test",
+    "typecheck": "bash tools/prototypes.sh typecheck",
+    "verify": "npm run typecheck && npm test",
+    "native": "bash tools/prototypes.sh native start",
+    "owned": "bash tools/prototypes.sh owned start",
+    "native:demo": "bash tools/prototypes.sh native demo",
+    "owned:demo": "bash tools/prototypes.sh owned demo",
+    "native:live": "bash tools/prototypes.sh native live",
+    "owned:live": "bash tools/prototypes.sh owned live"
+  }
+}
