@@ -71,7 +71,12 @@ export class CodexClient extends EventEmitter {
           reject(e);
         },
       });
-      this.send({ id, method, params });
+      try {
+        this.send({ id, method, params });
+      } catch (error) {
+        this.pending.get(id).reject(error);
+        this.pending.delete(id);
+      }
     });
   }
   fail(e) {
@@ -263,23 +268,40 @@ export class CodexClient extends EventEmitter {
     return value;
   }
   async close() {
-    if (this.closed) return;
+    if (this.closed) return this.closing;
     this.closed = true;
-    await Promise.all([...this.threads.keys()].map((id) => this.interrupt(id)));
-    this.child?.stdin.end();
-    const child = this.child;
-    if (child && child.exitCode === null) {
-      await new Promise((resolve) => {
-        const timer = setTimeout(() => {
-          child.kill("SIGTERM");
-          resolve();
-        }, 1000);
-        child.once("exit", () => {
-          clearTimeout(timer);
-          resolve();
+    this.closing = (async () => {
+      let deadline;
+      try {
+        await Promise.race([
+          Promise.all([...this.threads.keys()].map((id) => this.interrupt(id))),
+          new Promise((resolve) => {
+            deadline = setTimeout(resolve, 1000);
+          }),
+        ]);
+      } finally {
+        clearTimeout(deadline);
+      }
+      this.fail(Error("Codex client closed"));
+      this.child?.stdin.end();
+      const child = this.child;
+      if (child && child.exitCode === null) {
+        await new Promise((resolve) => {
+          let escalation;
+          const timer = setTimeout(() => {
+            child.kill("SIGTERM");
+            escalation = setTimeout(() => {
+              child.kill("SIGKILL");
+            }, 300);
+          }, 1000);
+          child.once("exit", () => {
+            clearTimeout(timer);
+            clearTimeout(escalation);
+            resolve();
+          });
         });
-      });
-    }
-    this.fail(Error("Codex client closed"));
+      }
+    })();
+    return this.closing;
   }
 }

@@ -17,6 +17,13 @@ let active = null,
   useModel = false,
   busy = false;
 const controller = new AbortController();
+controller.signal.addEventListener(
+  "abort",
+  () => {
+    void client?.close();
+  },
+  { once: true },
+);
 const runProgram = async (program = source, input = fixture, sessionId) => {
   if (active) throw Error("Only one execution per native adapter invocation");
   active = new JoshRun({
@@ -93,15 +100,18 @@ async function launch(
     throw Error(
       "This prototype permits one run per CLI process; restart to run again",
     );
+  controller.signal.throwIfAborted();
   busy = true;
   useModel = liveMode;
   if (!liveMode) {
     log(await runProgram());
     return;
   }
-  client = await new CodexClient().open();
+  client = new CodexClient();
   client.on("trace", log);
   try {
+    await client.open();
+    controller.signal.throwIfAborted();
     const threadId = await client.thread({
       instructions:
         'You are the existing Codex harness in a native ALLEN integration experiment. Use allen_run exactly once to execute the requested review. Select fixture "review" for the synthetic review or supply exact source and input if the user requests a custom ALLEN program. Do not implement the workflow yourself. After it returns summarize its typed outcome briefly. Do not call any other tools.',
