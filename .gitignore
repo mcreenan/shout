@@ -1,11 +1,29 @@
-.cache/
-.worktrees/
+# Dependencies and build output
 node_modules/
 dist/
 target/
+coverage/
+*.tsbuildinfo
+
+# Local runtime state, dependency builds, and parallel worktrees
+.cache/
+.worktrees/
+.scratch/
+.runs/
+tmp/
+temp/
+
+# Local environment and credentials
 .env
 .env.*
 !.env.example
-.runs/
+
+# Logs, interpreter caches, and editor/OS temporary files
 *.log
 __pycache__/
+*.py[cod]
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~

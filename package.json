@@ -1,8 +1,8 @@
 {
-  "name": "agent-harness-experiment",
+  "name": "shout",
   "private": true,
   "version": "0.0.0",
-  "description": "Parallel native-adapter and owned-harness JOSH/ALLEN prototypes",
+  "description": "SHOUT: agent harness and runtime experiments built on JOSH/ALLEN",
   "scripts": {
     "setup": "bash tools/prototypes.sh setup",
     "test": "bash tools/prototypes.sh test && node tools/interactive-smoke.mjs",

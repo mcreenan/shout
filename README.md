@@ -1,4 +1,6 @@
-# JOSH/ALLEN harness experiments
+# SHOUT
+
+SHOUT explores a unified agent harness and programming runtime, building on the earlier JOSH/ALLEN research.
 
 Two working prototypes explore the same principle: deterministic code handles orchestration; models make judgments. Both use the existing, pinned JOSH/ALLEN compiler and VM.
 
@@ -14,6 +16,8 @@ Both completed actual model-backed runs. The integrated verification passes 26 a
 Requirements: Linux with Bash, Git, `flock`, a Rust/Cargo toolchain, and Node 22+ with npm. Initial setup downloads the pinned upstream runtime and npm dependencies. Live runs additionally require **Codex CLI 0.153.3**, signed in through its normal login. Offline runs need no model credentials.
 
 ```sh
+git clone https://github.com/mcreenan/shout.git
+cd shout
 npm run setup
 npm run verify
 
