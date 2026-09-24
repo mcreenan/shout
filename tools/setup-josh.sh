@@ -16,7 +16,9 @@ fi
 if ! git -C "$source_dir" cat-file -e "$revision^{commit}" 2>/dev/null; then
   git -C "$source_dir" fetch origin "$revision" >&2
 fi
-git -C "$source_dir" checkout --detach "$revision" >&2
+if [ "$(git -C "$source_dir" rev-parse HEAD)" != "$revision" ]; then
+  git -C "$source_dir" checkout --detach "$revision" >&2
+fi
 if [ ! -x "$target_dir/debug/josh" ] || [ ! -x "$target_dir/debug/allen" ] || [ "$(cat "$cache_root/built-revision" 2>/dev/null || true)" != "$revision" ]; then
   CARGO_TARGET_DIR="$target_dir" cargo build --locked --manifest-path "$source_dir/Cargo.toml" -p josh -p allen-cli >&2
   printf '%s\n' "$revision" > "$cache_root/built-revision"
