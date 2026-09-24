@@ -1,0 +1,16 @@
+{
+  "name": "allen-native-adapter-prototype",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "demo": "node src/cli.mjs --fixture",
+    "live": "node src/cli.mjs --live --fixture",
+    "start": "node src/cli.mjs",
+    "typecheck": "node --check src/josh.mjs && node --check src/codex.mjs && node --check src/cli.mjs"
+  }
+}

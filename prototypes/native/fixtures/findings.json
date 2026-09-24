@@ -1,0 +1,1 @@
+{"findings":[{"file":"auth.ts","severity":3,"evidence":"Authorization guard removed before private account lookup."},{"file":"format.ts","severity":1,"evidence":"Whitespace changed."},{"file":"queue.ts","severity":2,"evidence":"Retry loop no longer has an attempt limit."}]}

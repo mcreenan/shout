@@ -1,0 +1,36 @@
+manifest {
+  language: "0.1"
+  entry: main
+  capabilities: [model.request, user.ask]
+  tools: { required: [{ name: "review.save", version: ">=1.0.0, <2.0.0" }] }
+}
+record Finding { file: String severity: Int evidence: String }
+record Input { findings: List<Finding> }
+record Judgment { recommend: Bool reason: String }
+record Final { candidate_count: Int recommend: Bool approved: Bool reason: String receipt: String }
+export async fn main(input: Input) returns Final effects [model.request, user.ask, tool.review.save@1] {
+  let candidates = list.filter(input.findings, fn(item: Finding) returns Bool { item.severity >= 2 });
+  let decision = match await model.request<Judgment>(prompt {
+    system: "Review these synthetic code findings. Recommend whether they merit human review, based on the evidence. Give a concise reason. The list was deterministically filtered to severity >= 2."
+    data: candidates
+    output: Judgment
+    policy: { max_attempts: 1 }
+  }) {
+    Ok(value) => value
+    Err(_) => fail("Model judgment unavailable or invalid")
+  };
+  let receipt = match await tools.review.save.call({ count: length(candidates), recommend: decision.recommend }) {
+    Ok(value) => value.receipt
+    Err(_) => fail("Review record tool failed")
+  };
+  let approved = match await user.ask<Bool>(prompt {
+    system: "Approve this synthetic review result? This does not deploy or mutate external services."
+    data: decision
+    output: Bool
+    policy: { max_attempts: 1 }
+  }) {
+    Ok(value) => value
+    Err(_) => fail("User answer unavailable or invalid")
+  };
+  Final { candidate_count: length(candidates), recommend: decision.recommend, approved: approved, reason: decision.reason, receipt: receipt }
+}
