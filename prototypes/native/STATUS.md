@@ -1,6 +1,6 @@
 Native adapter working: real pinned ALLEN runtime + Codex 0.153.3 dynamic tool + nested real Codex model judgment + deterministic tool + correlated user answer + typed parent return.
 
-Completed: reusable bounded source/input runner, interactive CLI, fixture/live demos, 8 real-VM lifecycle acceptance tests, budgets and cancellation, visible trace/counters, docs and protocol findings. Final formatting and verification in progress.
+Completed: reusable bounded source/input runner, interactive CLI, fixture/live demos, 8 real-VM lifecycle acceptance tests, budgets and cancellation, visible trace/counters, docs and protocol findings. Formatting, syntax checks, offline tests and a second successful live run completed. Root interactive smoke confirms answer/duplicate/cancel paths.
 
 Commands: npm ci; npm run typecheck; npm test; npm run demo; npm run live; npm start.
 

@@ -68,6 +68,7 @@ if (!auto) {
         controller.abort();
         void active?.cancel();
         rl.close();
+        process.stdin.destroy();
       } else if (cmd === "/run")
         void launch(false).catch((e) => log({ error: e.message }));
       else if (cmd === "/live")
