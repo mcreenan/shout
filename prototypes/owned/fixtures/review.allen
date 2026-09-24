@@ -1,0 +1,38 @@
+manifest {
+  language: "0.1"
+  entry: main
+  capabilities: [model.request, user.ask]
+  tools: { required: [{ name: "review_draft", version: ">=1.0.0, <2.0.0" }] }
+}
+record Ticket { id: String title: String open: Bool severity: Int }
+record ReviewInput { goal: String tickets: List<Ticket> }
+record Judgment { ticket_id: String reason: String }
+record Answer { accept: Bool }
+record ReviewResult { scanned: Int eligible: Int ticket_id: String reason: String draft: String accepted: Bool }
+
+export async fn main(input: ReviewInput) returns ReviewResult
+  effects [model.request, user.ask, tool.review_draft@1] {
+  let candidates = list.filter(input.tickets, fn(t: Ticket) returns Bool { t.open && t.severity >= 2 });
+  if (length(candidates) == 0) { stop("review.no_candidates") }
+  let judgment = match await model.request<Judgment>(prompt {
+    system: "Choose the one ticket most deserving prompt human attention. Return its exact ticket_id and a concise reason. Use only supplied candidate tickets."
+    context: input.goal
+    data: candidates
+    output: Judgment
+    policy: { max_attempts: 1 }
+  }) { Ok(value) => value Err(_) => stop("review.model_invalid_or_unavailable") };
+  let selected = list.filter(candidates, fn(t: Ticket) returns Bool { t.id == judgment.ticket_id });
+  if (length(selected) != 1) { stop("review.invalid_selection") }
+  let draft = match await tools.review_draft.call({ ticket_id: judgment.ticket_id, reason: judgment.reason }) {
+    Ok(value) => value.text
+    Err(_) => stop("review.tool_failed")
+  };
+  let answer = match await user.ask<Answer>(prompt {
+    system: "Accept this synthetic review recommendation? No external issue is changed."
+    data: { draft: draft }
+    output: Answer
+    policy: { max_attempts: 1 }
+  }) { Ok(value) => value Err(_) => stop("review.answer_failed") };
+  ReviewResult { scanned: length(input.tickets), eligible: length(candidates), ticket_id: judgment.ticket_id,
+    reason: judgment.reason, draft: draft, accepted: answer.accept }
+}

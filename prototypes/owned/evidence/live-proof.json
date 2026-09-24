@@ -1,0 +1,187 @@
+{
+  "verifiedAt": "2026-09-24T02:47:32Z",
+  "joshRevision": "abb8a9782fc438d1b87e8aa2fdaea65e5db633c3",
+  "codexVersion": "0.153.3",
+  "humanAnswer": "scripted-fixture (not real user approval)",
+  "direct": {
+    "result": {
+      "id": "run-e7d56e0a-71d4-4b18-a43d-730526b05ee1",
+      "state": "completed",
+      "counters": {
+        "modelJudgments": 1,
+        "nativeToolCalls": 1,
+        "userQuestions": 1,
+        "providerRequests": 3,
+        "automaticProviderReplies": 3,
+        "deterministicTransitions": 21,
+        "modelForwardingEnvelopes": 0
+      },
+      "pending": [],
+      "result": {
+        "outcome": "completed",
+        "output": {
+          "accepted": true,
+          "draft": "Review T-100: T-100 is the urgent operational issue because intermittent duplicate checkout charges are directly affecting several customers. Draft recommendation: prioritize immediate investigation and mitigation. Accept this recommendation?",
+          "eligible": 2,
+          "reason": "T-100 is the urgent operational issue because intermittent duplicate checkout charges are directly affecting several customers. Draft recommendation: prioritize immediate investigation and mitigation. Accept this recommendation?",
+          "scanned": 4,
+          "ticket_id": "T-100"
+        }
+      }
+    },
+    "workers": [
+      {
+        "sequence": 8,
+        "time": "2026-09-24T02:46:35.946Z",
+        "run": "run-e7d56e0a-71d4-4b18-a43d-730526b05ee1",
+        "type": "model.worker",
+        "provider": "codex-exec",
+        "version": "codex-cli 0.153.3",
+        "usage": {
+          "input_tokens": 421,
+          "cached_input_tokens": 0,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 55,
+          "reasoning_output_tokens": 0
+        },
+        "acceptedToolEvents": 0,
+        "profile": "restricted-no-tools-v1"
+      }
+    ],
+    "events": [
+      "run.started",
+      "program.loaded",
+      "vm.event",
+      "vm.event",
+      "vm.event",
+      "effect.requested",
+      "model.started",
+      "model.worker",
+      "model.completed",
+      "effect.resolved",
+      "vm.event",
+      "effect.requested",
+      "tool.completed",
+      "effect.resolved",
+      "vm.event",
+      "effect.requested",
+      "user.question",
+      "user.answered",
+      "effect.resolved",
+      "vm.event",
+      "run.terminal"
+    ]
+  },
+  "chat": {
+    "reply": {
+      "action": "reply",
+      "text": "I can explain the harness, answer status questions, or route supplied synthetic tickets through the registered review workflow when you explicitly ask. No review has been started."
+    },
+    "action": {
+      "action": "review",
+      "text": "I’ll route the supplied synthetic tickets to the registered review workflow.",
+      "run": "run-884a7312-2901-44e2-a534-9615f3f40ac4"
+    },
+    "result": {
+      "id": "run-884a7312-2901-44e2-a534-9615f3f40ac4",
+      "state": "completed",
+      "counters": {
+        "modelJudgments": 1,
+        "nativeToolCalls": 1,
+        "userQuestions": 1,
+        "providerRequests": 3,
+        "automaticProviderReplies": 3,
+        "deterministicTransitions": 21,
+        "modelForwardingEnvelopes": 0
+      },
+      "pending": [],
+      "result": {
+        "outcome": "completed",
+        "output": {
+          "accepted": true,
+          "draft": "Review T-100: Open checkout defect is double-charging several customers and has the higher severity.",
+          "eligible": 2,
+          "reason": "Open checkout defect is double-charging several customers and has the higher severity.",
+          "scanned": 4,
+          "ticket_id": "T-100"
+        }
+      }
+    },
+    "workers": [
+      {
+        "type": "chat.worker",
+        "provider": "codex-exec",
+        "version": "codex-cli 0.153.3",
+        "usage": {
+          "input_tokens": 465,
+          "cached_input_tokens": 0,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 51,
+          "reasoning_output_tokens": 0
+        },
+        "acceptedToolEvents": 0,
+        "profile": "restricted-no-tools-v1"
+      },
+      {
+        "type": "chat.worker",
+        "provider": "codex-exec",
+        "version": "codex-cli 0.153.3",
+        "usage": {
+          "input_tokens": 523,
+          "cached_input_tokens": 0,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 33,
+          "reasoning_output_tokens": 0
+        },
+        "acceptedToolEvents": 0,
+        "profile": "restricted-no-tools-v1"
+      },
+      {
+        "sequence": 8,
+        "time": "2026-09-24T02:47:31.154Z",
+        "run": "run-884a7312-2901-44e2-a534-9615f3f40ac4",
+        "type": "model.worker",
+        "provider": "codex-exec",
+        "version": "codex-cli 0.153.3",
+        "usage": {
+          "input_tokens": 413,
+          "cached_input_tokens": 0,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 37,
+          "reasoning_output_tokens": 0
+        },
+        "acceptedToolEvents": 0,
+        "profile": "restricted-no-tools-v1"
+      }
+    ],
+    "events": [
+      "chat.started",
+      "chat.worker",
+      "chat.reply",
+      "chat.started",
+      "chat.worker",
+      "chat.reply",
+      "run.started",
+      "program.loaded",
+      "vm.event",
+      "vm.event",
+      "vm.event",
+      "effect.requested",
+      "model.started",
+      "model.worker",
+      "model.completed",
+      "effect.resolved",
+      "vm.event",
+      "effect.requested",
+      "tool.completed",
+      "effect.resolved",
+      "vm.event",
+      "effect.requested",
+      "user.question",
+      "user.answered",
+      "effect.resolved",
+      "vm.event",
+      "run.terminal"
+    ]
+  }
+}
