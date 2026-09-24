@@ -1,0 +1,68 @@
+{
+  "verifiedAt": "2026-09-24T02:55:34.353Z",
+  "joshRevision": "abb8a9782fc438d1b87e8aa2fdaea65e5db633c3",
+  "codexVersion": "0.153.3",
+  "humanAnswers": "explicit scripted fixtures, not actual user approval",
+  "native": {
+    "outcome": {
+      "outcome": "completed",
+      "output": {
+        "approved": true,
+        "candidate_count": 2,
+        "reason": "The removed authorization guard risks unauthorized access to private accounts, and unlimited retries risk resource exhaustion. Both merit human review.",
+        "receipt": "review:2:true",
+        "recommend": true
+      }
+    },
+    "counters": {
+      "modelJudgments": 1,
+      "toolInvocations": 1,
+      "userQuestions": 1,
+      "deterministicDispatches": 3,
+      "modelForwardingEnvelopes": 0
+    },
+    "parentSummary": "ALLEN completed the synthetic review successfully.\n\n- **2 findings:** removed authorization guard and unlimited retries, risking unauthorized access and resource exhaustion.\n- **Human review recommended:** yes.\n- **Approved:** true.\n- **Receipt:** `review:2:true`",
+    "itemTypes": [
+      "userMessage",
+      "agentMessage",
+      "dynamicToolCall"
+    ]
+  },
+  "owned": {
+    "result": {
+      "outcome": "completed",
+      "output": {
+        "accepted": true,
+        "draft": "Review T-100: T-100 is the urgent operational issue because intermittent duplicate checkout charges are directly harming several customers and it has higher severity than the build delay. Accept this draft recommendation?",
+        "eligible": 2,
+        "reason": "T-100 is the urgent operational issue because intermittent duplicate checkout charges are directly harming several customers and it has higher severity than the build delay. Accept this draft recommendation?",
+        "scanned": 4,
+        "ticket_id": "T-100"
+      }
+    },
+    "counters": {
+      "modelJudgments": 1,
+      "nativeToolCalls": 1,
+      "userQuestions": 1,
+      "providerRequests": 3,
+      "automaticProviderReplies": 3,
+      "deterministicTransitions": 21,
+      "modelForwardingEnvelopes": 0
+    },
+    "workers": [
+      {
+        "provider": "codex-exec",
+        "version": "codex-cli 0.153.3",
+        "usage": {
+          "input_tokens": 421,
+          "cached_input_tokens": 0,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 56,
+          "reasoning_output_tokens": 0
+        },
+        "acceptedToolEvents": 0,
+        "profile": "restricted-no-tools-v1"
+      }
+    ]
+  }
+}
