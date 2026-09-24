@@ -5,7 +5,7 @@
   "description": "Parallel native-adapter and owned-harness JOSH/ALLEN prototypes",
   "scripts": {
     "setup": "bash tools/prototypes.sh setup",
-    "test": "bash tools/prototypes.sh test",
+    "test": "bash tools/prototypes.sh test && node tools/interactive-smoke.mjs",
     "typecheck": "bash tools/prototypes.sh typecheck",
     "verify": "npm run typecheck && npm test",
     "native": "bash tools/prototypes.sh native start",
