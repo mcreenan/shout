@@ -1,0 +1,14 @@
+flowchart TD
+    UI[Chat and slash commands] --> IN[Durable session inbox]
+    IN --> CORE[Single-writer session reducer]
+    CORE --> VM[Versioned program interpreter]
+    VM --> FX[Typed effect requests]
+    FX --> BROKER[Capability and budget broker]
+    BROKER --> MODEL[Model adapters]
+    BROKER --> TOOL[Tool workers and sandboxes]
+    BROKER --> HUMAN[Pending user requests]
+    MODEL --> IN
+    TOOL --> IN
+    HUMAN --> IN
+    CORE --> LOG[Events, snapshots, artifact references]
+    LOG --> UI

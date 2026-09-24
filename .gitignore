@@ -1,0 +1,11 @@
+.cache/
+.worktrees/
+node_modules/
+dist/
+target/
+.env
+.env.*
+!.env.example
+.runs/
+*.log
+__pycache__/

@@ -1,0 +1,8 @@
+sequenceDiagram
+    participant H as Existing harness
+    participant V as Embedded VM tool
+    participant M as Model
+    H->>V: Execute program, wait for final tool result
+    V->>H: Need an agent decision to continue
+    Note over H,V: If H cannot service the callback while waiting, neither can progress
+    H-->>M: Callback cannot be dispatched through this active turn

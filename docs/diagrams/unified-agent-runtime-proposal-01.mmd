@@ -1,0 +1,13 @@
+sequenceDiagram
+    participant A as Surrounding agent harness
+    participant B as MCP bridge
+    participant V as ALLEN VM
+    A->>B: Start ALLEN program
+    B->>V: Execute
+    V-->>B: Need a model, user, or tool result
+    B-->>A: next_action and resume shape
+    Note over A: Model interprets relay instructions
+    A->>A: Perform requested action
+    A->>B: Resume with copied result
+    B->>V: Validate and deliver result
+    V-->>A: Eventually return program outcome

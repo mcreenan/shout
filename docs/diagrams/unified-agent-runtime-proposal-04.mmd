@@ -1,0 +1,20 @@
+stateDiagram-v2
+    [*] --> Ready
+    Ready --> WaitingEffect: Persist request and dispatch intent
+    WaitingEffect --> Ready: Commit validated result
+    WaitingEffect --> WaitingUser: Question or approval required
+    WaitingUser --> Ready: Accept correlated response
+    WaitingEffect --> Reconciling: Outcome unknown after interruption
+    Reconciling --> Ready: Outcome recovered and no cancellation
+    Reconciling --> Cancelled: Outcome settled and cancellation pending
+    Reconciling --> Failed: Cannot safely continue
+    Ready --> Completed: Program returns
+    Ready --> Cancelling: User cancels
+    WaitingEffect --> Cancelling: User cancels
+    WaitingUser --> Cancelling: User cancels
+    Cancelling --> Reconciling: External action may have completed
+    Cancelling --> Cancelled: Owned work settled
+    Ready --> Failed: Terminal error
+    Completed --> [*]
+    Cancelled --> [*]
+    Failed --> [*]

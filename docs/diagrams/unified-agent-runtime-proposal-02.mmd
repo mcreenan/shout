@@ -1,0 +1,12 @@
+flowchart TB
+    U[Chat UI and commands] --> K[Session kernel: router, mailbox and scheduler]
+    K <--> H[(Events, runs, waits and artifacts)]
+    K --> M[Model-turn driver]
+    K --> W[ALLEN worker: compiler, verifier and VM]
+    M --> E[Effect broker: policy, budgets and dispatch]
+    W --> E
+    E --> P[Models and child agents]
+    E --> T[Tools, MCP and workspace workers]
+    E --> Q[User questions and approvals]
+    E -. Persist effects and results .-> H
+    H --> R[Timeline and artifacts displayed in the UI]

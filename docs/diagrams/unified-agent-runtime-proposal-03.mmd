@@ -1,0 +1,18 @@
+sequenceDiagram
+    participant U as User
+    participant K as Session kernel
+    participant M as Model turn A
+    participant V as ALLEN program
+    participant J as Callback turn B
+    U->>K: Review these dependency changes
+    K->>M: Start turn with tools and context
+    M->>K: program.run(source, input)
+    K->>V: Start verified program
+    V->>K: agent.ask typed review
+    Note over K: Persist wait, release session writer
+    K->>J: Same logical agent, separate context snapshot
+    J-->>K: Validated review result
+    K->>V: Resolve effect
+    V-->>K: Final program result
+    K->>M: Tool result for original call
+    M-->>U: Explain findings

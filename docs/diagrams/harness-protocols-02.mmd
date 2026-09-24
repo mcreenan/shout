@@ -1,0 +1,14 @@
+sequenceDiagram
+    participant U as Chat UI
+    participant S as Runtime scheduler
+    participant V as VM
+    participant A as Model or child agent adapter
+    U->>S: Message or slash command
+    S->>V: Step runnable program
+    V-->>S: NeedDecision(effect_id, payload, continuation)
+    S->>S: Persist suspension and pending effect
+    S->>A: Start separate identified decision job
+    Note over U,S: UI and unrelated jobs remain responsive
+    A-->>S: DecisionCompleted(effect_id, typed value)
+    S->>S: Validate, deduplicate, persist result
+    S->>V: Resume continuation with value
