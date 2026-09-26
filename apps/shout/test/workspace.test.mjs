@@ -95,6 +95,7 @@ for (const scenario of scenarios) {
     const result = await workspace.test();
     assert.equal(result.passed, true, result.output);
     assert.match(result.output, /fail 0/);
+    assert.deepEqual(await fixtureChanges(scenario.id, (await workspace.inspect()).files), []);
     const second = await createScenario(scenario.id, base);
     assert.notEqual(second.workspace, config.workspace);
     assert.equal((await new Workspace(second.workspace, second).test()).passed, false);

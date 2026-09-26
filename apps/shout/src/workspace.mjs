@@ -46,7 +46,8 @@ export async function fixtureChanges(scenarioId, files) {
   if (!filename) throw new Error(`No fixture patch for scenario: ${scenarioId}`);
   const current = files.find(file => file.path === filename);
   if (!current) throw new Error(`Scenario file missing: ${filename}`);
-  return [{ path: filename, before: current.content, after: await fs.readFile(path.join(SCENARIO_ROOT, 'solutions', `${scenarioId}.mjs`), 'utf8') }];
+  const after = await fs.readFile(path.join(SCENARIO_ROOT, 'solutions', `${scenarioId}.mjs`), 'utf8');
+  return current.content === after ? [] : [{ path: filename, before: current.content, after }];
 }
 
 /** Workspace confinement protects against accidental escapes, not hostile concurrent OS actors. */
