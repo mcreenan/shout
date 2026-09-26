@@ -17,6 +17,8 @@ Use **New session** to select a local workspace path and optionally a test comma
 
 Startup prints available local, LAN and Tailscale URLs. Permit the selected TCP port in the firewall for the LAN subnet if needed. Tailscale access also follows your tailnet policy. Browser requests use the current origin.
 
+`npm start` loads machine-local settings from the repository's ignored `.env` file. Copy `.env.example` to `.env` and set `SHOUT_ALLOWED_HOSTS=your-hostname.example` to persist a custom DNS alias, then restart. Use `http://your-hostname.example:4310`; DNS must resolve to a reachable address. Explicit process environment variables take precedence over `.env`.
+
 You can override `PORT`, `SHOUT_HOST` (default `0.0.0.0`; use `127.0.0.1` for an explicit local-only launch), `SHOUT_ALLOWED_HOSTS` (comma-separated additional exact hostnames), `SHOUT_WORKSPACE` (the default workspace), `SHOUT_STATE_DIR`, `JOSH_BIN`, and `CODEX_BIN`. The defaults store local session history, scenario workspaces and run scratch files under `.runs/shout/`, ignored by Git.
 
 ## Use a coding session
