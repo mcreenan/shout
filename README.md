@@ -11,7 +11,7 @@ npm run setup
 npm start
 ```
 
-Open **http://127.0.0.1:4310**. Choose **New session** for your own workspace, or click one of the three guided scenarios. Live mode uses your signed-in **Codex CLI 0.153.3**; **Fixture** mode uses explicitly scripted judgments with real ALLEN execution, file edits and tests.
+Open **http://127.0.0.1:4310** on this machine, or use a LAN/Tailscale URL printed at startup. The app listens on `0.0.0.0` by default. Choose **New session** for your own workspace, or click one of the three guided scenarios. Live mode uses your signed-in **Codex CLI 0.153.3**; **Fixture** mode uses explicitly scripted judgments with real ALLEN execution, file edits and tests.
 
 - **Fix a checkout calculation:** repair discount/tax ordering.
 - **Implement a missing slug utility:** add normalized, tested string handling.
@@ -22,7 +22,7 @@ Send the prepared prompt, inspect **Changes**, and choose **Approve & continue**
 Sessions and traces persist locally; in-flight executions become interrupted after an app restart. Workspace reads and edits are bounded to small projects. Full usage, architecture, limits and verification: **[GUI guide](apps/shout/README.md)**.
 
 ```sh
-npm run verify        # 58 automated tests plus original interactive checks
+npm run verify        # 60 automated tests plus original interactive checks
 npm run test:browser  # Real Chromium UI acceptance flow (offline model fixtures)
 ```
 
