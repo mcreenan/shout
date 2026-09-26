@@ -139,3 +139,25 @@ test('skipped tests are never marked passing or sent into a pointless repair loo
   assert.equal(result.state, 'completed'); assert.equal(result.result.output.passed, false);
   assert.equal(result.counters.modelJudgments, 1);
 });
+
+test('verification-only ALLEN runs configured tests with no judgment, edits, or approval', async t => {
+  const verify = await readFile(new URL('../workflows/verify.allen', import.meta.url), 'utf8');
+  for (const [passed, skipped] of [[true, false], [false, false], [false, true]]) {
+    const fixture = await create(t, { source: verify, maxModelJudgments: 0,
+      judge: () => assert.fail('Verification must not call a model'),
+      toolHandler: async name => {
+        assert.equal(name, 'run_tests');
+        return { passed, skipped, exitCode: passed ? 0 : 1, output: skipped ? 'Not configured' : passed ? 'PASS existing tests' : 'FAIL existing tests' };
+      } });
+    const result = await fixture.run.done;
+    assert.equal(result.state, 'completed', JSON.stringify(result));
+    assert.equal(result.result.output.passed, passed && !skipped);
+    assert.equal(result.result.output.accepted, true);
+    assert.equal(result.result.output.changed, 0);
+    assert.equal(result.result.output.attempts, 0);
+    assert.equal(result.counters.modelJudgments, 0);
+    assert.equal(fixture.approvals.length, 0);
+    assert.deepEqual(fixture.calls.map(call => call.name), ['run_tests']);
+    if (skipped) assert.match(result.result.output.summary, /not run/);
+  }
+});

@@ -1,0 +1,27 @@
+manifest {
+  language: "0.1"
+  entry: main
+  capabilities: []
+  tools: { required: [{ name: "run_tests", version: ">=1.0.0, <2.0.0" }] }
+}
+
+record CodingInput { goal: String history: String }
+record CodingResult { summary: String accepted: Bool passed: Bool changed: Int attempts: Int test_output: String }
+
+// A user-requested verification task needs no model judgment or file mutation.
+export async fn main(input: CodingInput) returns CodingResult effects [tool.run_tests@1] {
+  let tests = match await tools.run_tests.call({}) {
+    Ok(value) => value
+    Err(_) => stop("verification.tests_failed")
+  };
+  let passed = tests.passed && !tests.skipped;
+  let summary = if (tests.skipped) {
+    "Tests were not run because no test command is configured."
+  } else if (passed) {
+    "The configured tests passed. No file edits were proposed."
+  } else {
+    "The configured tests failed. No file edits were proposed."
+  };
+  CodingResult { summary: summary, accepted: true, passed: passed,
+    changed: 0, attempts: 0, test_output: tests.output }
+}
