@@ -203,9 +203,11 @@ function renderEventDetail() {
 function renderGraph(container, events) {
   if (!events.length) return renderVizEmpty(container);
   const stats = el('div', 'flow-summary');
+  const scopedEvents = (state.session?.events || []).filter((event) => !state.runFilter || event.run === state.runFilter);
   for (const [label, type] of [[state.session?.mode === 'fixture' ? 'Scripted judgments' : 'Model calls', 'model.started'], ['Tool calls', 'tool.started'], ['VM runs', 'run.started']]) {
     const stat = el('div', 'flow-stat');
-    stat.append(el('strong', '', String(events.filter((event) => event.type === type || type === 'model.started' && event.type === 'chat.started').length)), document.createTextNode(label));
+    stat.title = 'Totals for the selected run scope, before the text filter';
+    stat.append(el('strong', '', String(scopedEvents.filter((event) => event.type === type || type === 'model.started' && event.type === 'chat.started').length)), document.createTextNode(label));
     stats.append(stat);
   }
   container.append(stats);
