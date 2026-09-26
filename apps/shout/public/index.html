@@ -26,9 +26,10 @@
         <section class="conversation" aria-label="Conversation">
           <div id="messages" class="messages" aria-live="polite" aria-relevant="additions"></div>
           <div id="question-area"></div>
+          <div id="storage-warning" class="storage-warning" role="alert" hidden></div>
           <div id="status-line" class="status-line" aria-live="polite"><span class="status-dot"></span><span id="status-text">Ready when you are</span><button id="cancel-button" class="text-button" hidden>Cancel run</button></div>
           <form id="composer" class="composer"><label class="sr-only" for="message-input">Message SHOUT</label><textarea id="message-input" placeholder="Ask SHOUT to explore, fix, or build something…" rows="2"></textarea><div class="composer-bottom"><span class="composer-note"><span class="tiny-mark">S</span> Models judge. ALLEN orchestrates.</span><button type="submit" id="send-button" class="send-button" aria-label="Send message">↑</button></div></form>
-          <div class="input-hint">Enter to send <span>·</span> Shift + Enter for a new line <span>·</span> Review changes before applying</div>
+          <div class="input-hint">Enter to send <span>·</span> Shift + Enter for a new line <span>·</span> <code>/test</code> runs configured tests</div>
         </section>
         <aside id="inspector" class="inspector" aria-label="Session inspector">
           <div class="inspector-header"><div><span class="eyebrow">OBSERVABILITY</span><h2 id="inspector-title">Session VIZ</h2></div><span class="live-indicator" id="connection-status">LIVE</span></div>

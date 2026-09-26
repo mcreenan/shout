@@ -1,4 +1,5 @@
 :root{font-family:'DM Sans',system-ui,sans-serif;color:#dedee5;background:#111216;font-synthesis:none;--bg:#111216;--panel:#16171c;--line:#292b34;--muted:#999aa9;--accent:#bdc3ff;--model:#bbadff;--vm:#72d8bd;--tool:#f0bd79;--user:#88bcff}
+.storage-warning{margin:0 24px 12px;padding:10px 13px;border:1px solid #8a505a;border-radius:7px;background:#38212a;color:#f0b6bd;font-size:11px;line-height:1.6;overflow-wrap:anywhere}
 *{box-sizing:border-box}
 body{margin:0;font-size:14px}
 button,input,textarea,select{font:inherit}
@@ -251,4 +252,3 @@ dialog{padding:21px}
 }
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;animation:none!important;transition:none!important}
 }
-

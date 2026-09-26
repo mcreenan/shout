@@ -105,7 +105,9 @@ function renderQuestion() {
   if (!question) return;
   const card = el('section', 'question-card');
   card.setAttribute('aria-label', 'Review required');
-  card.append(el('h3', '', 'Your judgment is needed'), el('p', '', question.prompt));
+  const prompt = typeof question.prompt === 'string' ? question.prompt : question.prompt?.system || 'Review this proposal before continuing.';
+  card.append(el('h3', '', 'Your judgment is needed'), el('p', '', prompt));
+  if (typeof question.prompt?.data?.value?.summary === 'string') card.append(el('p', '', question.prompt.data.value.summary));
   const actions = el('div', 'question-actions');
   const approve = el('button', 'approve-button', 'Approve & continue');
   const decline = el('button', 'decline-button', 'Decline changes');
@@ -151,6 +153,8 @@ function renderStatus() {
   $('mode-badge').textContent = session ? session.mode === 'fixture' ? 'FIXTURE · NO MODEL' : 'LIVE MODEL' : 'READY';
   $('mode-badge').classList.toggle('fixture', session?.mode === 'fixture');
   $('export-button').disabled = !session;
+  $('storage-warning').hidden = !session?.storageError;
+  $('storage-warning').textContent = session?.storageError ? `Session could not be saved: ${typeof session.storageError === 'string' ? session.storageError : JSON.stringify(session.storageError)}. Export this session to keep a copy.` : '';
   $('files-button').disabled = !session;
   $('status-line').className = `status-line${session?.question ? ' question' : active ? ' active' : session?.status === 'failed' ? ' failed' : ''}`;
   const latest = session?.events?.at(-1);
@@ -199,14 +203,14 @@ function renderEventDetail() {
 function renderGraph(container, events) {
   if (!events.length) return renderVizEmpty(container);
   const stats = el('div', 'flow-summary');
-  for (const [label, type] of [['Model calls', 'model.started'], ['Tool calls', 'tool.started'], ['VM runs', 'run.started']]) {
+  for (const [label, type] of [[state.session?.mode === 'fixture' ? 'Scripted judgments' : 'Model calls', 'model.started'], ['Tool calls', 'tool.started'], ['VM runs', 'run.started']]) {
     const stat = el('div', 'flow-stat');
     stat.append(el('strong', '', String(events.filter((event) => event.type === type || type === 'model.started' && event.type === 'chat.started').length)), document.createTextNode(label));
     stats.append(stat);
   }
   container.append(stats);
   const lanes = el('div', 'lane-header');
-  for (const [name, kind] of [['You', 'user'], ['SHOUT', 'harness'], ['Model', 'model'], ['ALLEN', 'vm'], ['Tools', 'tool']]) lanes.append(el('span', kind, name));
+  for (const [name, kind] of [['You', 'user'], ['SHOUT', 'harness'], [state.session?.mode === 'fixture' ? 'Fixture' : 'Model', 'model'], ['ALLEN', 'vm'], ['Tools', 'tool']]) lanes.append(el('span', kind, name));
   container.append(lanes);
   let lastRun;
   const effects = new Map();
