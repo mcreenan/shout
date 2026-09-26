@@ -109,6 +109,7 @@ export class Workspace {
     try {
       const stat = await handle.stat();
       if (!stat.isFile() || stat.size > MAX_FILE_BYTES) throw new Error(`Not a bounded text file: ${relative}`);
+      if (stat.nlink > 1) throw new Error(`Hardlinked files are not allowed: ${relative}`);
       const buffer = await handle.readFile();
       if (buffer.length > MAX_FILE_BYTES || buffer.includes(0)) throw new Error(`Not a bounded text file: ${relative}`);
       return new TextDecoder('utf-8', { fatal: true }).decode(buffer);
@@ -158,17 +159,26 @@ export class Workspace {
       for (const plan of plans) {
         signal?.throwIfAborted();
         await this.resolveFile(plan.path, { allowMissing: true });
+        signal?.throwIfAborted();
         await fs.mkdir(path.dirname(plan.filename), { recursive: true });
         await this.resolveFile(plan.path, { allowMissing: true });
+        signal?.throwIfAborted();
         const handle = await fs.open(plan.filename, plan.exists ? constants.O_RDWR | constants.O_NOFOLLOW : constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+        // Creating a new file is already a mutation, even if cancellation prevents its contents.
+        if (!plan.exists) changed.push(plan.path);
         try {
+          const stat = await handle.stat();
+          if (!stat.isFile() || stat.size > MAX_FILE_BYTES) throw new Error(`Not a bounded text file: ${plan.path}`);
+          if (stat.nlink > 1) throw new Error(`Hardlinked files are not allowed: ${plan.path}`);
           if (plan.exists && (await handle.readFile('utf8')) !== plan.before) throw new Error(`Stale patch: ${plan.path} changed during apply`);
           // Writes are per-file. Later failures can leave earlier approved files changed.
-          changed.push(plan.path);
+          signal?.throwIfAborted();
+          if (plan.exists) changed.push(plan.path);
           await handle.truncate(0);
           const buffer = Buffer.from(plan.after);
           let offset = 0;
           while (offset < buffer.length) {
+            signal?.throwIfAborted();
             const { bytesWritten } = await handle.write(buffer, offset, buffer.length - offset, offset);
             if (!bytesWritten) throw new Error(`Unable to finish writing ${plan.path}`);
             offset += bytesWritten;
@@ -177,9 +187,11 @@ export class Workspace {
       }
       return { changed };
     } catch (error) {
-      error.changed = changed;
-      error.message += changed.length ? `; files possibly changed: ${changed.join(', ')}` : '';
-      throw error;
+      // AbortSignal commonly throws a DOMException with a read-only message.
+      const failure = new Error(`${error.message}${changed.length ? `; files possibly changed: ${changed.join(', ')}` : ''}`, { cause: error });
+      failure.name = error.name;
+      failure.changed = changed;
+      throw failure;
     }
   }
 

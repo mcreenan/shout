@@ -56,6 +56,56 @@ test('preflights every edit, rejects stale/duplicate edits, and supports new nes
   await assert.rejects(workspace.apply([{ path: 'a.mjs', before: 'original a', after: 'stale result' }]), /Stale patch/);
 });
 
+test('hardlinked files cannot expose or modify content outside the workspace', async t => {
+  const base = await temporary(t);
+  const directory = path.join(base, 'project');
+  await fs.mkdir(directory);
+  const outside = path.join(base, 'outside.mjs');
+  await fs.writeFile(outside, 'outside content');
+  await fs.link(outside, path.join(directory, 'linked.mjs'));
+  const workspace = await new Workspace(directory).init();
+  await assert.rejects(workspace.read('linked.mjs'), /Hardlinked/);
+  await assert.rejects(workspace.inspect(), /Hardlinked/);
+  await assert.rejects(workspace.apply([{ path: 'linked.mjs', before: 'outside content', after: 'changed' }]), /Hardlinked/);
+  assert.equal(await fs.readFile(outside, 'utf8'), 'outside content');
+});
+
+test('write handle rechecks hardlinks created after patch preflight', async t => {
+  const base = await temporary(t);
+  const directory = path.join(base, 'project');
+  await fs.mkdir(directory);
+  await fs.writeFile(path.join(directory, 'app.mjs'), 'original');
+  const outside = path.join(base, 'outside.mjs');
+  const workspace = await new Workspace(directory).init();
+  const read = workspace.read.bind(workspace);
+  workspace.read = async filename => {
+    const content = await read(filename);
+    await fs.link(path.join(directory, filename), outside);
+    return content;
+  };
+  await assert.rejects(workspace.apply([{ path: 'app.mjs', before: 'original', after: 'changed' }]), /Hardlinked/);
+  assert.equal(await fs.readFile(outside, 'utf8'), 'original');
+  assert.equal(await fs.readFile(path.join(directory, 'app.mjs'), 'utf8'), 'original');
+});
+
+test('cancellation during final path validation prevents truncating an existing file', async t => {
+  const directory = await temporary(t);
+  await fs.writeFile(path.join(directory, 'app.mjs'), 'original');
+  const workspace = await new Workspace(directory).init();
+  const controller = new AbortController();
+  const resolveFile = workspace.resolveFile.bind(workspace);
+  let validationCalls = 0;
+  workspace.resolveFile = async (...args) => {
+    const filename = await resolveFile(...args);
+    // Preflight path + read validation, then two path checks in the write phase.
+    if (++validationCalls === 4) controller.abort();
+    return filename;
+  };
+  await assert.rejects(workspace.apply([{ path: 'app.mjs', before: 'original', after: 'changed' }], { signal: controller.signal }), /abort/i);
+  assert.equal(validationCalls, 4);
+  assert.equal(await fs.readFile(path.join(directory, 'app.mjs'), 'utf8'), 'original');
+});
+
 test('concurrent patch requests serialize and cannot overwrite a changed precondition', async t => {
   const directory = await temporary(t);
   await fs.writeFile(path.join(directory, 'a.mjs'), 'original');
