@@ -5,4 +5,7 @@ if [ ! -d "$repo_root/prototypes/owned/node_modules/ajv" ]; then
   npm --prefix "$repo_root/prototypes/owned" ci --no-audit --no-fund
 fi
 export JOSH_BIN="${JOSH_BIN:-$("$repo_root/tools/setup-josh.sh")}"
-exec node --env-file-if-exists="$repo_root/.env" "$repo_root/apps/shout/src/server.mjs" "$@"
+watch=()
+# SHOUT_WATCH=1 restarts the server when its source or imported modules change.
+if [ "${SHOUT_WATCH:-}" = 1 ]; then watch=(--watch --watch-preserve-output); fi
+exec node "${watch[@]}" --env-file-if-exists="$repo_root/.env" "$repo_root/apps/shout/src/server.mjs" "$@"

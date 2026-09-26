@@ -18,13 +18,13 @@ try {
   await page.getByRole('heading', { name: 'Fix a checkout calculation' }).first().waitFor();
   await page.getByRole('button', { name: /Fix a checkout calculation/ }).first().click();
   await page.getByLabel('Model provider').selectOption('fixture');
-  await page.getByRole('button', { name: /Create scenario session/ }).click();
+  await page.getByRole('button', { name: 'Create session' }).click();
   await page.waitForFunction(() => location.hash.startsWith('#session-'));
   assert.ok((await page.getByLabel('Message SHOUT').inputValue()).includes('checkout'));
   await page.getByRole('button', { name: 'Send message', exact: true }).click();
   await page.getByRole('button', { name: 'Approve & continue' }).waitFor();
   assert.ok(!(await page.locator('#question-area').innerText()).includes('[object Object]'));
-  await page.getByRole('button', { name: 'Inspect changes →' }).click();
+  await page.getByRole('button', { name: 'View changes' }).click();
   await page.locator('.diff-file').waitFor();
   assert.match(await page.locator('.diff-title').innerText(), /pricing.mjs/);
   const id = await page.evaluate(() => location.hash.slice(1));
@@ -55,7 +55,7 @@ try {
   await page.getByRole('button', { name: /New session/ }).click();
   await page.getByRole('button', { name: /Implement a missing slug utility/ }).last().click();
   await page.getByLabel('Model provider').selectOption('fixture');
-  await page.getByRole('button', { name: /Create scenario session/ }).click();
+  await page.getByRole('button', { name: 'Create session' }).click();
   await page.getByRole('button', { name: 'Send message', exact: true }).click();
   await page.getByRole('button', { name: 'Approve & continue' }).waitFor();
   await page.getByRole('button', { name: 'Cancel run' }).click();
@@ -63,7 +63,7 @@ try {
   assert.equal(await page.getByRole('button', { name: 'Approve & continue' }).count(), 0);
   await page.setViewportSize({ width: 390, height: 844 }); await page.reload();
   await page.getByRole('button', { name: 'Toggle sessions' }).waitFor();
-  await page.getByRole('button', { name: /Session VIZ/ }).click();
+  await page.getByRole('button', { name: 'Inspector' }).click();
   assert.ok(await page.locator('#inspector').isVisible());
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
   await page.screenshot({ path: resolve(screenshotDir, 'session-mobile.png'), fullPage: true });

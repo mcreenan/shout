@@ -77,11 +77,11 @@ export async function startServer({ port = Number(process.env.PORT || 4310), hos
         }
       }
       if (request.method !== 'GET') return json(response, 404, { error: 'Route not found' });
-      const files = { '/': 'index.html', '/index.html': 'index.html', '/app.js': 'app.js', '/style.css': 'style.css', '/styles.css': 'style.css' };
+      const files = { '/': 'index.html', '/index.html': 'index.html', '/app.js': 'app.js', '/theme.js': 'theme.js', '/style.css': 'style.css', '/styles.css': 'style.css', '/shout-wordmark.png': 'shout-wordmark.png' };
       const file = files[url.pathname];
       if (!file) return json(response, 404, { error: 'Route not found' });
       const bytes = await readFile(resolve(appRoot, 'public', file));
-      response.writeHead(200, { 'Content-Type': ({ '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css' })[extname(file)] + '; charset=utf-8', 'Cache-Control': 'no-cache' }); response.end(bytes);
+      response.writeHead(200, { 'Content-Type': ({ '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.png': 'image/png' })[extname(file)], 'Cache-Control': 'no-cache' }); response.end(bytes);
     } catch (error) { if (!response.headersSent) json(response, /not found/i.test(error.message) ? 404 : 400, { error: error.message }); else response.end(); }
   });
   await new Promise((resolveReady, reject) => { server.once('error', reject); server.listen(port, host, resolveReady); });

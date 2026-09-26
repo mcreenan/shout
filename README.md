@@ -1,10 +1,12 @@
-# SHOUT
+<p align="center">
+  <img src="apps/shout/public/shout-wordmark.png" alt="SHOUT!" width="480">
+</p>
 
 SHOUT explores a unified agent harness and programming runtime, building on the earlier JOSH/ALLEN research.
 
 ## Coding workspace GUI
 
-SHOUT now has a local browser app: chat with a coding agent, inspect proposed file changes, approve edits, run tests, and watch model/tool/VM interactions in **Session VIZ**.
+SHOUT now has a local browser app: chat with a coding agent, inspect proposed file changes, approve edits, run tests, and watch model/tool/VM interactions in the **Inspector**.
 
 ```sh
 npm run setup
@@ -17,7 +19,7 @@ Open **http://127.0.0.1:4310** on this machine, or use a LAN/Tailscale URL print
 - **Implement a missing slug utility:** add normalized, tested string handling.
 - **Unify inconsistent validation:** refactor two entry points around one rule.
 
-Send the prepared prompt, inspect **Changes**, and choose **Approve & continue**. ALLEN handles the execution and bounded repair loop; every new patch requires approval. Enter `/test` to run the configured tests directly, without a model call. Open **Session VIZ** to explore the flow, filter events, inspect tool inputs/results, or read the exact executed ALLEN source.
+Send the prepared prompt, inspect **Changes**, and choose **Approve & continue**. ALLEN handles the execution and bounded repair loop; every new patch requires approval. Enter `/test` to run the configured tests directly, without a model call. Open the **Inspector** to explore the flow, filter events, inspect tool inputs/results, or read the exact executed ALLEN source.
 
 Sessions and traces persist locally; in-flight executions become interrupted after an app restart. Workspace reads and edits are bounded to small projects. Full usage, architecture, limits and verification: **[GUI guide](apps/shout/README.md)**.
 

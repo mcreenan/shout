@@ -26,7 +26,7 @@ You can override `PORT`, `SHOUT_HOST` (default `0.0.0.0`; use `127.0.0.1` for an
 Ask for a concrete change, explanation, review, or refactor. The conversation router decides whether to reply, run the coding workflow, or run existing tests. For coding, ALLEN reads a bounded workspace snapshot, requests a typed patch from the model, removes unchanged replacements, and presents the exact proposal for approval.
 
 1. Inspect the **Changes** tab's before/after file contents.
-2. Choose **Approve & continue** to apply that exact patch and execute the configured tests, or **Decline changes** to stop this proposal.
+2. Choose **Approve & continue** to apply that exact patch and execute the configured tests, or **Decline** to stop this proposal.
 3. If tests fail, ALLEN reads fresh files, supplies the observed failure to the model, and permits up to two repair proposals. Every proposal gets a new approval.
 4. Follow up in chat. The session retains recent conversation and previous task results.
 
@@ -52,7 +52,7 @@ Fixture mode is an offline demonstration of the same real compiler, VM, file ope
 
 See [scenario definitions](scenarios/README.md) for exact expected behavior.
 
-## Session VIZ
+## Inspector
 
 The right panel provides **Flow**, **Events**, and **Changes** views:
 
@@ -107,6 +107,6 @@ npm run test:browser
 
 The integrated suite passes **60 tests** (26 original + 34 app/engine/workspace/network tests), plus four original interactive CLI scenarios. Tests execute the real pinned compiler/VM and real file/test tools. Model fixtures provide reproducibility. Coverage includes repairs, declined proposals, stale/hardlinked paths, bounded processes, cancellation and late results, restart invalidation, storage failure, HTTP/SSE and local-origin checks.
 
-The browser test drives the actual UI through scenario creation, chat, diff inspection, approval, edits, tests, VIZ/source inspection, file reading, `/test`, reload, cancellation, and mobile layout. It uses local Chromium or `CHROMIUM_BIN`; otherwise install Playwright's browser with `npx playwright install chromium`.
+The browser test drives the actual UI through scenario creation, chat, diff inspection, approval, edits, tests, inspector/source inspection, file reading, `/test`, reload, cancellation, and mobile layout. It uses local Chromium or `CHROMIUM_BIN`; otherwise install Playwright's browser with `npx playwright install chromium`.
 
 Separate live verification used real Codex judgments to repair the pricing scenario and passed all four tests. Its approval was explicitly supplied by an automated verification driver in an isolated scenario workspace. Live/browser details are recorded in [GUI verification](../../docs/GUI-VERIFICATION.md).

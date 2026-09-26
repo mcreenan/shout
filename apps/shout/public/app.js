@@ -38,21 +38,31 @@ function scenarioCard(scenario, index, onClick) {
   card.append(el('span', 'scenario-number', String(index + 1).padStart(2, '0')));
   const copy = el('div');
   copy.append(el('h3', '', scenario.title));
-  card.append(copy, el('span', 'arrow', '↗'));
+  if (scenario.description) copy.append(el('p', '', scenario.description));
+  card.append(copy);
   card.addEventListener('click', onClick);
   return card;
 }
 function renderWelcome() {
   const wrapper = el('div', 'welcome');
-  wrapper.append(el('h2', '', 'Scenarios'));
+  if (state.session) {
+    wrapper.append(el('h2', '', 'No messages yet'), el('p', '', 'Describe the change you want. Proposed edits wait for your approval before they are applied.'));
+    return wrapper;
+  }
+  const logoFrame = el('div', 'welcome-wordmark wordmark');
+  const logo = el('img');
+  logo.src = '/shout-wordmark.png';
+  logo.alt = 'SHOUT!';
+  logo.width = 1983;
+  logo.height = 793;
+  logoFrame.append(logo);
+  wrapper.append(logoFrame, el('h2', '', 'Start a session'), el('p', '', 'Open a sample workspace, or point SHOUT at your own project.'));
   const grid = el('div', 'scenario-grid');
   (state.config?.scenarios || []).forEach((scenario, i) => grid.append(scenarioCard(scenario, i, () => openNewDialog(scenario.id))));
   wrapper.append(grid);
-  if (!state.config?.scenarios?.length) {
-    const button = el('button', 'primary-button', 'New session ↗');
-    button.addEventListener('click', () => openNewDialog());
-    grid.append(button);
-  }
+  const button = el('button', 'primary-button', 'Open a project');
+  button.addEventListener('click', () => openNewDialog());
+  wrapper.append(button);
   return wrapper;
 }
 function appendContent(container, text) {
@@ -81,9 +91,8 @@ function renderMessages() {
     const role = ['user', 'assistant', 'system', 'tool'].includes(message.role) ? message.role : 'system';
     const item = el('article', `message ${role}`);
     item.dataset.messageId = message.id;
-    item.append(el('div', 'avatar', role === 'user' ? 'YOU' : role === 'assistant' ? 'S↗' : role === 'tool' ? '↳' : '·'));
     const body = el('div', 'message-body');
-    const header = el('div', 'message-header', role === 'assistant' ? 'SHOUT' : role === 'user' ? 'You' : role === 'tool' ? 'Tool result' : 'Runtime');
+    const header = el('div', 'message-header', role === 'assistant' ? 'SHOUT' : role === 'user' ? 'You' : role === 'tool' ? 'Tool result' : 'System');
     header.append(el('time', '', time(message.time)));
     const content = el('div', 'message-text');
     appendContent(content, message.content);
@@ -103,12 +112,12 @@ function renderQuestion() {
   const card = el('section', 'question-card');
   card.setAttribute('aria-label', 'Review required');
   const prompt = typeof question.prompt === 'string' ? question.prompt : question.prompt?.system || 'Approve these changes?';
-  card.append(el('h3', '', 'Review changes'), el('p', '', prompt));
+  card.append(el('h3', '', 'Approval needed'), el('p', '', prompt));
   if (typeof question.prompt?.data?.value?.summary === 'string') card.append(el('p', '', question.prompt.data.value.summary));
   const actions = el('div', 'question-actions');
   const approve = el('button', 'approve-button', 'Approve & continue');
-  const decline = el('button', 'decline-button', 'Decline changes');
-  const changes = el('button', 'text-button', 'Inspect changes →');
+  const decline = el('button', 'decline-button', 'Decline');
+  const changes = el('button', 'text-button', 'View changes');
   changes.addEventListener('click', () => setTab('changes'));
   for (const [button, accept] of [[approve, true], [decline, false]]) {
     button.addEventListener('click', async () => {
@@ -129,35 +138,42 @@ function renderQuestion() {
 function renderSidebar() {
   $('session-count').textContent = String(state.sessions.length);
   $('session-list').replaceChildren();
-  if (!state.sessions.length) $('session-list').append(el('p', 'empty-copy', 'No sessions'));
+  if (!state.sessions.length) $('session-list').append(el('p', 'empty-copy', 'No sessions yet'));
   for (const session of state.sessions) {
     const button = el('button', `session-item${session.id === state.session?.id ? ' active' : ''}`);
     button.setAttribute('aria-current', session.id === state.session?.id ? 'page' : 'false');
     button.append(el('span', 'session-name', session.title || 'Untitled session'));
     const meta = el('span', 'session-meta');
-    meta.append(el('span', '', `${session.mode === 'fixture' ? 'Fixture' : 'Live'} · ${session.status || 'ready'}`), el('span', '', time(session.updatedAt)));
+    meta.append(el('span', `status-pill ${statusKind(session)}`, session.question ? 'awaiting approval' : session.status || 'ready'), el('span', '', `· ${session.mode === 'fixture' ? 'Fixture' : 'Live'}`), el('time', '', time(session.updatedAt)));
     button.append(meta);
     button.addEventListener('click', () => selectSession(session.id).catch((error) => toast(error.message)));
     $('session-list').append(button);
   }
 }
+function statusKind(session) {
+  if (session?.question) return 'question';
+  if (isActive(session)) return 'active';
+  return ['completed', 'failed', 'interrupted'].includes(session?.status) ? session.status : '';
+}
 function renderStatus() {
   const session = state.session;
   const active = isActive(session);
-  $('session-title').textContent = session?.title || 'New session';
+  $('session-title').textContent = session ? session.title || 'Untitled session' : 'Workspace';
   $('workspace-path').textContent = session?.workspace || '';
   $('workspace-path').title = session?.workspace || '';
-  $('mode-badge').textContent = session ? session.mode === 'fixture' ? 'FIXTURE · NO MODEL' : 'LIVE MODEL' : 'READY';
+  $('mode-badge').hidden = !session;
+  $('mode-badge').textContent = session?.mode === 'fixture' ? 'Fixture' : 'Live';
+  $('mode-badge').title = session?.mode === 'fixture' ? 'Scripted judgments, no model calls' : 'Live Codex model';
   $('mode-badge').classList.toggle('fixture', session?.mode === 'fixture');
   $('export-button').disabled = !session;
   $('storage-warning').hidden = !session?.storageError;
   $('storage-warning').textContent = session?.storageError ? `Session could not be saved: ${typeof session.storageError === 'string' ? session.storageError : JSON.stringify(session.storageError)}. Export this session to keep a copy.` : '';
   $('files-button').disabled = !session;
-  $('status-line').className = `status-line${session?.question ? ' question' : active ? ' active' : session?.status === 'failed' ? ' failed' : ''}`;
+  $('status-line').className = `status-line ${statusKind(session)}`;
   $('status-text').textContent = session?.question ? 'Awaiting approval' : session?.status || 'Ready';
   $('cancel-button').hidden = !active;
   $('send-button').disabled = active || state.busy;
-  $('message-input').placeholder = active ? 'Next message…' : 'Message SHOUT…';
+  $('message-input').placeholder = !session ? 'Create a session to start' : active ? 'Waiting for the current run…' : 'Describe a change, or /test';
 }
 function classify(event) {
   const type = event.type || '';
@@ -186,7 +202,8 @@ function renderEventDetail() {
   if (detail.hidden) return;
   const header = el('div', 'detail-header');
   header.append(el('strong', '', `#${event.sequence} · ${event.type}`));
-  const close = el('button', 'icon-button', '×');
+  const close = el('button', 'icon-button');
+  close.innerHTML = '<svg><use href="#i-x"/></svg>';
   close.setAttribute('aria-label', 'Close event details');
   close.addEventListener('click', () => { state.selectedEvent = null; renderInspector(); });
   header.append(close);
@@ -247,14 +264,14 @@ function renderVizEmpty(container) {
   container.append(empty);
   if (!state.session?.events?.length) {
     const lanes = el('div', 'lane-header');
-    for (const name of ['You', 'SHOUT', 'Model', 'ALLEN', 'Tools']) lanes.append(el('span', '', name));
+    for (const [name, kind] of [['You', 'user'], ['SHOUT', 'harness'], ['Model', 'model'], ['ALLEN', 'vm'], ['Tools', 'tool']]) lanes.append(el('span', kind, name));
     container.append(lanes);
   }
 }
 function renderTrace(container, events) {
   if (!events.length) return renderVizEmpty(container);
   for (const event of events) {
-    const button = el('button', `trace-event${state.selectedEvent === event.id ? ' selected' : ''}`);
+    const button = el('button', `trace-event ${classify(event).kind}${state.selectedEvent === event.id ? ' selected' : ''}`);
     button.append(el('span', 'trace-index', `#${event.sequence}`));
     const main = el('span', 'trace-event-main');
     main.append(el('strong', '', event.type), el('small', '', `${time(event.time)}${event.effectId ? ` · effect ${event.effectId}` : event.run ? ` · ${event.run}` : ''}`));
@@ -267,16 +284,63 @@ function renderChanges(container) {
   const changes = state.session?.changes || [];
   if (!changes.length) container.append(el('p', 'empty-copy', 'No changes'));
   for (const change of changes) {
+    const lines = diffLines(change.before ?? '', change.after ?? '');
     const file = el('section', 'diff-file');
-    file.append(el('div', 'diff-title', change.path), el('div', 'diff-label', 'BEFORE'), el('pre', 'diff-code before', change.before ?? '(new file)'), el('div', 'diff-label', 'AFTER'), el('pre', 'diff-code after', change.after ?? '(deleted)'));
+    const title = el('div', 'diff-title');
+    const stat = el('span', 'diff-stat');
+    stat.append(el('span', 'add', `+${lines.filter((line) => line.type === 'add').length}`), el('span', 'del', `−${lines.filter((line) => line.type === 'del').length}`));
+    title.append(el('span', '', change.path + (change.before == null ? ' (new)' : change.after == null ? ' (deleted)' : '')), stat);
+    const body = el('div', 'diff-body');
+    for (const line of collapseContext(lines)) {
+      if (line.type === 'gap') { body.append(el('div', 'diff-line gap', `${line.count} unchanged line${line.count === 1 ? '' : 's'}`)); continue; }
+      const row = el('div', `diff-line ${line.type}`);
+      row.append(el('span', 'sign', line.type === 'add' ? '+' : line.type === 'del' ? '−' : ''), el('span', 'code', line.text || ' '));
+      body.append(row);
+    }
+    file.append(title, body);
     container.append(file);
   }
+}
+// Line-level LCS diff. Workspace files are small and bounded; very large inputs fall back to remove-all/add-all.
+function diffLines(before, after) {
+  const a = before ? before.split('\n') : [];
+  const b = after ? after.split('\n') : [];
+  if (a.length * b.length > 4_000_000) return [...a.map((text) => ({ type: 'del', text })), ...b.map((text) => ({ type: 'add', text }))];
+  const width = b.length + 1;
+  const table = new Uint32Array((a.length + 1) * width);
+  for (let i = a.length - 1; i >= 0; i--) for (let j = b.length - 1; j >= 0; j--) table[i * width + j] = a[i] === b[j] ? table[(i + 1) * width + j + 1] + 1 : Math.max(table[(i + 1) * width + j], table[i * width + j + 1]);
+  const result = [];
+  let i = 0, j = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) { result.push({ type: 'same', text: a[i] }); i++; j++; }
+    else if (table[(i + 1) * width + j] >= table[i * width + j + 1]) result.push({ type: 'del', text: a[i++] });
+    else result.push({ type: 'add', text: b[j++] });
+  }
+  while (i < a.length) result.push({ type: 'del', text: a[i++] });
+  while (j < b.length) result.push({ type: 'add', text: b[j++] });
+  return result;
+}
+function collapseContext(lines, context = 3) {
+  const keep = lines.map(() => false);
+  lines.forEach((line, index) => {
+    if (line.type === 'same') return;
+    for (let k = Math.max(0, index - context); k <= Math.min(lines.length - 1, index + context); k++) keep[k] = true;
+  });
+  const output = [];
+  for (let index = 0; index < lines.length; index++) {
+    if (keep[index]) { output.push(lines[index]); continue; }
+    let end = index;
+    while (end < lines.length && !keep[end]) end++;
+    output.push({ type: 'gap', count: end - index });
+    index = end - 1;
+  }
+  return output;
 }
 function renderInspector() {
   const container = $('inspector-content');
   const oldScroll = container.scrollTop;
   const nearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 85;
-  $('inspector-title').textContent = state.tab === 'files' ? 'Workspace files' : 'Session VIZ';
+  $('inspector-title').textContent = state.tab === 'files' ? 'Workspace files' : 'Inspector';
   $('event-count').textContent = String(state.session?.events?.length || 0);
   $('change-count').textContent = String(state.session?.changes?.length || 0);
   $('viz-toolbar').hidden = state.tab === 'changes' || state.tab === 'files';
@@ -376,12 +440,12 @@ async function selectSession(id) {
   });
   stream.onopen = () => {
     if (state.stream !== stream) return;
-    $('connection-status').textContent = 'LIVE';
+    $('connection-status').textContent = 'Live';
     $('connection-status').classList.remove('disconnected');
   };
   stream.onerror = () => {
     if (state.stream !== stream) return;
-    $('connection-status').textContent = 'RECONNECTING';
+    $('connection-status').textContent = 'Reconnecting';
     $('connection-status').classList.add('disconnected');
   };
   $('messages').scrollTop = $('messages').scrollHeight;
@@ -398,21 +462,22 @@ function renderDialogScenarios() {
     $('dialog-scenarios').append(card);
   });
   $('workspace-input').disabled = !!state.selectedScenario;
-  $('workspace-input').placeholder = state.selectedScenario ? 'New sample workspace' : '/path/to/your/project';
+  $('workspace-input').placeholder = state.selectedScenario ? 'A fresh copy of the sample is created' : '/path/to/your/project';
   $('workspace-input').value = state.selectedScenario ? '' : state.config?.defaultWorkspace || state.config?.cwd || '';
   $('test-command-input').disabled = !!state.selectedScenario;
-  $('create-button').textContent = state.selectedScenario ? 'Create scenario session ↗' : 'Create session ↗';
+  $('test-command-input').placeholder = state.selectedScenario ? 'Provided by the sample' : 'npm test';
 }
 function openNewDialog(scenarioId = null) {
   state.selectedScenario = scenarioId;
   $('new-error').hidden = true;
   $('new-form').reset();
+  if (state.config && !state.config.provider?.available) $('mode-input').value = 'fixture';
   renderDialogScenarios();
   $('new-dialog').showModal();
 }
 $('new-session').addEventListener('click', () => openNewDialog());
 $('close-dialog').addEventListener('click', () => $('new-dialog').close());
-$('blank-session').addEventListener('click', () => { state.selectedScenario = null; renderDialogScenarios(); });
+$('cancel-dialog').addEventListener('click', () => $('new-dialog').close());
 $('new-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   $('create-button').disabled = true;
@@ -490,13 +555,22 @@ $('export-button').addEventListener('click', async () => {
   } catch (error) { toast(error.message); }
 });
 $('menu-button').addEventListener('click', () => $('app').classList.toggle('menu-open'));
+for (const id of ['scrim', 'sidebar-close']) $(id).addEventListener('click', () => $('app').classList.remove('menu-open'));
+function applyTheme(choice) {
+  if (choice === 'light' || choice === 'dark') document.documentElement.dataset.theme = choice;
+  else delete document.documentElement.dataset.theme;
+  try { localStorage.setItem('shout.theme', choice); } catch {}
+  for (const button of document.querySelectorAll('[data-theme-choice]')) button.setAttribute('aria-checked', String(button.dataset.themeChoice === choice));
+}
+for (const button of document.querySelectorAll('[data-theme-choice]')) button.addEventListener('click', () => applyTheme(button.dataset.themeChoice));
+applyTheme(document.documentElement.dataset.theme || 'system');
 document.addEventListener('keydown', (event) => {
   if (event.key.toLowerCase() === 'n' && !event.ctrlKey && !event.metaKey && !event.altKey && !['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement.tagName) && !$('new-dialog').open) { event.preventDefault(); openNewDialog(); }
 });
 window.addEventListener('beforeunload', () => state.stream?.close());
 
 async function init() {
-  if (window.matchMedia('(max-width:1000px)').matches) {
+  if (window.matchMedia('(max-width:1040px)').matches) {
     $('inspector').hidden = true;
     $('viz-button').setAttribute('aria-pressed', 'false');
   }
@@ -508,8 +582,10 @@ async function init() {
     state.config = config;
     state.sessions = Array.isArray(sessions) ? sessions : sessions.sessions || [];
     $('provider-status').textContent = config.provider?.available ? 'Codex connected' : 'Live model unavailable';
+    $('engine-dot').className = `engine-dot ${config.provider?.available ? 'ok' : 'off'}`;
+    $('provider-status').title = config.provider?.available ? '' : config.provider?.error || '';
     if (!config.provider?.available) {
-      $('model-help').textContent = config.provider?.error || 'Live model unavailable. Select Fixture to continue.';
+      $('model-help').textContent = `Live model unavailable: ${config.provider?.error || 'sign in to Codex CLI.'} Use Fixture mode in the meantime.`;
       $('model-help').hidden = false;
     }
     state.messageSignature = '';
