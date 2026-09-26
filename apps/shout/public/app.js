@@ -37,22 +37,19 @@ function scenarioCard(scenario, index, onClick) {
   card.type = 'button';
   card.append(el('span', 'scenario-number', String(index + 1).padStart(2, '0')));
   const copy = el('div');
-  copy.append(el('h3', '', scenario.title), el('p', '', scenario.description));
+  copy.append(el('h3', '', scenario.title));
   card.append(copy, el('span', 'arrow', '↗'));
   card.addEventListener('click', onClick);
   return card;
 }
 function renderWelcome() {
   const wrapper = el('div', 'welcome');
-  wrapper.append(el('div', 'welcome-icon', '↗'), el('div', 'eyebrow', 'JUDGMENT MEETS EXECUTION'));
-  wrapper.append(el('h2', '', state.session ? 'Let’s make something work.' : 'More than a conversation.\nA visible way to build.'));
-  wrapper.append(el('p', '', 'Talk through a change. Let the model make the judgment calls, then watch SHOUT and ALLEN carry out the work. Every model call, tool, and decision has a place in the session.'));
-  wrapper.append(el('div', 'scenario-heading', 'TRY A GUIDED SCENARIO'));
+  wrapper.append(el('h2', '', 'Scenarios'));
   const grid = el('div', 'scenario-grid');
   (state.config?.scenarios || []).forEach((scenario, i) => grid.append(scenarioCard(scenario, i, () => openNewDialog(scenario.id))));
-  wrapper.append(grid, el('div', 'welcome-footer', 'Each scenario starts in its own sample workspace.\nYou review proposed changes before they are applied.'));
+  wrapper.append(grid);
   if (!state.config?.scenarios?.length) {
-    const button = el('button', 'primary-button', 'Start a new session ↗');
+    const button = el('button', 'primary-button', 'New session ↗');
     button.addEventListener('click', () => openNewDialog());
     grid.append(button);
   }
@@ -105,8 +102,8 @@ function renderQuestion() {
   if (!question) return;
   const card = el('section', 'question-card');
   card.setAttribute('aria-label', 'Review required');
-  const prompt = typeof question.prompt === 'string' ? question.prompt : question.prompt?.system || 'Review this proposal before continuing.';
-  card.append(el('h3', '', 'Your judgment is needed'), el('p', '', prompt));
+  const prompt = typeof question.prompt === 'string' ? question.prompt : question.prompt?.system || 'Approve these changes?';
+  card.append(el('h3', '', 'Review changes'), el('p', '', prompt));
   if (typeof question.prompt?.data?.value?.summary === 'string') card.append(el('p', '', question.prompt.data.value.summary));
   const actions = el('div', 'question-actions');
   const approve = el('button', 'approve-button', 'Approve & continue');
@@ -126,13 +123,13 @@ function renderQuestion() {
     });
   }
   actions.append(approve, decline, changes);
-  card.append(actions, el('div', 'question-id', `Correlated question · ${question.id}`));
+  card.append(actions);
   $('question-area').append(card);
 }
 function renderSidebar() {
   $('session-count').textContent = String(state.sessions.length);
   $('session-list').replaceChildren();
-  if (!state.sessions.length) $('session-list').append(el('p', 'empty-copy', 'Your sessions will appear here.'));
+  if (!state.sessions.length) $('session-list').append(el('p', 'empty-copy', 'No sessions'));
   for (const session of state.sessions) {
     const button = el('button', `session-item${session.id === state.session?.id ? ' active' : ''}`);
     button.setAttribute('aria-current', session.id === state.session?.id ? 'page' : 'false');
@@ -147,8 +144,8 @@ function renderSidebar() {
 function renderStatus() {
   const session = state.session;
   const active = isActive(session);
-  $('session-title').textContent = session?.title || 'Make the work visible.';
-  $('workspace-path').textContent = session?.workspace || 'Start a session to build with SHOUT';
+  $('session-title').textContent = session?.title || 'New session';
+  $('workspace-path').textContent = session?.workspace || '';
   $('workspace-path').title = session?.workspace || '';
   $('mode-badge').textContent = session ? session.mode === 'fixture' ? 'FIXTURE · NO MODEL' : 'LIVE MODEL' : 'READY';
   $('mode-badge').classList.toggle('fixture', session?.mode === 'fixture');
@@ -157,11 +154,10 @@ function renderStatus() {
   $('storage-warning').textContent = session?.storageError ? `Session could not be saved: ${typeof session.storageError === 'string' ? session.storageError : JSON.stringify(session.storageError)}. Export this session to keep a copy.` : '';
   $('files-button').disabled = !session;
   $('status-line').className = `status-line${session?.question ? ' question' : active ? ' active' : session?.status === 'failed' ? ' failed' : ''}`;
-  const latest = session?.events?.at(-1);
-  $('status-text').textContent = session?.question ? 'Waiting for your review' : active ? `${session.status} ${latest ? `· ${latest.type}` : ''}` : session ? `Session ${session.status || 'ready'}${session.mode === 'fixture' ? ' · scripted judgments' : ''}` : 'Ready when you are';
+  $('status-text').textContent = session?.question ? 'Awaiting approval' : session?.status || 'Ready';
   $('cancel-button').hidden = !active;
   $('send-button').disabled = active || state.busy;
-  $('message-input').placeholder = active ? 'The current run is in progress. You can draft your next message…' : 'Ask SHOUT to explore, fix, or build something…';
+  $('message-input').placeholder = active ? 'Next message…' : 'Message SHOUT…';
 }
 function classify(event) {
   const type = event.type || '';
@@ -244,11 +240,10 @@ function renderGraph(container, events) {
     row.append(node);
     container.append(row);
   }
-  container.append(el('p', 'flow-note', 'Top to bottom: recorded event order. Horizontal lines connect events sharing an explicit run + effect ID. Select any node to inspect its payload.'));
 }
 function renderVizEmpty(container) {
   const empty = el('div', 'viz-empty');
-  empty.append(el('div', 'empty-glyph', '⌘'), el('h3', '', state.session?.events?.length ? 'No matching events' : 'The runtime, unfolded.'), el('p', '', state.session?.events?.length ? 'Adjust the run or event filter to see more of this session.' : 'As your session runs, see judgment and execution move between the model, SHOUT, ALLEN, and tools.'));
+  empty.append(el('h3', '', state.session?.events?.length ? 'No matching events' : 'No events yet'));
   container.append(empty);
   if (!state.session?.events?.length) {
     const lanes = el('div', 'lane-header');
@@ -270,7 +265,7 @@ function renderTrace(container, events) {
 }
 function renderChanges(container) {
   const changes = state.session?.changes || [];
-  container.append(el('p', 'empty-copy', changes.length ? 'Review the exact before and after contents. Changes may be proposed or already applied; check the run events for the outcome.' : 'Proposed file changes will appear here before approval.'));
+  if (!changes.length) container.append(el('p', 'empty-copy', 'No changes'));
   for (const change of changes) {
     const file = el('section', 'diff-file');
     file.append(el('div', 'diff-title', change.path), el('div', 'diff-label', 'BEFORE'), el('pre', 'diff-code before', change.before ?? '(new file)'), el('div', 'diff-label', 'AFTER'), el('pre', 'diff-code after', change.after ?? '(deleted)'));
@@ -316,13 +311,13 @@ async function loadFiles() {
   const sessionId = state.session?.id;
   if (!sessionId) return;
   $('event-detail').hidden = true;
-  $('inspector-content').replaceChildren(el('p', 'empty-copy', 'Loading workspace files…'));
+  $('inspector-content').replaceChildren(el('p', 'empty-copy', 'Loading files…'));
   try {
     const { files } = await api(`/sessions/${encodeURIComponent(sessionId)}/files`);
     if (state.session?.id !== sessionId || state.tab !== 'files') return;
     const container = $('inspector-content');
     container.replaceChildren();
-    if (!files.length) container.append(el('p', 'empty-copy', 'No readable files found in this workspace.'));
+    if (!files.length) container.append(el('p', 'empty-copy', 'No readable files'));
     for (const path of files) {
       const button = el('button', 'file-entry', path);
       button.addEventListener('click', () => loadFile(sessionId, path));
@@ -335,7 +330,7 @@ async function loadFile(sessionId, path) {
     const file = await api(`/sessions/${encodeURIComponent(sessionId)}/file?path=${encodeURIComponent(path)}`);
     if (state.session?.id !== sessionId || state.tab !== 'files') return;
     const container = $('inspector-content');
-    const back = el('button', 'file-back', '← All workspace files');
+    const back = el('button', 'file-back', '← Files');
     back.addEventListener('click', loadFiles);
     container.replaceChildren(back, el('div', 'diff-title', file.path), el('pre', 'code-block', file.content));
   } catch (error) { toast(error.message); }
@@ -403,7 +398,7 @@ function renderDialogScenarios() {
     $('dialog-scenarios').append(card);
   });
   $('workspace-input').disabled = !!state.selectedScenario;
-  $('workspace-input').placeholder = state.selectedScenario ? 'Isolated sample workspace (created automatically)' : '/path/to/your/project';
+  $('workspace-input').placeholder = state.selectedScenario ? 'New sample workspace' : '/path/to/your/project';
   $('workspace-input').value = state.selectedScenario ? '' : state.config?.defaultWorkspace || state.config?.cwd || '';
   $('test-command-input').disabled = !!state.selectedScenario;
   $('create-button').textContent = state.selectedScenario ? 'Create scenario session ↗' : 'Create session ↗';
@@ -430,7 +425,6 @@ $('new-form').addEventListener('submit', async (event) => {
     $('message-input').value = scenario?.prompt || '';
     resizeComposer();
     $('message-input').focus();
-    if (scenario) toast('Scenario ready. Send the prepared prompt to begin.');
   } catch (error) {
     $('new-error').textContent = error.message;
     $('new-error').hidden = false;
@@ -496,10 +490,8 @@ $('export-button').addEventListener('click', async () => {
   } catch (error) { toast(error.message); }
 });
 $('menu-button').addEventListener('click', () => $('app').classList.toggle('menu-open'));
-$('about-button').addEventListener('click', () => $('about-dialog').showModal());
-$('close-about').addEventListener('click', () => $('about-dialog').close());
 document.addEventListener('keydown', (event) => {
-  if (event.key.toLowerCase() === 'n' && !event.ctrlKey && !event.metaKey && !event.altKey && !['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement.tagName) && !$('new-dialog').open && !$('about-dialog').open) { event.preventDefault(); openNewDialog(); }
+  if (event.key.toLowerCase() === 'n' && !event.ctrlKey && !event.metaKey && !event.altKey && !['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement.tagName) && !$('new-dialog').open) { event.preventDefault(); openNewDialog(); }
 });
 window.addEventListener('beforeunload', () => state.stream?.close());
 
@@ -515,15 +507,18 @@ async function init() {
     const [config, sessions] = await Promise.all([api('/config'), api('/sessions')]);
     state.config = config;
     state.sessions = Array.isArray(sessions) ? sessions : sessions.sessions || [];
-    $('provider-status').textContent = config.provider?.available ? config.provider.version || 'Codex connected' : 'Live provider unavailable · fixture ready';
-    if (!config.provider?.available) $('model-help').textContent = config.provider?.error || 'Live provider is unavailable. Choose fixture mode to explore without a model.';
+    $('provider-status').textContent = config.provider?.available ? 'Codex connected' : 'Live model unavailable';
+    if (!config.provider?.available) {
+      $('model-help').textContent = config.provider?.error || 'Live model unavailable. Select Fixture to continue.';
+      $('model-help').hidden = false;
+    }
     state.messageSignature = '';
     renderMessages();
     renderSidebar();
     const remembered = decodeURIComponent(location.hash.slice(1)) || localStorage.getItem('shout.session');
     if (remembered && state.sessions.some((session) => session.id === remembered)) await selectSession(remembered);
   } catch (error) {
-    $('provider-status').textContent = 'Runtime connection failed';
+    $('provider-status').textContent = 'Disconnected';
     toast(`Cannot connect to SHOUT: ${error.message}`);
   }
 }
