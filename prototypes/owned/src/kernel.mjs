@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import Ajv from 'ajv';
 import { JoshTransport } from './transport.mjs';
 import { callbackSchema, validate, record, textField, chatSchema } from './schema.mjs';
 
@@ -16,8 +17,25 @@ const tool = { name: 'review_draft', version: '1.0.0', description: 'Write one s
 const terminal = state => ['completed', 'failed', 'cancelled', 'stopped', 'interrupted'].includes(state);
 
 export class Run extends EventEmitter {
-  constructor({ provider, source, input, scratchRoot, wallMs = 180000 }) {
+  constructor({ provider, source, input, scratchRoot, wallMs = 180000, tools = [tool], toolHandler, maxModelJudgments = 3 }) {
     super();
+    if (!Number.isInteger(wallMs) || wallMs < 1 || wallMs > 600000) throw new Error('Wall-time budget must be 1–600000 ms');
+    if (!Number.isInteger(maxModelJudgments) || maxModelJudgments < 0 || maxModelJudgments > 16) throw new Error('Model budget must be 0–16');
+    if (!Array.isArray(tools) || tools.length > 256) throw new Error('Invalid host tool catalog');
+    this.tools = structuredClone(tools).sort((a, b) => Buffer.compare(Buffer.from(a.name), Buffer.from(b.name)));
+    this.toolMap = new Map();
+    const validator = new Ajv({ strict: true, allErrors: true });
+    for (const definition of this.tools) {
+      if (typeof definition.name !== 'string' || !definition.name || this.toolMap.has(definition.name)) throw new Error('Invalid or duplicate tool name');
+      for (const key of ['input_schema', 'output_schema', 'error_schema']) {
+        if (!definition[key] || typeof definition[key] !== 'object') throw new Error(`Missing tool ${key}`);
+        validator.compile(definition[key]);
+      }
+      this.toolMap.set(definition.name, definition);
+    }
+    if (toolHandler !== undefined && typeof toolHandler !== 'function') throw new Error('Tool handler must be a function');
+    if (this.tools.some(definition => definition.name !== tool.name) && !toolHandler) throw new Error('Custom tools require a tool handler');
+    this.toolHandler = toolHandler; this.maxModelJudgments = maxModelJudgments;
     this.id = `run-${randomUUID()}`; this.state = 'starting'; this.provider = provider;
     this.source = source; this.input = input; this.wallMs = wallMs;
     this.scratch = resolve(scratchRoot, this.id); this.effects = new Map(); this.events = [];
@@ -51,14 +69,14 @@ export class Run extends EventEmitter {
         }, onFailure: error => this.finish('interrupted', { outcome: 'interrupted', error: error.message }) });
       await this.transport.ready;
       await this.transport.request('initialize', { host, protocol_versions: ['josh/1.6'], language_versions: ['>=0.1.0, <0.2.0'],
-        execution_mode: 'unattended', invoking_session_id: null, standard_capabilities: [], limits, extensions: [] });
+        execution_mode: 'unattended', invoking_session_id: null, standard_capabilities: [], limits: { ...limits, max_catalog_tools: Math.max(1, this.tools.length) }, extensions: [] });
       const metadata = { source: host.name, source_revision: host.version, observed_at_unix_ms: Date.now(), freshness: 'current', complete: true };
       await this.transport.request('host/project', { profile: 'josh.host-projection/0.1', projection_id: this.id,
         host, session_binding: 'none', sections: ['tools', 'resources', 'attachments', 'transcript', 'models', 'user_interaction', 'agents', 'roots', 'permissions', 'telemetry'].map(kind => ({
-          kind, ...metadata, item_count: kind === 'tools' ? 1 : 0 })) });
-      await this.transport.request('catalog/set', { schema_dialect: 'https://json-schema.org/draft/2020-12/schema', metadata, tools: [tool] });
+          kind, ...metadata, item_count: kind === 'tools' ? this.tools.length : 0 })) });
+      await this.transport.request('catalog/set', { schema_dialect: 'https://json-schema.org/draft/2020-12/schema', metadata, tools: this.tools });
       const loaded = await this.transport.request('program/load', { format: 'source_bundle', files: [{ path: 'src/main.allen', encoding: 'utf8', content: this.source }] });
-      if (!Array.isArray(loaded.required_tools) || loaded.required_tools.some(name => name !== tool.name)) throw new Error('Program requests an unauthorized tool');
+      if (!Array.isArray(loaded.required_tools) || loaded.required_tools.some(name => !this.toolMap.has(name))) throw new Error('Program requests an unauthorized tool');
       this.state = 'running'; this.event('program.loaded', { artifactDigest: loaded.artifact_digest, tools: loaded.required_tools });
       const result = await this.transport.request('execution/start', { execution_id: this.id, program_id: loaded.program_id,
         artifact_digest: loaded.artifact_digest, entry: 'main', input: this.input, working_directory: null,
@@ -78,7 +96,7 @@ export class Run extends EventEmitter {
     this.event('effect.requested', { id, method });
     try {
       if (method === 'model/request') {
-        if (this.counters.modelJudgments >= 3) throw new Error('Model judgment budget exhausted (3 per run)');
+        if (this.counters.modelJudgments >= this.maxModelJudgments) throw new Error(`Model judgment budget exhausted (${this.maxModelJudgments} per run)`);
         this.counters.modelJudgments++; effect.schema = callbackSchema(params.response_schema.descriptor);
         this.event('model.started', { id, prompt: params.prompt });
         const value = await this.provider.judge({ prompt: params.prompt, schema: effect.schema, signal: effect.abort.signal,
@@ -87,15 +105,25 @@ export class Run extends EventEmitter {
         validate(effect.schema, value);
         this.event('model.completed', { id, value }); this.respond(effect, { value });
       } else if (method === 'tool/invoke') {
-        if (params.tool !== tool.name) throw new Error('Unknown host tool');
-        validate(tool.input_schema, params.input);
+        const definition = this.toolMap.get(params.tool);
+        if (!definition) throw new Error('Unknown host tool');
+        validate(definition.input_schema, params.input);
         if (this.counters.nativeToolCalls >= 16) throw new Error('Native tool budget exhausted (16 per run)');
         this.counters.nativeToolCalls++;
-        const text = `Review ${params.input.ticket_id}: ${params.input.reason}`;
-        await writeFile(resolve(this.scratch, `draft-${createHash('sha256').update(effect.id).digest('hex').slice(0, 16)}.txt`), text + '\n', { flag: 'wx', mode: 0o600 });
+        this.event('tool.started', { id, tool: params.tool, input: params.input });
+        let value; let artifact;
+        if (this.toolHandler) {
+          value = await this.toolHandler(params.tool, params.input, { signal: effect.abort.signal, effectId: id });
+        } else {
+          const text = `Review ${params.input.ticket_id}: ${params.input.reason}`;
+          artifact = resolve(this.scratch, `draft-${createHash('sha256').update(effect.id).digest('hex').slice(0, 16)}.txt`);
+          await writeFile(artifact, text + '\n', { flag: 'wx', mode: 0o600 });
+          value = { text };
+        }
         if (!this.isPending(effect)) return;
-        this.event('tool.completed', { id, tool: tool.name, artifact: resolve(this.scratch, `draft-${createHash('sha256').update(effect.id).digest('hex').slice(0, 16)}.txt`) });
-        this.respond(effect, { outcome: 'ok', value: { text } });
+        validate(definition.output_schema, value);
+        this.event('tool.completed', { id, tool: params.tool, value, ...(artifact ? { artifact } : {}) });
+        this.respond(effect, { outcome: 'ok', value });
       } else if (method === 'user/ask') {
         effect.schema = callbackSchema(params.response_schema.descriptor);
         if (this.counters.userQuestions >= 8) throw new Error('User question budget exhausted (8 per run)');
