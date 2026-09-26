@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>SHOUT — agent workspace</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="app" class="app">
+    <aside class="sidebar" aria-label="Sessions">
+      <a class="brand" href="/" aria-label="SHOUT home"><span class="brand-mark">S<span>↗</span></span><span>SHOUT<small>AGENT WORKSPACE</small></span></a>
+      <button class="new-session" id="new-session"><span>＋</span> New session <kbd>N</kbd></button>
+      <div class="sidebar-label">YOUR SESSIONS <span id="session-count">0</span></div>
+      <nav id="session-list" class="session-list" aria-label="Session list"></nav>
+      <div class="sidebar-bottom"><div class="engine-dot"></div><div>Built on JOSH / ALLEN<small id="provider-status">Connecting to runtime…</small></div><button class="icon-button" id="about-button" title="About the runtime" aria-label="About the runtime">?</button></div>
+    </aside>
+    <main class="workspace">
+      <header class="topbar">
+        <button class="icon-button mobile-menu" id="menu-button" aria-label="Toggle sessions">☰</button>
+        <div class="session-heading"><div class="eyebrow">WORKSPACE <span id="mode-badge" class="badge">READY</span></div><h1 id="session-title">Make the work visible.</h1><div id="workspace-path" class="workspace-path">Start a session to build with SHOUT</div></div>
+        <div class="topbar-actions"><button class="quiet-button" id="files-button" aria-pressed="false">Files</button><button class="quiet-button" id="export-button" disabled>Export</button><button class="viz-toggle" id="viz-button" aria-pressed="true"><span>⌘</span> Session VIZ</button></div>
+      </header>
+      <div class="workspace-body">
+        <section class="conversation" aria-label="Conversation">
+          <div id="messages" class="messages" aria-live="polite" aria-relevant="additions"></div>
+          <div id="question-area"></div>
+          <div id="status-line" class="status-line" aria-live="polite"><span class="status-dot"></span><span id="status-text">Ready when you are</span><button id="cancel-button" class="text-button" hidden>Cancel run</button></div>
+          <form id="composer" class="composer"><label class="sr-only" for="message-input">Message SHOUT</label><textarea id="message-input" placeholder="Ask SHOUT to explore, fix, or build something…" rows="2"></textarea><div class="composer-bottom"><span class="composer-note"><span class="tiny-mark">S</span> Models judge. ALLEN orchestrates.</span><button type="submit" id="send-button" class="send-button" aria-label="Send message">↑</button></div></form>
+          <div class="input-hint">Enter to send <span>·</span> Shift + Enter for a new line <span>·</span> Review changes before applying</div>
+        </section>
+        <aside id="inspector" class="inspector" aria-label="Session inspector">
+          <div class="inspector-header"><div><span class="eyebrow">OBSERVABILITY</span><h2 id="inspector-title">Session VIZ</h2></div><span class="live-indicator" id="connection-status">LIVE</span></div>
+          <div class="inspector-tabs" role="tablist"><button id="graph-tab" class="active" role="tab" aria-selected="true">Flow</button><button id="trace-tab" role="tab" aria-selected="false">Events <span id="event-count">0</span></button><button id="changes-tab" role="tab" aria-selected="false">Changes <span id="change-count">0</span></button></div>
+          <div id="viz-toolbar" class="viz-toolbar"><label class="sr-only" for="run-filter">Filter by run</label><select id="run-filter"><option value="">All runs</option></select><label class="sr-only" for="event-filter">Filter events</label><input id="event-filter" placeholder="Filter events…"></div>
+          <div id="inspector-content" class="inspector-content"></div>
+          <div id="event-detail" class="event-detail" hidden></div>
+          <div class="inspector-footer"><span class="legend-dot model"></span> Model <span class="legend-dot vm"></span> VM <span class="legend-dot tool"></span> Tool <span class="legend-dot user"></span> You</div>
+        </aside>
+      </div>
+    </main>
+  </div>
+  <dialog id="new-dialog" aria-labelledby="new-dialog-title"><form id="new-form"><div class="dialog-heading"><div><span class="eyebrow">A NEW WORKSPACE</span><h2 id="new-dialog-title">What are we building?</h2></div><button type="button" class="icon-button" id="close-dialog" aria-label="Close">×</button></div><p class="muted">Start with your code, or launch a guided scenario in an isolated sample workspace.</p><label for="workspace-input">Workspace path</label><input id="workspace-input" name="workspace" placeholder="/path/to/your/project"><label for="mode-input">Model provider</label><select id="mode-input" name="mode"><option value="live">Live · Codex model</option><option value="fixture">Fixture · deterministic demo, no model calls</option></select><p class="field-help" id="model-help">Live mode uses your locally signed-in Codex account.</p><label for="test-command-input">Test command <span class="optional">optional</span></label><input id="test-command-input" name="testCommand" placeholder="e.g. npm test"><p class="field-help">The runtime can execute this command in your workspace.</p><label>Guided scenarios</label><div id="dialog-scenarios" class="dialog-scenarios"></div><p id="new-error" class="form-error" role="alert" hidden></p><div class="dialog-footer"><button type="button" id="blank-session" class="quiet-button">Clear scenario</button><button type="submit" class="primary-button" id="create-button">Create session <span>↗</span></button></div></form></dialog>
+  <dialog id="about-dialog" aria-labelledby="about-title"><div class="dialog-heading"><h2 id="about-title">A runtime you can see.</h2><button id="close-about" class="icon-button" aria-label="Close">×</button></div><p>SHOUT owns the session. Models make judgments and propose code. JOSH executes typed ALLEN programs, and SHOUT dispatches their tools and questions.</p><p>The visualization shows recorded runtime events. Rows follow event order; related calls are identified by their run and effect IDs. A completed row is evidence of a recorded event, not proof that a task is correct.</p><p class="muted">Fixture mode uses scripted judgments. Live mode calls your local Codex provider. This is an experimental local coding workspace.</p></dialog>
+  <div id="toast" class="toast" role="status" hidden></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
