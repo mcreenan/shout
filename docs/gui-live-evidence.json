@@ -1,0 +1,218 @@
+{
+  "joshRevision": "abb8a9782fc438d1b87e8aa2fdaea65e5db633c3",
+  "codexVersion": "0.153.3",
+  "pricing": {
+    "scenario": "pricing",
+    "approval": "automated-verification-fixture",
+    "status": "completed",
+    "output": {
+      "accepted": true,
+      "attempts": 1,
+      "changed": 1,
+      "passed": true,
+      "summary": "Update checkoutTotal to discount the subtotal before calculating tax, rounding each monetary amount to cents while preserving the exported API.",
+      "test_output": "✔ discount reduces the taxable amount (0.394351ms)\n✔ no discount preserves the regular total (0.068721ms)\n✔ a full discount leaves nothing taxable (0.054712ms)\n✔ round the final total to cents (0.057728ms)\nℹ tests 4\nℹ suites 0\nℹ pass 4\nℹ fail 0\nℹ cancelled 0\nℹ skipped 0\nℹ todo 0\nℹ duration_ms 36.435315\n"
+    },
+    "workers": [
+      {
+        "type": "chat.worker",
+        "provider": "codex-exec",
+        "usage": {
+          "input_tokens": 525,
+          "cached_input_tokens": 0,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 72,
+          "reasoning_output_tokens": 0
+        }
+      },
+      {
+        "type": "model.worker",
+        "provider": "codex-exec",
+        "usage": {
+          "input_tokens": 956,
+          "cached_input_tokens": 0,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 349,
+          "reasoning_output_tokens": 134
+        }
+      }
+    ]
+  },
+  "slug": {
+    "verifiedAt": "2026-09-26T18:56:18.325Z",
+    "approval": "Automated browser verification driver; not actual human approval",
+    "scenario": "slug",
+    "output": {
+      "accepted": true,
+      "attempts": 1,
+      "changed": 1,
+      "passed": true,
+      "summary": "Implement slug generation with trimming, lowercasing, accent removal, separator collapsing, and leading/trailing hyphen removal while preserving the exported API.",
+      "test_output": "✔ trims and lowercases (0.482153ms)\n✔ normalizes accented characters (0.093142ms)\n✔ collapses punctuation and repeated separators (0.060153ms)\n✔ keeps digits (3.321557ms)\n✔ empty and punctuation-only inputs produce no slug (0.083158ms)\nℹ tests 5\nℹ suites 0\nℹ pass 5\nℹ fail 0\nℹ cancelled 0\nℹ skipped 0\nℹ todo 0\nℹ duration_ms 39.125318\n"
+    },
+    "events": [
+      {
+        "type": "chat.started"
+      },
+      {
+        "type": "chat.worker"
+      },
+      {
+        "type": "chat.completed"
+      },
+      {
+        "type": "run.started"
+      },
+      {
+        "type": "program.loaded"
+      },
+      {
+        "type": "vm.event",
+        "method": "execution/event"
+      },
+      {
+        "type": "vm.event",
+        "method": "execution/event"
+      },
+      {
+        "type": "vm.event",
+        "method": "execution/event"
+      },
+      {
+        "type": "vm.event",
+        "method": "execution/event"
+      },
+      {
+        "type": "effect.requested",
+        "method": "tool/invoke"
+      },
+      {
+        "type": "tool.started",
+        "tool": "inspect_workspace"
+      },
+      {
+        "type": "tool.completed",
+        "tool": "inspect_workspace"
+      },
+      {
+        "type": "effect.resolved",
+        "method": "tool/invoke"
+      },
+      {
+        "type": "vm.event",
+        "method": "execution/event"
+      },
+      {
+        "type": "effect.requested",
+        "method": "model/request"
+      },
+      {
+        "type": "model.started"
+      },
+      {
+        "type": "model.worker"
+      },
+      {
+        "type": "model.completed"
+      },
+      {
+        "type": "effect.resolved",
+        "method": "model/request"
+      },
+      {
+        "type": "effect.requested",
+        "method": "user/ask"
+      },
+      {
+        "type": "user.question"
+      },
+      {
+        "type": "user.answered"
+      },
+      {
+        "type": "effect.resolved",
+        "method": "user/ask"
+      },
+      {
+        "type": "vm.event",
+        "method": "execution/event"
+      },
+      {
+        "type": "effect.requested",
+        "method": "tool/invoke"
+      },
+      {
+        "type": "tool.started",
+        "tool": "apply_changes"
+      },
+      {
+        "type": "workspace.changed"
+      },
+      {
+        "type": "tool.completed",
+        "tool": "apply_changes"
+      },
+      {
+        "type": "effect.resolved",
+        "method": "tool/invoke"
+      },
+      {
+        "type": "vm.event",
+        "method": "execution/event"
+      },
+      {
+        "type": "vm.event",
+        "method": "execution/event"
+      },
+      {
+        "type": "effect.requested",
+        "method": "tool/invoke"
+      },
+      {
+        "type": "tool.started",
+        "tool": "run_tests"
+      },
+      {
+        "type": "tool.completed",
+        "tool": "run_tests"
+      },
+      {
+        "type": "effect.resolved",
+        "method": "tool/invoke"
+      },
+      {
+        "type": "vm.event",
+        "method": "execution/event"
+      },
+      {
+        "type": "vm.event",
+        "method": "execution/event"
+      },
+      {
+        "type": "run.terminal"
+      }
+    ],
+    "workers": [
+      {
+        "provider": "codex-exec",
+        "usage": {
+          "input_tokens": 557,
+          "cached_input_tokens": 0,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 57,
+          "reasoning_output_tokens": 0
+        }
+      },
+      {
+        "provider": "codex-exec",
+        "usage": {
+          "input_tokens": 964,
+          "cached_input_tokens": 0,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 289,
+          "reasoning_output_tokens": 125
+        }
+      }
+    ]
+  }
+}

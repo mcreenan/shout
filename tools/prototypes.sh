@@ -19,6 +19,7 @@ shift || true
 case "$command_name" in
   setup)
     export JOSH_BIN="$("$root_dir/tools/setup-josh.sh")"
+    npm --prefix "$root_dir" ci --no-audit --no-fund
     for track in native owned; do
       project_dir=$(track_dir "$track")
       npm --prefix "$project_dir" ci --no-audit --no-fund

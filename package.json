@@ -4,9 +4,13 @@
   "version": "0.0.0",
   "description": "SHOUT: agent harness and runtime experiments built on JOSH/ALLEN",
   "scripts": {
+    "start": "bash tools/start-gui.sh",
+    "gui": "bash tools/start-gui.sh",
+    "test:gui": "node --test apps/shout/test/*.test.mjs",
+    "test:browser": "node tools/gui-browser-smoke.mjs",
     "setup": "bash tools/prototypes.sh setup",
-    "test": "bash tools/prototypes.sh test && node tools/interactive-smoke.mjs",
-    "typecheck": "bash tools/prototypes.sh typecheck",
+    "test": "bash tools/prototypes.sh test && node tools/interactive-smoke.mjs && npm run test:gui",
+    "typecheck": "bash tools/prototypes.sh typecheck && node --check apps/shout/src/session.mjs && node --check apps/shout/src/server.mjs && node --check apps/shout/public/app.js",
     "verify": "npm run typecheck && npm test",
     "native": "bash tools/prototypes.sh native start",
     "owned": "bash tools/prototypes.sh owned start",
@@ -14,5 +18,8 @@
     "owned:demo": "bash tools/prototypes.sh owned demo",
     "native:live": "bash tools/prototypes.sh native live",
     "owned:live": "bash tools/prototypes.sh owned live"
+  },
+  "devDependencies": {
+    "playwright": "1.58.2"
   }
 }
