@@ -145,8 +145,15 @@ test('unexpected VM exit is interruption, not resumable completion', async t => 
   assert.equal((await run.done).state, 'interrupted'); assert.equal(run.effects.size, 0);
 });
 
-test('wall budget cancels a pending provider', async t => {
+test('wall budget cancels a pending provider and reports its duration', async t => {
   const session = await create(t, { judge: () => new Promise(() => {}) }, { wallMs: 100 });
   const run = await session.review(); const result = await run.done;
-  assert.equal(result.state, 'failed'); assert.match(result.result.error, /wall-time/);
+  assert.equal(result.state, 'failed'); assert.match(result.result.error, /wall-time budget expired after 100 ms/);
+});
+
+test('run accepts a disabled wall budget while cancellation still aborts work', async t => {
+  const session = await create(t, { judge: () => new Promise(() => {}) }, { wallMs: null });
+  const run = await session.review(); await event(run, 'model.started');
+  session.cancel();
+  assert.equal((await run.done).state, 'cancelled');
 });

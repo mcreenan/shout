@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { Workspace, scenarios, createScenario, fixtureChanges } from '../src/workspace.mjs';
+import { Workspace, scenarios, createScenario } from '../src/workspace.mjs';
+import { solutionChanges } from './doubles.mjs';
 
 async function temporary(t) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'shout-workspace-test-'));
@@ -121,17 +122,17 @@ test('concurrent patch requests serialize and cannot overwrite a changed precond
 
 test('rejects oversized, binary, invalid UTF-8 files and oversized patches', async t => {
   const directory = await temporary(t);
-  await fs.writeFile(path.join(directory, 'large.mjs'), 'a'.repeat(65 * 1024));
+  await fs.writeFile(path.join(directory, 'large.mjs'), 'a'.repeat(257 * 1024));
   await fs.writeFile(path.join(directory, 'binary.mjs'), Buffer.from([1, 0, 2]));
   await fs.writeFile(path.join(directory, 'invalid.mjs'), Buffer.from([0xff]));
   const workspace = await new Workspace(directory).init();
   for (const filename of ['large.mjs', 'binary.mjs', 'invalid.mjs']) await assert.rejects(workspace.read(filename));
-  await assert.rejects(workspace.apply([{ path: 'new.mjs', before: '', after: 'a'.repeat(65 * 1024) }]), /bounded text/);
+  await assert.rejects(workspace.apply([{ path: 'new.mjs', before: '', after: 'a'.repeat(257 * 1024) }]), /bounded text/);
   await assert.rejects(workspace.apply([{ path: 'new.mjs', before: '', after: 'hello\0world' }]), /bounded text/);
 });
 
 for (const scenario of scenarios) {
-  test(`${scenario.id}: isolated real project fails initially, scripted patch makes tests pass`, async t => {
+  test(`${scenario.id}: isolated real project fails initially, its checked-in solution makes tests pass`, async t => {
     const base = await temporary(t);
     const config = await createScenario(scenario.id, base);
     const workspace = await new Workspace(config.workspace, config).init();
@@ -140,12 +141,12 @@ for (const scenario of scenarios) {
     assert.match(initial.output, /fail [1-9]/);
     const before = await workspace.inspect();
     assert.equal(before.files.some(file => file.path.includes('solution')), false);
-    const changes = await fixtureChanges(scenario.id, before.files);
+    const changes = await solutionChanges(scenario.id, before.files);
     await workspace.apply(changes);
     const result = await workspace.test();
     assert.equal(result.passed, true, result.output);
     assert.match(result.output, /fail 0/);
-    assert.deepEqual(await fixtureChanges(scenario.id, (await workspace.inspect()).files), []);
+    assert.deepEqual(await solutionChanges(scenario.id, (await workspace.inspect()).files), []);
     const second = await createScenario(scenario.id, base);
     assert.notEqual(second.workspace, config.workspace);
     assert.equal((await new Workspace(second.workspace, second).test()).passed, false);

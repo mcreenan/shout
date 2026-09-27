@@ -1,0 +1,9 @@
+{
+  "name": "ledger-import",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "description": "Import bank CSV exports into a household ledger and summarize spending by month.",
+  "bin": { "ledger-import": "src/cli.mjs" },
+  "scripts": { "test": "node --test" }
+}

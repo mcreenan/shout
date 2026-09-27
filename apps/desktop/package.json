@@ -1,0 +1,16 @@
+{
+  "name": "shout-desktop",
+  "productName": "SHOUT",
+  "desktopName": "shout.desktop",
+  "private": true,
+  "version": "0.0.0",
+  "description": "SHOUT desktop shell: an Electron window around the local SHOUT server",
+  "type": "module",
+  "main": "src/main.mjs",
+  "scripts": {
+    "start": "bash ../../tools/start-desktop.sh"
+  },
+  "dependencies": {
+    "electron": "44.4.5"
+  }
+}

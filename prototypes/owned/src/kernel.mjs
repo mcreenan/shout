@@ -14,13 +14,20 @@ const limits = { max_frame_bytes: 1048576, max_active_requests: 64, max_loaded_p
 const tool = { name: 'review_draft', version: '1.0.0', description: 'Write one synthetic review draft into this run scratch directory. No external issue is changed.',
   input_schema: record({ ticket_id: textField, reason: textField }), output_schema: record({ text: textField }),
   error_schema: record({ message: textField }), effects: [], idempotency: 'non_idempotent' };
+/** Thrown by a tool handler to return the tool's declared `{ message }` error to the program. */
+export class ToolError extends Error {}
+// Leaves room for the response envelope inside the negotiated max_frame_bytes.
+const maxToolResultBytes = limits.max_frame_bytes - 64 * 1024;
 const terminal = state => ['completed', 'failed', 'cancelled', 'stopped', 'interrupted'].includes(state);
 
+export const DEFAULT_RUN_WALL_MS = 30 * 60 * 1000;
+
 export class Run extends EventEmitter {
-  constructor({ provider, source, input, scratchRoot, wallMs = 180000, tools = [tool], toolHandler, maxModelJudgments = 3 }) {
+  constructor({ provider, source, input, scratchRoot, wallMs = DEFAULT_RUN_WALL_MS, tools = [tool], toolHandler, maxModelJudgments = 3, maxToolCalls = 16 }) {
     super();
-    if (!Number.isInteger(wallMs) || wallMs < 1 || wallMs > 600000) throw new Error('Wall-time budget must be 1–600000 ms');
+    if (wallMs !== null && (!Number.isInteger(wallMs) || wallMs < 1 || wallMs > 2 * 60 * 60 * 1000)) throw new Error('Wall-time budget must be 1–7200000 ms or null');
     if (!Number.isInteger(maxModelJudgments) || maxModelJudgments < 0 || maxModelJudgments > 16) throw new Error('Model budget must be 0–16');
+    if (!Number.isInteger(maxToolCalls) || maxToolCalls < 0 || maxToolCalls > 256) throw new Error('Tool budget must be 0–256');
     if (!Array.isArray(tools) || tools.length > 256) throw new Error('Invalid host tool catalog');
     this.tools = structuredClone(tools).sort((a, b) => Buffer.compare(Buffer.from(a.name), Buffer.from(b.name)));
     this.toolMap = new Map();
@@ -35,7 +42,7 @@ export class Run extends EventEmitter {
     }
     if (toolHandler !== undefined && typeof toolHandler !== 'function') throw new Error('Tool handler must be a function');
     if (this.tools.some(definition => definition.name !== tool.name) && !toolHandler) throw new Error('Custom tools require a tool handler');
-    this.toolHandler = toolHandler; this.maxModelJudgments = maxModelJudgments;
+    this.toolHandler = toolHandler; this.maxModelJudgments = maxModelJudgments; this.maxToolCalls = maxToolCalls;
     this.id = `run-${randomUUID()}`; this.state = 'starting'; this.provider = provider;
     this.source = source; this.input = input; this.wallMs = wallMs;
     this.scratch = resolve(scratchRoot, this.id); this.effects = new Map(); this.events = [];
@@ -54,8 +61,10 @@ export class Run extends EventEmitter {
     })), ...(this.result ? { result: this.result } : {}) };
   }
   async start() {
-    this.event('run.started', { sourceBytes: Buffer.byteLength(this.source) });
-    this.timer = setTimeout(() => this.finish('failed', { outcome: 'failed', error: 'Host wall-time budget expired' }), this.wallMs);
+    this.event('run.started', { sourceBytes: Buffer.byteLength(this.source), wallMs: this.wallMs });
+    this.timer = this.wallMs === null ? null : setTimeout(() => this.finish('failed', {
+      outcome: 'failed', error: `Host wall-time budget expired after ${this.wallMs} ms (${this.wallMs / 1000} seconds)`,
+    }), this.wallMs);
     try {
       await mkdir(this.scratch, { recursive: true });
       if (terminal(this.state)) return;
@@ -80,7 +89,7 @@ export class Run extends EventEmitter {
       this.state = 'running'; this.event('program.loaded', { artifactDigest: loaded.artifact_digest, tools: loaded.required_tools });
       const result = await this.transport.request('execution/start', { execution_id: this.id, program_id: loaded.program_id,
         artifact_digest: loaded.artifact_digest, entry: 'main', input: this.input, working_directory: null,
-        granted_capabilities: [], granted_tools: loaded.required_tools, allowed_http_origins: [], granted_exec: [], granted_exec_environment: [], limits: { wall_ms: this.wallMs } });
+        granted_capabilities: [], granted_tools: loaded.required_tools, allowed_http_origins: [], granted_exec: [], granted_exec_environment: [], limits: this.wallMs === null ? {} : { wall_ms: this.wallMs } });
       const state = result.outcome === 'completed' ? 'completed' : result.outcome === 'cancelled' ? 'cancelled' : result.outcome === 'stopped' ? 'stopped' : 'failed';
       this.finish(state, result);
     } catch (error) { this.finish('failed', { outcome: 'failed', error: error.message }); }
@@ -108,12 +117,22 @@ export class Run extends EventEmitter {
         const definition = this.toolMap.get(params.tool);
         if (!definition) throw new Error('Unknown host tool');
         validate(definition.input_schema, params.input);
-        if (this.counters.nativeToolCalls >= 16) throw new Error('Native tool budget exhausted (16 per run)');
+        if (this.counters.nativeToolCalls >= this.maxToolCalls) throw new Error(`Native tool budget exhausted (${this.maxToolCalls} per run)`);
         this.counters.nativeToolCalls++;
         this.event('tool.started', { id, tool: params.tool, input: params.input });
         let value; let artifact;
         if (this.toolHandler) {
-          value = await this.toolHandler(params.tool, params.input, { signal: effect.abort.signal, effectId: id });
+          try { value = await this.toolHandler(params.tool, params.input, { signal: effect.abort.signal, effectId: id }); }
+          catch (error) {
+            // A declared tool error is ordinary program data (the generated Error.Declared
+            // variant); any other handler failure still fails the run.
+            if (!(error instanceof ToolError) || !this.isPending(effect)) throw error;
+            const declared = { message: error.message.slice(0, 2048) || 'Tool failed' };
+            validate(definition.error_schema, declared);
+            this.event('tool.failed', { id, tool: params.tool, error: declared });
+            this.respond(effect, { outcome: 'error', error: declared });
+            return;
+          }
         } else {
           const text = `Review ${params.input.ticket_id}: ${params.input.reason}`;
           artifact = resolve(this.scratch, `draft-${createHash('sha256').update(effect.id).digest('hex').slice(0, 16)}.txt`);
@@ -122,6 +141,16 @@ export class Run extends EventEmitter {
         }
         if (!this.isPending(effect)) return;
         validate(definition.output_schema, value);
+        // A result that cannot fit one JOSH frame would stall the transport; return it as the
+        // tool's declared error when the tool has the common { message } error contract.
+        const bytes = Buffer.byteLength(JSON.stringify(value));
+        if (bytes > maxToolResultBytes) {
+          const declared = { message: `Tool result too large (${bytes} bytes; limit ${maxToolResultBytes}). Request less data.` };
+          if (!new Ajv({ strict: true }).validate(definition.error_schema, declared)) throw new Error(declared.message);
+          this.event('tool.failed', { id, tool: params.tool, error: declared });
+          this.respond(effect, { outcome: 'error', error: declared });
+          return;
+        }
         this.event('tool.completed', { id, tool: params.tool, value, ...(artifact ? { artifact } : {}) });
         this.respond(effect, { outcome: 'ok', value });
       } else if (method === 'user/ask') {

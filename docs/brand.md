@@ -1,8 +1,8 @@
 # SHOUT identity
 
-The approved logo is the **SHOUT! wordmark only**. Use the same transparent PNG in light and dark mode; its white edge keeps the dark outline visible. Preserve its aspect ratio and full lettering, including the exclamation mark and red underline.
+The approved logo is the **SHOUT! wordmark only**. Preserve its aspect ratio and full lettering, including the exclamation mark and red underline. Light mode uses white letter faces with a black outline. Dark mode swaps those neutral colors, using black letter faces with a white outline, while retaining the original blue and red details.
 
-Canonical asset: [shout-wordmark.png](../apps/shout/public/shout-wordmark.png). The README and app both use this file. The wordmark was selected from the Stampede S exploration and isolated with the built-in image generation tool. The standalone S and mascot concepts are not part of the identity.
+Canonical artwork: [shout-wordmark.png](../apps/shout/public/shout-wordmark.png). Dark-mode artwork: [shout-wordmark-dark.png](../apps/shout/public/shout-wordmark-dark.png), the same art with the white faces and navy outline swapped along the white–navy axis (anti-aliased edges included); the red and blue extrusions are unchanged. The app switches between the light and dark renderings for explicit and system theme choices. The wordmark was selected from the Stampede S exploration and isolated with the built-in image generation tool. The standalone S and mascot concepts are not part of the identity.
 
 | Color | Hex | Use |
 | --- | --- | --- |

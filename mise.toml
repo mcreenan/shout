@@ -1,0 +1,3 @@
+[tools]
+# SHOUT is verified against this exact Codex CLI (see apps/shout/src/agent.mjs).
+codex = "0.157.1"

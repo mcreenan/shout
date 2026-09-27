@@ -1,0 +1,63 @@
+// List TODO, FIXME and HACK markers in the workspace, grouped by file with counts. Use when asked about outstanding todos or known hacks; no model call.
+manifest {
+  language: "0.1"
+  entry: main
+  capabilities: []
+  tools: { required: [{ name: "workspace.search", version: ">=1.0.0, <2.0.0" }] }
+}
+
+record Hit { path: String line: Int text: String }
+record Marked { marker: String hit: Hit }
+
+async fn search(marker: String) returns { hits: List<Hit>, truncated: Bool } effects [tool.workspace.search@1] {
+  match await tools.workspace.search.call({ query: marker, max_results: 500 }) {
+    Ok(result) => { hits: result.matches, truncated: result.truncated }
+    Err(_) => stop(`Searching for ${marker} failed.`)
+  }
+}
+
+fn count(items: List<Marked>, marker: String) returns String {
+  to_string(length(list.filter(items, fn(item: Marked) returns Bool { item.marker == marker })))
+}
+
+// Insertion by partition keeps the output in line order within a file.
+fn by_line(items: List<Marked>) returns List<Marked> {
+  mut sorted: List<Marked> = [];
+  for item in items {
+    let parts = list.partition(sorted, fn(other: Marked) returns Bool { other.hit.line <= item.hit.line });
+    sorted = [..parts.matched, item, ..parts.rest];
+  }
+  sorted
+}
+
+export async fn main() returns String effects [tool.workspace.search@1] {
+  let markers = ["TODO", "FIXME", "HACK"];
+  mut all: List<Marked> = [];
+  mut truncated = false;
+  mut files: Map<String, Int> = map {};
+  for marker in markers {
+    let found = await search(marker);
+    truncated = truncated || found.truncated;
+    for hit in found.hits {
+      all = list.append(all, Marked { marker: marker, hit: hit });
+      files = map.insert(files, hit.path, (map.get(files, hit.path) ?? 0) + 1).values;
+    }
+  }
+  if (length(all) == 0) {
+    return "No TODO, FIXME or HACK markers found.";
+  }
+  mut table: List<String> = ["| File | TODO | FIXME | HACK | Total |", "|---|---:|---:|---:|---:|"];
+  mut details: List<String> = [];
+  // Map iteration is in sorted key order, so files are listed alphabetically.
+  for (path, total) in files {
+    let here = by_line(list.filter(all, fn(item: Marked) returns Bool { item.hit.path == path }));
+    table = list.append(table, `| \`${path}\` | ${count(here, "TODO")} | ${count(here, "FIXME")} | ${count(here, "HACK")} | ${to_string(total)} |`);
+    details = list.append(details, `\n**${path}**`);
+    for item in here {
+      details = list.append(details, `- L${to_string(item.hit.line)} ${item.marker}: \`${string.trim_ascii(item.hit.text)}\``);
+    }
+  }
+  let note = if (truncated) { "\n\nSome searches hit the 500-result limit, so counts may be incomplete." } else { "" };
+  let header = `${to_string(length(all))} markers in ${to_string(length(map.keys(files)))} file(s).${note}`;
+  string.join([header, "", ..table, ..details], "\n")
+}

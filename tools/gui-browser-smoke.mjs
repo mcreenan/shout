@@ -5,19 +5,21 @@ import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { startServer } from '../apps/shout/src/server.mjs';
+import { codeAgent, scenarioProvider } from '../apps/shout/test/doubles.mjs';
 
 const stateRoot = await mkdtemp(resolve(tmpdir(), 'shout-browser-'));
-const app = await startServer({ port: 0, stateRoot, checkProvider: async () => ({ available: false, error: 'Browser verification uses explicitly scripted fixture judgments.' }) });
+// Scripted agent and judgments; the compiler, VM, workspace, approvals and tests are real.
+const app = await startServer({ port: 0, stateRoot, agent: codeAgent(), providerFactory: data => scenarioProvider(data.scenario), checkProvider: async () => ({ available: true, version: 'scripted' }) });
 let browser;
 try {
   const executablePath = process.env.CHROMIUM_BIN || (existsSync('/usr/bin/chromium') ? '/usr/bin/chromium' : undefined);
   browser = await chromium.launch({ headless: true, executablePath });
   const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
   const errors = []; page.on('pageerror', error => errors.push(error.message));
+  const screenshotDir = resolve('.cache/shout-ui'); await mkdir(screenshotDir, { recursive: true });
   await page.goto(app.url);
   await page.getByRole('heading', { name: 'Fix a checkout calculation' }).first().waitFor();
   await page.getByRole('button', { name: /Fix a checkout calculation/ }).first().click();
-  await page.getByLabel('Model provider').selectOption('fixture');
   await page.getByRole('button', { name: 'Create session' }).click();
   await page.waitForFunction(() => location.hash.startsWith('#session-'));
   assert.ok((await page.getByLabel('Message SHOUT').inputValue()).includes('checkout'));
@@ -27,23 +29,55 @@ try {
   await page.getByRole('button', { name: 'View changes' }).click();
   await page.locator('.diff-file').waitFor();
   assert.match(await page.locator('.diff-title').innerText(), /pricing.mjs/);
+  // Changes open beside the chat, so the approval card stays visible.
+  assert.equal(await page.locator('#dock .group').count(), 2);
+  assert.ok(await page.getByRole('button', { name: 'Approve & continue' }).isVisible());
+  assert.ok(await page.locator('.diff-line .tok-kw').count() > 0);
   const id = await page.evaluate(() => location.hash.slice(1));
   assert.equal(app.store.get(id).data.status, 'waiting_user');
   await page.getByRole('button', { name: 'Approve & continue' }).click();
-  await page.waitForFunction(() => document.querySelector('#status-text').textContent.includes('completed'));
+  await page.waitForFunction(() => document.querySelector('#status-text').textContent.includes('idle'));
   assert.match(await page.locator('#messages').innerText(), /Tests passed/);
   assert.equal(app.store.get(id).data.runs[0].result.output.passed, true);
-  await page.getByRole('tab', { name: 'Flow', exact: true }).click();
-  await page.getByRole('button', { name: /Event \d+: program.loaded/ }).click();
-  assert.match(await page.locator('#event-detail').innerText(), /Executed ALLEN source/);
-  assert.ok(await page.locator('.flow-connector').count() > 0);
+  // The executed ALLEN program is reachable from the chat and annotated with the run's effects.
+  assert.equal(await page.locator('.run-card').count(), 1);
+  assert.ok(await page.locator('.run-card .run-step').count() >= 4);
+  await page.locator('.run-card').getByRole('button', { name: 'View program' }).click();
+  await page.getByRole('tab', { name: /Program · Run 1/ }).waitFor();
+  assert.match(await page.locator('.program-view').innerText(), /manifest/);
+  assert.match(await page.locator('.program-view').innerText(), /1× call/);
+  assert.ok(await page.locator('.program-view .tok-kw').count() > 0);
+  await page.screenshot({ path: resolve(screenshotDir, 'session-program.png') });
+  // Flow mode: the chat pane becomes a canvas of phase cards; the composer stays underneath.
+  await page.getByRole('tab', { name: 'Chat' }).click();
+  await page.locator('.run-card').getByRole('button', { name: 'Flow', exact: true }).click();
+  await page.locator('#flow-stage .fl-card.hub').first().waitFor();
+  assert.equal(await page.getByRole('radio', { name: 'Flow' }).getAttribute('aria-checked'), 'true');
+  assert.ok(await page.locator('#messages').isHidden());
+  assert.ok(await page.locator('#flow-stage .fl-card').count() >= 5);
+  assert.match(await page.locator('#flow-stage .fl-card.tool .fl-time').first().innerText(), /\d+(ms|s)/);
+  assert.ok(await page.locator('#flow-stage .fl-card.tool.pass .fl-icon').count() > 0, 'passing tests show a check');
+  assert.ok(await page.locator('#flow-stage .fl-card.msg.final .fl-md').count() === 1, 'the closing reply renders in full');
+  assert.ok(await page.getByLabel('Message SHOUT').isVisible());
+  await page.waitForTimeout(700); // cards fade in and the camera settles
+  await page.screenshot({ path: resolve(screenshotDir, 'session-flow-chat.png') });
+  await page.getByRole('radio', { name: 'Chat' }).click();
+  await page.locator('.run-card').first().waitFor();
+  await page.getByRole('button', { name: 'Open Events in a tab' }).click();
+  await page.locator('.trace-event', { hasText: 'program.loaded' }).first().click();
+  assert.ok(await page.getByRole('button', { name: 'Open ALLEN program' }).isVisible());
   await page.getByRole('button', { name: 'Close event details' }).click();
-  const screenshotDir = resolve('.cache/shout-ui'); await mkdir(screenshotDir, { recursive: true });
+  await page.getByRole('button', { name: 'Open Events below' }).click();
+  assert.equal(await page.locator('#dock .split.col').count(), 1);
   await page.screenshot({ path: resolve(screenshotDir, 'session-desktop.png'), fullPage: true });
-  await page.getByRole('button', { name: 'Files', exact: true }).click();
+  await page.getByRole('tab', { name: 'Files', exact: true }).click();
   await page.getByRole('button', { name: 'pricing.mjs', exact: true }).click();
-  await page.waitForFunction(() => document.querySelector('#inspector-content').textContent.includes('checkoutTotal'));
-  assert.match(await page.locator('#inspector-content').innerText(), /checkoutTotal/);
+  await page.getByRole('tab', { name: 'pricing.mjs' }).waitFor();
+  await page.waitForFunction(() => [...document.querySelectorAll('#dock .code-view')].some((view) => view.textContent.includes('checkoutTotal')));
+  assert.ok(await page.locator('#dock .code-view .tok-kw').count() > 0);
+  await page.screenshot({ path: resolve(screenshotDir, 'session-tabs.png') });
+  const tabsBeforeReload = await page.locator('#dock .tab').count();
+  await page.getByRole('tab', { name: 'Chat' }).click();
   await page.getByLabel('Message SHOUT').fill('/test');
   await page.getByRole('button', { name: 'Send message', exact: true }).click();
   await page.waitForFunction(() => document.querySelectorAll('.message.assistant').length >= 4 && document.querySelector('#status-text').textContent.includes('completed'));
@@ -52,10 +86,28 @@ try {
   await page.reload();
   await page.waitForFunction(() => document.querySelector('#status-text').textContent.includes('completed'));
   assert.match(await page.locator('#messages').innerText(), /Tests passed/);
+  assert.equal(await page.locator('#dock .tab').count(), tabsBeforeReload, 'tab layout persists across reloads');
+  // A workspace folder that doesn't exist is offered for creation: Nevermind keeps the form, Create makes it.
+  const newFolder = resolve(stateRoot, 'made-by-dialog', 'project');
   await page.getByRole('button', { name: /New session/ }).click();
-  await page.getByRole('button', { name: /Implement a missing slug utility/ }).last().click();
-  await page.getByLabel('Model provider').selectOption('fixture');
+  await page.getByLabel('Workspace path').fill(newFolder);
   await page.getByRole('button', { name: 'Create session' }).click();
+  await page.getByRole('heading', { name: 'Create this folder?' }).waitFor();
+  assert.equal(await page.locator('#create-folder-path').innerText(), newFolder);
+  await page.getByRole('button', { name: 'Nevermind' }).click();
+  assert.ok(await page.locator('#new-dialog').isVisible(), 'the new session form stays open');
+  assert.equal(existsSync(newFolder), false);
+  await page.getByRole('button', { name: 'Create session' }).click();
+  await page.getByRole('button', { name: 'Create', exact: true }).click();
+  await page.waitForFunction((folder) => document.title !== 'SHOUT' && !document.querySelector('#new-dialog').open, newFolder);
+  assert.ok(existsSync(newFolder), 'the folder was created');
+  assert.equal(app.store.list().some((summary) => summary.workspace === newFolder), true);
+  // Samples live on the welcome screen now; the slug scenario is created through the API.
+  const slug = await page.evaluate(() => fetch('/api/sessions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Shout-Client': '1' }, body: JSON.stringify({ scenario: 'slug' }) }).then((response) => response.json()));
+  await page.goto(`${app.url}/#${slug.id}`);
+  await page.reload();
+  await page.waitForFunction((title) => document.title.startsWith(title), slug.title);
+  await page.getByLabel('Message SHOUT').fill(slug.suggestedPrompt);
   await page.getByRole('button', { name: 'Send message', exact: true }).click();
   await page.getByRole('button', { name: 'Approve & continue' }).waitFor();
   await page.getByRole('button', { name: 'Cancel run' }).click();
@@ -63,12 +115,12 @@ try {
   assert.equal(await page.getByRole('button', { name: 'Approve & continue' }).count(), 0);
   await page.setViewportSize({ width: 390, height: 844 }); await page.reload();
   await page.getByRole('button', { name: 'Toggle sessions' }).waitFor();
-  await page.getByRole('button', { name: 'Inspector' }).click();
-  assert.ok(await page.locator('#inspector').isVisible());
+  await page.getByRole('button', { name: 'Inspector', exact: true }).click();
+  assert.ok(await page.locator('#side-panel').isVisible());
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
   await page.screenshot({ path: resolve(screenshotDir, 'session-mobile.png'), fullPage: true });
   assert.deepEqual(errors, []);
-  console.log('PASS browser: scenario → chat → exact diff → approve → real ALLEN edit/tests → VIZ/source → files → /test → reload → cancellation → mobile; no uncaught page errors.');
+  console.log('PASS browser: scenario → chat → exact diff → approve → real ALLEN edit/tests → VIZ/source → tabs/splits → highlighted file tab → /test → reload → cancellation → mobile; no uncaught page errors.');
 } finally {
   await browser?.close(); await app.close(); await rm(stateRoot, { recursive: true, force: true });
 }

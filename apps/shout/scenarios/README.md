@@ -1,6 +1,6 @@
 # Guided coding scenarios
 
-Start SHOUT, choose a scenario, and send its suggested prompt from the chat session. Each launch copies a small project into a unique local scratch workspace; the checked-in templates stay unchanged. All scenarios use real filesystem tools, a real ALLEN program executed by JOSH, an explicit approval before edits, and real Node tests. In **fixture mode**, the proposed code change is a labelled scripted solution; in **live mode**, the model proposes the change.
+Start SHOUT, choose a scenario, and send its suggested prompt from the chat session. Each launch copies a small project into a unique local scratch workspace; the checked-in templates stay unchanged. All scenarios use real filesystem tools, a real ALLEN program executed by JOSH, an explicit approval before edits, and real Node tests. The model proposes the change.
 
 | Scenario | Starting problem | Expected result after approval |
 | --- | --- | --- |
@@ -12,4 +12,4 @@ In the visualization, follow workspace inspection → model judgment → typed p
 
 The test command for every scenario is `node --test *.test.mjs`, configured by the app rather than selected by the model. You can also run that command directly from a scenario workspace. To compare behavior, try “Explain why these tests fail before proposing the smallest fix,” then review the proposed changes before approval. Live proposals may vary and must pass the supplied tests; passing tests do not prove arbitrary changes correct.
 
-`solutions/` contains the scripted fixture-mode changes and is not copied into scenario workspaces or shown to the live model. Tests and templates require only Node.js.
+`solutions/` holds reference solutions: tests use them to check that each scenario is solvable, and the browser test's scripted judgments return them. They are never copied into scenario workspaces or shown to the model. Tests and templates require only Node.js.

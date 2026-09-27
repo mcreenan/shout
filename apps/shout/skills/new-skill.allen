@@ -1,0 +1,186 @@
+// Write a new SHOUT skill (an ALLEN slash command) from a description, compile-check it with up to 3 repairs, and save it to .shout/skills/ after your approval. Use when asked to create, automate or add a slash command or repeatable workflow.
+// args: <what the skill should do>
+manifest {
+  language: "0.1"
+  entry: main
+  capabilities: [model.request]
+  tools: { required: [
+    { name: "skills.check", version: ">=1.0.0, <2.0.0" },
+    { name: "skills.guide", version: ">=1.0.0, <2.0.0" },
+    { name: "skills.list", version: ">=1.0.0, <2.0.0" },
+    { name: "workspace.edit", version: ">=1.0.0, <2.0.0" }
+  ] }
+}
+
+record SkillInput { args: String history: String }
+record Draft { name: String source: String }
+record Attempt { name: String source: String problems: String }
+
+fn max_attempts() returns Int { 4 }
+
+// Every visible skill name plus SHOUT's host commands. A new workspace skill
+// with one of these names would hide or collide with it.
+async fn taken_names() returns List<String> effects [tool.skills.list@1] {
+  let skills = match await tools.skills.list.call({}) {
+    Ok(result) => result.skills
+    Err(_) => stop("Could not list the existing skills.")
+  };
+  let names = list.map(skills, fn(skill: { args: String, description: String, name: String, ok: Bool, scope: String }) returns String { skill.name });
+  list.append(list.append(names, "help"), "skills")
+}
+
+fn author_system() returns String {
+  """
+  You write SHOUT skills: single-file ALLEN programs run as slash commands. Follow the supplied guide exactly; it is the complete reference for syntax, the manifest, effects, the tool catalog and entry input. Do not use syntax or functions that the guide does not show.
+  Return name (the command name, matching ^[a-z][a-z0-9-]{0,39}$, short and descriptive) and source (the complete .allen file).
+  The source must start with a // description line that says what the skill does and when to use it, then a // args: line if it takes arguments, then the manifest.
+  Design: do the repeatable work deterministically with tools and code; use model.request only for real judgments, with a typed record output; bound the data you send; handle every Err with a user-readable stop message or fallback; return a markdown String.
+  If previous_source and problems are supplied, they are your last attempt and the compiler's diagnostics (each followed by the offending source line). Fix every problem and return the whole corrected file. Keep the design unless it caused the errors; rewrite the failing construct the way the guide shows.
+  """
+}
+
+fn is_valid_name(name: String) returns Bool {
+  let first = string.get(name, 0) ?? "";
+  length(name) >= 1 && length(name) <= 40
+    && string.contains("abcdefghijklmnopqrstuvwxyz", first)
+    && all_chars_allowed(name)
+}
+
+fn all_chars_allowed(name: String) returns Bool {
+  mut ok = true;
+  for ch in name {
+    if (!string.contains("abcdefghijklmnopqrstuvwxyz0123456789-", ch)) { ok = false; }
+  }
+  ok
+}
+
+// Checks SHOUT enforces outside the compiler, done here so the model can fix them.
+fn name_problems(name: String, source: String, taken: List<String>) returns List<String> {
+  mut problems: List<String> = [];
+  if (!is_valid_name(name)) {
+    problems = list.append(problems, `name "${name}" is invalid: use 1-40 characters, lower-case letters, digits and "-", starting with a letter.`);
+  }
+  if (list.any(taken, fn(existing: String) returns Bool { existing == name })) {
+    problems = list.append(problems, `name "${name}" is already used by another skill or command; choose a different name.`);
+  }
+  if (!string.starts_with(string.trim_ascii(source), "//")) {
+    problems = list.append(problems, "the source must start with a // description line before the manifest.");
+  }
+  problems
+}
+
+// Diagnostics look like "12:5: error[E3005]: message"; append the source line they point at.
+fn annotate(diagnostics: String, source: String) returns String {
+  let none: List<String> = [];
+  let lines = string.split(source, "\n") ?? none;
+  let entries = string.split(diagnostics, "\n") ?? none;
+  let annotated = list.map(entries, fn(entry: String) returns String {
+    let head = (string.split(entry, ":") ?? [entry])[0];
+    let code_line = match to_int(head) {
+      Ok(number) => list.get(lines, number - 1) ?? ""
+      Err(_) => ""
+    };
+    if (code_line == "") { entry } else { `${entry}\n    > ${string.trim_ascii(code_line)}` }
+  });
+  string.join(annotated, "\n")
+}
+
+async fn draft(guide: String, request: String, history: String, taken: List<String>, previous: Option<Attempt>) returns Draft
+  effects [model.request] {
+  let feedback = match previous {
+    Some(attempt) => { previous_name: attempt.name, previous_source: attempt.source, problems: attempt.problems }
+    None => { previous_name: "", previous_source: "", problems: "" }
+  };
+  match await model.request<Draft>(prompt {
+    system: author_system()
+    context: { request: request, recent_conversation: history }
+    data: { guide: guide, names_in_use: taken, previous_name: feedback.previous_name, previous_source: feedback.previous_source, problems: feedback.problems }
+    output: Draft
+    policy: { max_attempts: 2 }
+  }) {
+    Ok(value) => value
+    Err(error) => stop(`Drafting the skill failed: ${error.message}`)
+  }
+}
+
+fn describe(source: String) returns String {
+  let first = (string.split(string.trim_ascii(source), "\n") ?? [source])[0];
+  string.trim_ascii(string.replace(first, "//", ""))
+}
+
+fn fenced(source: String) returns String {
+  `\`\`\`allen\n${source}\n\`\`\``
+}
+
+export async fn main(input: SkillInput) returns String
+  effects [model.request, tool.skills.check@1, tool.skills.guide@1, tool.skills.list@1, tool.workspace.edit@1] {
+  let request = string.trim_ascii(input.args);
+  if (request == "") {
+    return "Usage: `/new-skill <what the skill should do>`, for example `/new-skill list the largest files in the workspace`.";
+  }
+  let guide = match await tools.skills.guide.call({}) {
+    Ok(result) => result.guide
+    Err(_) => stop("Could not load the skill authoring guide.")
+  };
+
+  let taken = await taken_names();
+  mut previous: Option<Attempt> = None;
+  mut last = Attempt { name: "", source: "", problems: "" };
+  mut compiled = false;
+  mut attempts = 0;
+  for _ in 0..max_attempts() {
+    attempts += 1;
+    let candidate = await draft(guide, request, input.history, taken, previous);
+    let name = string.trim_ascii(candidate.name);
+    mut problems = name_problems(name, candidate.source, taken);
+    let checked = match await tools.skills.check.call({ source: candidate.source }) {
+      Ok(result) => result
+      Err(_) => stop("The skill compiler is unavailable.")
+    };
+    if (!checked.ok) {
+      problems = list.append(problems, annotate(checked.diagnostics, candidate.source));
+    }
+    if (string.contains(checked.diagnostics, "SHOUT007")) {
+      problems = list.append(problems, "SHOUT007 is a compiler crash, not a mistake at that line. It is caused by an if/for body that uses two effects and has a third only inside an inner if. Restructure as the guide's pitfalls table says: guard clauses (if (!ok) { continue; }), move the whole loop body into an async fn helper with declared effects, or make the call the branch's tail value.");
+    }
+    if (string.contains(checked.diagnostics, "produced invalid bytecode")) {
+      problems = list.append(problems, "Replace every top-level const with a function, e.g. fn limit() returns Int { 50 }.");
+    }
+    last = Attempt { name: name, source: candidate.source, problems: string.join(problems, "\n") };
+    if (length(problems) == 0) {
+      compiled = true;
+      break;
+    }
+    previous = Some(last);
+  }
+
+  if (!compiled) {
+    return string.join([
+      `I couldn't produce a skill that compiles after ${to_string(attempts)} attempts. Remaining problems:`,
+      "", "```text", last.problems, "```", "",
+      `Last draft (\`${last.name}\`), which you can fix and save as \`.shout/skills/<name>.allen\`:`,
+      "", fenced(last.source)
+    ], "\n");
+  }
+
+  let path = `.shout/skills/${last.name}.allen`;
+  let saved = match await tools.workspace.edit.call({
+    summary: `Add the /${last.name} skill`,
+    edits: [{ path: path, find: "", replace: last.source }]
+  }) {
+    Ok(result) => result
+    Err(_) => stop(`Could not save ${path}.`)
+  };
+  if (saved.problem != "") {
+    return `The skill compiled but could not be saved to \`${path}\`: ${saved.problem}\n\n${fenced(last.source)}`;
+  }
+  if (!saved.accepted) {
+    return `Not saved. Here is the compiled draft of \`/${last.name}\`:\n\n${fenced(last.source)}`;
+  }
+  let tries = if (attempts == 1) { "on the first try" } else { `after ${to_string(attempts)} attempts` };
+  string.join([
+    `Created \`/${last.name}\` in \`${path}\` (compiled ${tries}).`,
+    "", describe(last.source), "",
+    `Run it with \`/${last.name}\`. Edit the file to change it; SHOUT recompiles skills each time they run.`
+  ], "\n")
+}

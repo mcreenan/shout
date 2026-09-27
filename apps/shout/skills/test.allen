@@ -1,0 +1,25 @@
+// Run the session's configured test command. No model call, no edits.
+manifest {
+  language: "0.1"
+  entry: main
+  capabilities: []
+  tools: { required: [{ name: "tests.run", version: ">=1.0.0, <2.0.0" }] }
+}
+
+record TestResult { summary: String accepted: Bool passed: Bool changed: Int attempts: Int test_output: String }
+
+export async fn main() returns TestResult effects [tool.tests.run@1] {
+  let tests = match await tools.tests.run.call({}) {
+    Ok(value) => value
+    Err(_) => stop("tests.unavailable")
+  };
+  let passed = tests.passed && !tests.skipped;
+  let summary = if (tests.skipped) {
+    "Tests were not run because no test command is configured."
+  } else if (passed) {
+    "The configured tests passed."
+  } else {
+    string.concat("The configured tests failed.\n\n```text\n", string.concat(tests.output, "\n```"))
+  };
+  TestResult { summary: summary, accepted: true, passed: passed, changed: 0, attempts: 0, test_output: tests.output }
+}

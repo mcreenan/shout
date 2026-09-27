@@ -1,0 +1,49 @@
+// Find literal text in the workspace and list matching lines grouped by file. Use for "where is X used/defined" lookups; no model call.
+// args: <text>
+manifest {
+  language: "0.1"
+  entry: main
+  capabilities: []
+  tools: { required: [{ name: "workspace.search", version: ">=1.0.0, <2.0.0" }] }
+}
+
+// Same shape as one workspace.search match, so tool results can be passed in directly.
+record Hit { path: String line: Int text: String }
+
+fn max_results() returns Int { 300 }
+
+// Matches arrive sorted by file then line, so one pass groups them.
+fn render(query: String, hits: List<Hit>, truncated: Bool) returns String {
+  mut out: List<String> = [];
+  mut current = "";
+  mut files = 0;
+  for hit in hits {
+    if (hit.path != current) {
+      if (current != "") { out = list.append(out, "```"); }
+      current = hit.path;
+      files += 1;
+      out = list.append(out, `\n**${hit.path}**\n\`\`\`text`);
+    }
+    out = list.append(out, `${to_string(hit.line)}: ${string.trim_ascii(hit.text)}`);
+  }
+  if (current != "") { out = list.append(out, "```"); }
+  let noun = if (length(hits) == 1) { "match" } else { "matches" };
+  let more = if (truncated) { ` (stopped at ${to_string(max_results())}; narrow the search to see the rest)` } else { "" };
+  let header = `${to_string(length(hits))} ${noun} for \`${query}\` in ${to_string(files)} file(s)${more}`;
+  string.join([header, ..out], "\n")
+}
+
+export async fn main(args: String) returns String effects [tool.workspace.search@1] {
+  let query = string.trim_ascii(args);
+  if (query == "") {
+    return "Usage: `/find <text>` searches workspace files for that exact, case-sensitive text.";
+  }
+  let result = match await tools.workspace.search.call({ query: query, max_results: max_results() }) {
+    Ok(value) => value
+    Err(_) => stop("The workspace search failed.")
+  };
+  if (length(result.matches) == 0) {
+    return `No matches for \`${query}\`. The search is literal and case-sensitive.`;
+  }
+  render(query, result.matches, result.truncated)
+}

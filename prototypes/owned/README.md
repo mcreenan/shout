@@ -16,7 +16,7 @@ npm run demo
 
 `npm run demo` uses the **real pinned ALLEN compiler/VM**, a clearly labelled deterministic model fixture, and a scripted fixture answer. It writes a harmless review draft under `.scratch/`. No external ticket is changed.
 
-With `codex-cli 0.153.3` installed and signed in normally (`codex login status`):
+With `codex-cli 0.157.1` installed and signed in normally (`codex login status`):
 
 ```sh
 npm run live     # actual model judgment, explicitly scripted human answer
@@ -73,10 +73,10 @@ The VM is initialized as **unattended, session binding none**. `model.request` i
 
 `npm test` covers the real VM plus lifecycle edge cases, including a subprocess test driving the actual CLI. `npm run live` writes `.scratch/live-demo.json`; the checked-in [live proof](evidence/live-proof.json) records successful real runs and token usage. [FINDINGS.md](FINDINGS.md) explains what this establishes.
 
-- Every run allows at most 3 model judgments, 8 user questions, 16 host tool calls, 64 KiB source, 64 KiB input and 180 seconds wall time. A model worker allows 120 seconds and 1 MiB event output. These are inference-count/time bounds, not a hard billed-token limit.
+- Every run allows at most 3 model judgments, 8 user questions, 16 host tool calls, 64 KiB source and 64 KiB input. The default wall-time budget is 30 minutes and each model worker defaults to 10 minutes; timeout errors include the configured duration. SHOUT sessions expose a **No time limits** toggle while idle, persist that choice per session, and clearly show when limits are disabled. Disabling time budgets does not disable explicit cancellation, inference-count limits, tool-count limits, or output-size limits.
 - The frozen tool registry contains only `review_draft`. ALLEN receives no filesystem, network or subprocess grants. The native tool writes only a per-effect file beneath this run's scratch directory. It is marked non-idempotent; there is no automatic retry or exactly-once claim.
 - General programs support `model.request`, `user.ask`, the registered tool and pure ALLEN. Callback schemas support exact records, arrays, strings, Booleans, null and safe JavaScript integers. Other callback types fail clearly. Bundles/imports, arbitrary tool catalogs, subagents and invoking-agent callbacks are not implemented.
 - Ordinary chat can select the registered workflow or reply. It does not yet generate new ALLEN source. `/run` is the reusable source entry point.
-- The Codex worker restriction profile is verified for **0.153.3 only** and fails on other versions. Its per-call catalog override removes tool metadata; feature flags alone proved insufficient. No global configuration or credential files are edited or copied.
+- The Codex worker restriction profile is verified for **0.157.1 only** and fails on other versions. Its per-call catalog override removes tool metadata; feature flags alone proved insufficient. No global configuration or credential files are edited or copied.
 - State and questions exist only in memory. Unexpected VM exit reports interruption. Closing the app cancels runs; restart cannot resume them. Scratch artifacts and evidence are for inspection, not a recovery log.
 - Cancelling terminates model process groups and the VM, invalidates responses and prevents later dispatch. An already-started scratch write may still finish; cancellation cannot undo an effect that already occurred.

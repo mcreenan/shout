@@ -1,0 +1,412 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SHOUT · Sub-agent design proposals</title>
+<!-- Snapshot of apps/shout/public/style.css so every mock uses the real tokens and components. -->
+<link rel="stylesheet" href="shout-style.css">
+<style>
+/* ---- Page chrome (not part of the proposal) ---- */
+html,body{height:auto}
+body{background:var(--bg-sunken);padding:0 0 80px}
+.page{max-width:1320px;margin:0 auto;padding:0 28px}
+.page-head{display:flex;align-items:center;gap:16px;padding:28px 0 8px}
+.page-head h1{font-size:22px;font-weight:650;letter-spacing:-.01em;margin:0}
+.page-head p{margin:0;color:var(--text-2)}
+.page-head .spacer{flex:1}
+.proposal{margin-top:40px}
+.proposal-head{display:flex;align-items:baseline;gap:12px;margin-bottom:6px}
+.proposal-tag{font:600 11.5px var(--mono);color:var(--accent-text);background:var(--accent-soft);border-radius:5px;padding:1px 7px}
+.proposal h2{font-size:17px;font-weight:650;margin:0}
+.proposal>p{margin:0 0 14px;color:var(--text-2);max-width:900px}
+.viewport{border:1px solid var(--border-strong);border-radius:14px;overflow:hidden;background:var(--bg);box-shadow:var(--shadow-md)}
+.viewport .messages{padding:28px 24px 4px;overflow:visible}
+.viewport .composer-area{padding-bottom:20px}
+.two-up{display:grid;grid-template-columns:1fr 1fr}
+.two-up>*+*{border-left:1px solid var(--border)} /* structural pane divider */
+.pane{display:flex;flex-direction:column;min-width:0}
+.notes{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px;margin-top:12px}
+.note-box{border:1px solid var(--border);border-radius:10px;background:var(--surface);padding:10px 14px;font-size:13px;color:var(--text-2)}
+.note-box strong{display:block;color:var(--text);font-size:12.5px;margin-bottom:2px}
+.theme-btn{height:30px;padding:0 12px;border-radius:8px;border:1px solid var(--border-strong);background:var(--surface);font-size:12.5px;font-weight:550}
+
+/* ---- Proposed additions to style.css ---- */
+:root{--agent:#c2267e}
+:root[data-theme=dark]{--agent:#f472b6}
+
+/* Chat: the agent group card. Same family as .run-card. */
+.agent-group{border:1px solid var(--border);border-radius:10px;background:var(--bg-subtle);margin-bottom:22px;overflow:hidden}
+.agent-group-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 14px;font-size:13px}
+.agent-group-title{display:flex;align-items:center;gap:8px;min-width:0}
+.agent-group-title svg{color:var(--agent)}
+.agent-group-title strong{font-weight:600}
+.agent-group-title span{color:var(--text-3);font-size:12px}
+.agent-tally{display:flex;gap:12px;font-size:12px;color:var(--text-2);white-space:nowrap}
+.agent-rows{list-style:none;margin:0;padding:0 6px 6px}
+.agent-row{border-radius:8px}
+.agent-row+.agent-row{margin-top:2px}
+.agent-row-main{display:grid;grid-template-columns:18px minmax(84px,auto) 1fr auto 16px;align-items:center;gap:10px;width:100%;text-align:left;padding:7px 8px;border-radius:8px;font-size:13px}
+.agent-row-main:hover{background:var(--surface-hover)}
+.agent-name{font:600 12.5px var(--mono);color:color-mix(in srgb,var(--agent) 75%,var(--text))}
+.agent-task{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text)}
+.agent-task em{font-style:normal;color:var(--text-3)}
+.agent-meta{font:11.5px var(--mono);color:var(--text-3);font-variant-numeric:tabular-nums;white-space:nowrap}
+.agent-row-main>svg{width:12px;height:12px;color:var(--text-3);transition:transform .15s}
+.agent-row.expanded .agent-row-main>svg{transform:rotate(90deg)}
+.agent-state{width:14px;height:14px;border-radius:50%;display:grid;place-items:center;justify-self:center}
+.agent-state.done{background:color-mix(in srgb,var(--ok) 18%,transparent);color:var(--ok)}
+.agent-state.done svg{width:9px;height:9px;stroke-width:3.4}
+.agent-state.active{border:2px solid color-mix(in srgb,var(--agent) 30%,transparent);border-top-color:var(--agent);animation:spin .8s linear infinite}
+.agent-state.waiting{background:var(--warn);animation:fl-ping 1.4s ease-out infinite;--c:var(--warn);width:9px;height:9px}
+.agent-row.expanded{background:var(--surface);border:1px solid var(--border);margin:4px 0}
+.agent-thread{padding:2px 12px 12px 36px}
+.agent-line{display:flex;align-items:baseline;gap:8px;font-size:12.5px;line-height:1.9;color:var(--text-2);min-width:0}
+.agent-line code{font-size:11.5px;color:color-mix(in srgb,var(--tool) 75%,var(--text));background:color-mix(in srgb,var(--tool) 12%,var(--surface));border-radius:5px;padding:0 6px;line-height:19px;white-space:nowrap}
+.agent-line.model code{color:color-mix(in srgb,var(--model) 75%,var(--text));background:color-mix(in srgb,var(--model) 12%,var(--surface))}
+.agent-line span{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.agent-line time{margin-left:auto;font:11.5px var(--mono);color:var(--text-3)}
+.agent-line.live{color:var(--text)}
+.agent-actions{display:flex;gap:14px;margin-top:8px}
+.agent-approval{display:flex;align-items:center;gap:10px;margin:0 8px 8px 36px;padding:8px 12px;border:1px solid var(--warn-border);background:var(--warn-soft);border-radius:8px;font-size:12.5px}
+.agent-approval code{font-size:12px}
+.agent-approval .spacer{flex:1}
+.mini-button{height:26px;padding:0 10px;border-radius:7px;font-size:12px;font-weight:550;border:1px solid var(--border-strong);background:var(--surface)}
+.mini-button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-fg)}
+.agent-report{margin-top:8px;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--bg-subtle);font-size:13px;line-height:1.6}
+.agent-report p{margin:0}
+
+/* Chat: the roster docked on the composer. */
+.agent-roster{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
+.roster-pill{display:inline-flex;align-items:center;gap:7px;height:26px;padding:0 10px 0 8px;border-radius:13px;border:1px solid var(--border);background:var(--surface);font-size:12px;color:var(--text-2);box-shadow:var(--shadow-sm)}
+.roster-pill strong{font:600 12px var(--mono);color:color-mix(in srgb,var(--agent) 75%,var(--text))}
+.roster-pill.waiting{border-color:var(--warn-border);background:var(--warn-soft);color:var(--text)}
+.roster-pill.done{color:var(--text-3)}
+.roster-pill .agent-state{width:12px;height:12px}
+.roster-pill .agent-state.waiting{width:8px;height:8px}
+
+/* Sub-agent thread opened as a dock tab. */
+.crumb-bar{display:flex;align-items:center;gap:8px;padding:9px 16px;border-bottom:1px solid var(--border);font-size:12.5px;color:var(--text-3);background:var(--bg-subtle)}
+.crumb-bar strong{font:600 12.5px var(--mono);color:color-mix(in srgb,var(--agent) 75%,var(--text))}
+.crumb-bar .agent-meta{margin-left:auto}
+.brief{border:1px dashed var(--border-strong);border-radius:10px;padding:10px 14px;margin-bottom:18px;font-size:13px;color:var(--text-2)}
+.brief-label{font:600 10.5px var(--font);text-transform:uppercase;letter-spacing:.06em;color:var(--text-3);margin-bottom:3px}
+.tab.agent-tab .tab-label svg{color:var(--agent)}
+
+/* Flow: agents are frames, like runs. Finished ones fold into a single card. */
+.mock-stage{position:relative;height:850px;overflow:hidden;cursor:default}
+.mock-stage.short{height:490px}
+.fl-card.agent{--c:var(--agent);width:320px;border-color:color-mix(in srgb,var(--c) 35%,var(--border));background:color-mix(in srgb,var(--c) 6%,var(--surface))}
+.fl-frame.agent{border-color:color-mix(in srgb,var(--agent) 40%,transparent);pointer-events:auto}
+.fl-frame.agent.active{border-color:color-mix(in srgb,var(--agent) 65%,transparent);background:color-mix(in srgb,var(--agent) 5%,transparent)}
+.fl-frame.agent.waiting{border-color:color-mix(in srgb,var(--warn) 65%,transparent);background:color-mix(in srgb,var(--warn) 5%,transparent)}
+.fl-frame.agent .fl-frame-label{display:flex;align-items:center;gap:7px;right:16px;color:color-mix(in srgb,var(--agent) 75%,var(--text))}
+.fl-frame.agent .fl-frame-label span{color:var(--text-3);font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fl-frame.agent .fl-frame-label time{margin-left:auto;color:var(--text-3);font-weight:500}
+.le.hot.agent{stroke:var(--agent)}
+.le.agent{stroke:color-mix(in srgb,var(--agent) 45%,transparent)}
+.fl-card.slim{width:300px}
+.fl-card.hub.slim{width:300px}
+.fl-approve{display:flex;gap:8px;margin-top:10px}
+
+/* Flow: the fleet card, for fan-outs too wide to draw as frames. */
+.fl-card.fleet{--c:var(--agent);width:720px;border-color:color-mix(in srgb,var(--c) 35%,var(--border));background:color-mix(in srgb,var(--c) 5%,var(--surface))}
+.fleet-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:10px}
+.fleet-tile{border:1px solid var(--border);border-radius:9px;background:var(--surface);padding:8px 10px;min-width:0}
+.fleet-tile.active{border-color:color-mix(in srgb,var(--agent) 55%,var(--border))}
+.fleet-tile.waiting{border-color:var(--warn-border);background:var(--warn-soft)}
+.fleet-tile.failed{border-color:color-mix(in srgb,var(--danger) 55%,var(--border))}
+.fleet-top{display:flex;align-items:center;gap:7px;font:600 12px var(--mono)}
+.fleet-top time{margin-left:auto;font-weight:500;color:var(--text-3);font-size:11px}
+.fleet-now{margin-top:3px;font-size:12px;color:var(--text-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fleet-bar{display:flex;gap:2px;margin-top:7px;height:4px}
+.fleet-bar i{flex:1;border-radius:2px;background:var(--bg-sunken)}
+.fleet-bar i.m{background:var(--model)}.fleet-bar i.t{background:var(--tool)}.fleet-bar i.w{background:var(--warn)}.fleet-bar i.x{background:var(--danger)}
+.agent-state.failed{background:color-mix(in srgb,var(--danger) 18%,transparent);color:var(--danger)}
+.agent-state.failed svg{width:9px;height:9px;stroke-width:3.4}
+
+/* Inspector: one lane per agent under the Activity minimap. */
+.inspector-mock{width:300px;padding:14px 10px 18px}
+.inspector-mock h3{font:600 11px var(--font);letter-spacing:.06em;text-transform:uppercase;color:var(--text-3);margin:0 4px 8px}
+.minimap{border:1px solid var(--border);border-radius:10px;background:var(--surface);padding:10px 12px}
+.minimap-label.agent{color:var(--agent);font-family:var(--mono);font-weight:600}
+.minimap-tick.agent{--c:var(--agent)}
+.minimap-span{position:absolute;top:1px;height:6px;border-radius:3px;background:color-mix(in srgb,var(--agent) 35%,transparent)}
+.minimap-rule{grid-column:1/-1;height:1px;background:var(--border);margin:3px 0}
+.inspector-wrap{display:flex;gap:28px;align-items:flex-start;padding:24px;flex-wrap:wrap}
+.inspector-wrap .viewport{flex:none}
+.inspector-wrap .copy{flex:1;min-width:280px;color:var(--text-2);font-size:13.5px}
+.inspector-wrap .copy ul{padding-left:18px;margin:6px 0 0}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-agents" viewBox="0 0 24 24"><circle cx="12" cy="5" r="2.4"/><circle cx="5" cy="19" r="2.4"/><circle cx="19" cy="19" r="2.4"/><path d="M12 7.4V12M12 12L5.8 16.8M12 12l6.2 4.8"/></symbol>
+  <symbol id="i-chev" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+  <symbol id="i-chat" viewBox="0 0 24 24"><path d="M4 5h16v11H9l-5 4z"/></symbol>
+</svg>
+
+<div class="page">
+  <header class="page-head">
+    <div>
+      <h1>Sub-agents in SHOUT: design proposals</h1>
+      <p>Static mocks built on the app's real stylesheet. One scenario throughout: SHOUT fans an audit of the ledger importer out to three agents.</p>
+    </div>
+    <span class="spacer"></span>
+    <button class="theme-btn" id="theme">Switch to light</button>
+  </header>
+
+  <!-- ============ CHAT A ============ -->
+  <section class="proposal" id="chat-a">
+    <div class="proposal-head"><span class="proposal-tag">Chat A</span><h2>Agent group card</h2></div>
+    <p>One card per fan-out, sitting in the transcript where the run card sits today. Each agent is a row: state, name, brief, and what it is doing right now. A row opens in place to show that agent's steps and its report. Approvals surface on the row that needs them.</p>
+    <div class="viewport">
+      <div class="messages">
+        <article class="message user"><div class="message-body"><div class="message-text"><div>Audit the ledger importer. Find the rounding bug, check test coverage, and tighten the CSV parser.</div></div></div></article>
+
+        <article class="message assistant"><div class="message-body"><div class="message-header">SHOUT<time>2:14 PM</time></div><div class="message-text markdown"><p>Those three are independent, so I'll run them side by side and merge what comes back.</p></div></div></article>
+
+        <div class="agent-group">
+          <div class="agent-group-head">
+            <span class="agent-group-title"><svg><use href="#i-agents"/></svg><strong>3 agents</strong><span>1:12 elapsed</span></span>
+            <span class="agent-tally"><span class="status-pill completed">1 done</span><span class="status-pill active">1 running</span><span class="status-pill question">1 needs you</span></span>
+          </div>
+          <ul class="agent-rows">
+            <li class="agent-row">
+              <button class="agent-row-main">
+                <i class="agent-state done"><svg><use href="#i-check"/></svg></i>
+                <span class="agent-name">explorer</span>
+                <span class="agent-task">Find the rounding bug <em>· toCents() rounds each line before summing</em></span>
+                <span class="agent-meta">12 steps · 38s</span>
+                <svg><use href="#i-chev"/></svg>
+              </button>
+            </li>
+            <li class="agent-row expanded">
+              <button class="agent-row-main">
+                <i class="agent-state active"></i>
+                <span class="agent-name">tester</span>
+                <span class="agent-task">Check test coverage <em>· running the test suite</em></span>
+                <span class="agent-meta">7 steps · 1:12</span>
+                <svg><use href="#i-chev"/></svg>
+              </button>
+              <div class="agent-thread">
+                <div class="agent-line"><code>list_files</code><span>test/</span><time>1ms</time></div>
+                <div class="agent-line"><code>read_file</code><span>test/import.test.mjs</span><time>2ms</time></div>
+                <div class="agent-line"><code>search_files</code><span>"parseAmount" in src/</span><time>4ms</time></div>
+                <div class="agent-line model"><code>tester</code><span>Negative amounts and empty rows are never exercised. Running the suite to confirm.</span><time>6.4s</time></div>
+                <div class="agent-line live"><code>run_skill</code><span>/test · 41 of 58 passing so far</span><time>0:48</time></div>
+                <div class="agent-actions"><button class="text-button">Open in tab</button><button class="text-button">Open to the side</button><button class="text-button">Show in Flow</button><button class="text-button danger">Stop</button></div>
+              </div>
+            </li>
+            <li class="agent-row">
+              <button class="agent-row-main">
+                <i class="agent-state waiting"></i>
+                <span class="agent-name">reviewer</span>
+                <span class="agent-task">Tighten the CSV parser <em>· waiting for approval</em></span>
+                <span class="agent-meta">9 steps · 0:54</span>
+                <svg><use href="#i-chev"/></svg>
+              </button>
+              <div class="agent-approval"><span>Edit <code>src/parse.mjs</code> <span style="color:var(--add-sign)">+12</span> <span style="color:var(--del-sign)">−3</span></span><span class="spacer"></span><button class="text-button">View diff</button><button class="mini-button">Deny</button><button class="mini-button primary">Approve</button></div>
+            </li>
+          </ul>
+        </div>
+      </div>
+      <div class="composer-area">
+        <form class="composer" data-state="active"><textarea rows="2" placeholder="Message SHOUT, or @tester to steer one agent"></textarea>
+          <div class="composer-bottom"><span class="input-hint"><code>@</code> to address an agent · <code>/</code> for skills</span></div></form>
+      </div>
+    </div>
+    <div class="notes">
+      <div class="note-box"><strong>Fits what exists</strong>It is the run card's sibling: same border, same sunken fill, same status pills. Closed rows cost one line each.</div>
+      <div class="note-box"><strong>Live line</strong>The grey text after the brief is the agent's latest step while it runs, then the first line of its report when it finishes.</div>
+      <div class="note-box"><strong>Approvals stay attributable</strong>The request is pinned to the agent that raised it, so three agents asking at once never blur together.</div>
+    </div>
+  </section>
+
+  <!-- ============ CHAT B ============ -->
+  <section class="proposal" id="chat-b">
+    <div class="proposal-head"><span class="proposal-tag">Chat B</span><h2>Roster on the composer, threads in the dock</h2></div>
+    <p>The transcript stays clean. Running agents live as pills above the composer, so their state is visible wherever you have scrolled. Clicking a pill opens that agent's own thread as a dock tab, using the split and tab system that already exists. Each thread is a real chat: you can read it and steer it.</p>
+    <div class="viewport">
+      <div class="two-up">
+        <div class="pane">
+          <div class="tab-strip"><div class="tab-list"><div class="tab active"><span class="tab-label"><svg><use href="#i-chat"/></svg><span class="tab-text">Chat</span></span></div></div></div>
+          <div class="messages" style="flex:1">
+            <article class="message user"><div class="message-body"><div class="message-text"><div>Audit the ledger importer. Find the rounding bug, check test coverage, and tighten the CSV parser.</div></div></div></article>
+            <article class="message assistant"><div class="message-body"><div class="message-header">SHOUT<time>2:14 PM</time></div><div class="message-text markdown"><p>Those three are independent, so I'll run them side by side and merge what comes back.</p><p><strong>explorer</strong> has reported: <code class="inline-code">toCents()</code> rounds each line before summing, which drifts by a cent on long imports.</p></div></div></article>
+          </div>
+          <div class="composer-area">
+            <div class="agent-roster">
+              <button class="roster-pill done"><i class="agent-state done"><svg><use href="#i-check"/></svg></i><strong>explorer</strong>done · 38s</button>
+              <button class="roster-pill"><i class="agent-state active"></i><strong>tester</strong>running tests · 1:12</button>
+              <button class="roster-pill waiting"><i class="agent-state waiting"></i><strong>reviewer</strong>needs approval</button>
+            </div>
+            <form class="composer" data-state="active"><textarea rows="2" placeholder="Message SHOUT"></textarea>
+              <div class="composer-bottom"><span class="input-hint"><code>/</code> for skills</span></div></form>
+          </div>
+        </div>
+        <div class="pane">
+          <div class="tab-strip"><div class="tab-list">
+            <div class="tab active agent-tab"><span class="tab-label"><svg><use href="#i-agents"/></svg><span class="tab-text">tester</span><i class="tab-dot active"></i></span></div>
+            <div class="tab agent-tab"><span class="tab-label"><svg><use href="#i-agents"/></svg><span class="tab-text">reviewer</span><i class="tab-dot question"></i></span></div>
+          </div></div>
+          <div class="crumb-bar">Session<svg style="width:11px;height:11px"><use href="#i-chev"/></svg><strong>tester</strong><span class="agent-meta">6 Astra · medium · read-only · 18k tokens</span></div>
+          <div class="messages" style="flex:1">
+            <div class="brief"><div class="brief-label">Brief from SHOUT</div>Check test coverage for <code class="inline-code">src/import.mjs</code> and <code class="inline-code">src/parse.mjs</code>. Report which branches are untested. Do not edit files.</div>
+            <div class="run-card"><div class="run-card-head"><span class="run-card-title"><strong>7 steps</strong></span><span class="status-pill active">running</span></div>
+              <ul class="run-steps"><li class="run-step">list_files</li><li class="run-step">read_file</li><li class="run-step">search_files</li><li class="run-step model">tester</li><li class="run-step">run_skill /test</li></ul></div>
+            <article class="message assistant"><div class="message-body"><div class="message-header">tester<time>2:15 PM</time></div><div class="message-text markdown"><p>Negative amounts and empty rows are never exercised. Running the suite to confirm before I report.</p></div></div></article>
+          </div>
+          <div class="composer-area">
+            <form class="composer"><textarea rows="1" style="min-height:24px" placeholder="Steer tester"></textarea></form>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="notes">
+      <div class="note-box"><strong>Best for long runs</strong>When agents work for minutes, the roster keeps status one glance away and the transcript holds only what SHOUT said.</div>
+      <div class="note-box"><strong>Almost free to build</strong>A sub-agent thread is the chat view pointed at a different message list. The dock already knows tabs, splits and status dots.</div>
+      <div class="note-box"><strong>Pairs with Chat A</strong>They are not rivals. The card is the record in the transcript; the roster is the live control.</div>
+    </div>
+  </section>
+
+  <!-- ============ FLOW A ============ -->
+  <section class="proposal" id="flow-a">
+    <div class="proposal-head"><span class="proposal-tag">Flow A</span><h2>Agents as frames that fold</h2></div>
+    <p>Flow already draws a dashed frame around a run. An agent is the same idea: a frame holding its own hubs and tools, placed side by side with its siblings so parallel work reads as parallel. When an agent finishes, its frame folds into a single card carrying the report. Edges fan out from the parent's hub and gather again at the step that reads the results.</p>
+    <div class="viewport">
+      <div class="flow-stage mock-stage" style="--row-width:668px">
+        <div class="fl-world" style="transform:translate(640px,36px)">
+          <svg class="fl-edges">
+            <path class="le model" d="M0,45 C0,68 0,68 0,92"/>
+            <path class="le agent" d="M0,164 C0,198 -388,198 -388,232"/>
+            <path class="le hot agent" d="M0,164 C0,198 -20,198 -20,232"/>
+            <path class="le hot waiting" d="M0,164 C0,198 368,198 368,232"/>
+            <!-- inside tester -->
+            <path class="le" d="M-20,352 C-20,362 -20,362 -20,372"/>
+            <path class="le tool" d="M-20,444 C-20,454 -20,454 -20,464"/>
+            <path class="le hot agent" d="M-20,509 C-20,519 -20,519 -20,529"/>
+            <!-- inside reviewer -->
+            <path class="le" d="M368,352 C368,362 368,362 368,372"/>
+            <path class="le hot waiting" d="M368,444 C368,454 368,454 368,464"/>
+            <!-- gather -->
+            <path class="le agent" d="M-388,372 L-388,600 C-388,690 0,650 0,700"/>
+            <path class="le" style="stroke-dasharray:3 5" d="M-20,632 C-20,666 0,666 0,700"/>
+            <path class="le" style="stroke-dasharray:3 5" d="M368,632 C368,666 0,666 0,700"/>
+          </svg>
+
+          <div class="fl-card msg user ok" style="transform:translate(-334px,0)"><div class="fl-text">Audit the ledger importer. Find the rounding bug, check test coverage, and tighten the CSV parser.</div></div>
+
+          <div class="fl-card hub model ok" style="transform:translate(-230px,92px);height:72px"><div class="fl-head"><i class="fl-dot"></i><strong>Agent</strong><span class="fl-time">3.2s</span></div><div class="fl-chips"><span class="fl-chip strong">spawn agent ×3</span></div></div>
+
+          <!-- explorer: finished, folded -->
+          <div class="fl-card agent ok expandable" style="transform:translate(-548px,232px);height:140px">
+            <div class="fl-head"><i class="fl-dot"></i><strong>explorer</strong><span class="fl-role">rounding bug</span><span class="fl-time">38s</span><span class="fl-chevron" style="opacity:1"><svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></span></div>
+            <div class="fl-text clamp2" style="-webkit-line-clamp:3">toCents() rounds each line before summing, so long imports drift by a cent. Fix: sum in integer minor units, round once.</div>
+            <div class="fl-chips"><span class="fl-chip">12 steps</span><span class="fl-chip">read ×6</span><span class="fl-chip">41k tok</span></div>
+          </div>
+
+          <!-- tester: running, open -->
+          <div class="fl-frame agent active" style="transform:translate(-200px,232px);width:360px;height:400px"><span class="fl-frame-label"><i class="agent-state active"></i>tester<span>· test coverage</span><time>1:12</time></span></div>
+          <div class="fl-card note slim" style="transform:translate(-170px,272px);height:80px"><div class="fl-section-label">Brief</div><div class="fl-text muted clamp2" style="margin-top:0">Check coverage for import.mjs and parse.mjs. Report untested branches. Do not edit.</div></div>
+          <div class="fl-card hub model ok slim" style="transform:translate(-170px,372px);height:72px"><div class="fl-head"><i class="fl-dot"></i><strong>Agent</strong><span class="fl-time">6.4s</span></div><div class="fl-chips"><span class="fl-chip strong">read file</span><span class="fl-chip strong">search</span></div></div>
+          <div class="fl-card tool ok slim" style="transform:translate(-170px,464px);height:45px"><div class="fl-head"><i class="fl-dot"></i><strong>workspace.read</strong><span class="fl-time">2ms</span></div></div>
+          <div class="fl-card tool active slim" style="transform:translate(-170px,529px);height:76px"><div class="fl-head"><i class="fl-dot"></i><strong>tests.run</strong><span class="fl-time">0:48</span></div><div class="fl-code">41 of 58 passing</div></div>
+
+          <!-- reviewer: waiting on you -->
+          <div class="fl-frame agent waiting" style="transform:translate(188px,232px);width:360px;height:400px"><span class="fl-frame-label"><i class="agent-state waiting"></i>reviewer<span>· CSV parser</span><time>0:54</time></span></div>
+          <div class="fl-card note slim" style="transform:translate(218px,272px);height:80px"><div class="fl-section-label">Brief</div><div class="fl-text muted clamp2" style="margin-top:0">Tighten parse.mjs: reject malformed rows, keep the public signature.</div></div>
+          <div class="fl-card hub model ok slim" style="transform:translate(218px,372px);height:72px"><div class="fl-head"><i class="fl-dot"></i><strong>Agent</strong><span class="fl-time">11.0s</span></div><div class="fl-chips"><span class="fl-chip strong">apply edit</span></div></div>
+          <div class="fl-card approval waiting slim" style="transform:translate(218px,464px)"><div class="fl-head"><i class="fl-dot"></i><strong>Approve edit</strong><span class="fl-time">waiting</span></div><div class="fl-code">src/parse.mjs <span style="color:var(--add-sign)">+12</span> <span style="color:var(--del-sign)">−3</span></div><div class="fl-approve"><button class="mini-button primary">Approve</button><button class="mini-button">Deny</button><button class="text-button" style="margin-left:auto">View diff</button></div></div>
+
+          <!-- parent waits -->
+          <div class="fl-card hub model stale" style="transform:translate(-230px,700px);height:72px"><div class="fl-head"><i class="fl-dot"></i><strong>Agent</strong><span class="fl-role">waiting for 2 agents</span></div><div class="fl-chips"><span class="fl-chip">1 of 3 reports in</span></div></div>
+        </div>
+      </div>
+    </div>
+    <div class="notes">
+      <div class="note-box"><strong>Same grammar</strong>Frames, hubs, tools and approval cards are all existing components. The only new things are the agent colour and a row that branches.</div>
+      <div class="note-box"><strong>Folding controls the sprawl</strong>Open while running, folded when done. Click a folded card to reopen its frame in place.</div>
+      <div class="note-box"><strong>Needs a lane layout</strong>Today's rows are strictly sequential. This asks the layout to place sibling frames in columns and draw fan-out and gather edges.</div>
+    </div>
+  </section>
+
+  <!-- ============ FLOW B ============ -->
+  <section class="proposal" id="flow-b">
+    <div class="proposal-head"><span class="proposal-tag">Flow B</span><h2>Fleet card for wide fan-outs</h2></div>
+    <p>Frames stop working past four or five agents. Beyond that, the fan-out becomes one card holding a tile per agent. Each tile shows state, current step, and a strip of its steps so far. Clicking a tile opens that agent's frame on its own canvas, or its thread in the dock.</p>
+    <div class="viewport">
+      <div class="flow-stage mock-stage short" style="--row-width:668px">
+        <div class="fl-world" style="transform:translate(640px,32px)">
+          <svg class="fl-edges">
+            <path class="le hot agent" d="M0,72 C0,92 0,92 0,112"/>
+            <path class="le" style="stroke-dasharray:3 5" d="M0,308 C0,328 0,328 0,348"/>
+          </svg>
+          <div class="fl-card hub model ok" style="transform:translate(-230px,0);height:72px"><div class="fl-head"><i class="fl-dot"></i><strong>Agent</strong><span class="fl-time">4.1s</span></div><div class="fl-chips"><span class="fl-chip strong">spawn agent ×8</span></div></div>
+
+          <div class="fl-card fleet active" style="transform:translate(-360px,112px);height:196px">
+            <div class="fl-head"><i class="fl-dot"></i><strong>8 agents</strong><span class="fl-role">review each module</span><span class="fl-time">2:06</span></div>
+            <div class="fleet-grid">
+              <div class="fleet-tile"><div class="fleet-top"><i class="agent-state done"><svg><use href="#i-check"/></svg></i>import<time>38s</time></div><div class="fleet-now">2 findings</div><div class="fleet-bar"><i class="m"></i><i class="t"></i><i class="t"></i><i class="m"></i><i class="t"></i><i class="m"></i></div></div>
+              <div class="fleet-tile"><div class="fleet-top"><i class="agent-state done"><svg><use href="#i-check"/></svg></i>parse<time>51s</time></div><div class="fleet-now">No findings</div><div class="fleet-bar"><i class="m"></i><i class="t"></i><i class="m"></i><i class="t"></i><i class="t"></i><i class="m"></i></div></div>
+              <div class="fleet-tile active"><div class="fleet-top"><i class="agent-state active"></i>ledger<time>1:40</time></div><div class="fleet-now">read_file src/ledger.mjs</div><div class="fleet-bar"><i class="m"></i><i class="t"></i><i class="t"></i><i class="m"></i><i class="t"></i><i></i></div></div>
+              <div class="fleet-tile waiting"><div class="fleet-top"><i class="agent-state waiting"></i>export<time>1:12</time></div><div class="fleet-now">Needs approval</div><div class="fleet-bar"><i class="m"></i><i class="t"></i><i class="m"></i><i class="w"></i><i></i><i></i></div></div>
+              <div class="fleet-tile active"><div class="fleet-top"><i class="agent-state active"></i>rates<time>1:31</time></div><div class="fleet-now">search_files "fx"</div><div class="fleet-bar"><i class="m"></i><i class="t"></i><i class="t"></i><i></i><i></i><i></i></div></div>
+              <div class="fleet-tile failed"><div class="fleet-top"><i class="agent-state failed"><svg><use href="#i-x"/></svg></i>audit<time>0:22</time></div><div class="fleet-now">Model call timed out</div><div class="fleet-bar"><i class="m"></i><i class="t"></i><i class="x"></i><i></i><i></i><i></i></div></div>
+              <div class="fleet-tile active"><div class="fleet-top"><i class="agent-state active"></i>cli<time>0:58</time></div><div class="fleet-now">Thinking</div><div class="fleet-bar"><i class="m"></i><i class="t"></i><i class="m"></i><i></i><i></i><i></i></div></div>
+              <div class="fleet-tile"><div class="fleet-top"><i class="agent-state" style="border:1.5px dashed var(--text-3)"></i>config<time>queued</time></div><div class="fleet-now" style="color:var(--text-3)">Waiting for a slot</div><div class="fleet-bar"><i></i><i></i><i></i><i></i><i></i><i></i></div></div>
+            </div>
+          </div>
+
+          <div class="fl-card hub model stale" style="transform:translate(-230px,348px);height:72px"><div class="fl-head"><i class="fl-dot"></i><strong>Agent</strong><span class="fl-role">waiting for 5 agents</span></div><div class="fl-chips"><span class="fl-chip">2 of 8 reports in</span><span class="fl-chip">1 failed</span></div></div>
+        </div>
+      </div>
+    </div>
+    <div class="notes">
+      <div class="note-box"><strong>Keeps the row layout</strong>The fleet is a single node in the existing sequential rows, so this ships without any layout work.</div>
+      <div class="note-box"><strong>A sensible first step</strong>Build this first, then add Flow A's frames as the expanded state for fan-outs of four or fewer.</div>
+      <div class="note-box"><strong>Shows the queue</strong>If concurrency is capped, queued agents are visible rather than missing.</div>
+    </div>
+  </section>
+
+  <!-- ============ INSPECTOR ============ -->
+  <section class="proposal" id="inspector">
+    <div class="proposal-head"><span class="proposal-tag">Inspector</span><h2>A lane per agent</h2></div>
+    <p>The Activity minimap already has lanes for You, SHOUT, Model, ALLEN and Tools. Agents add lanes beneath them. Each lane shows the agent's lifetime as a bar, with ticks for its steps. Overlap is visible at a glance, and so is an agent that has gone quiet.</p>
+    <div class="viewport">
+      <div class="inspector-wrap">
+        <div class="viewport"><div class="inspector-mock">
+          <h3>Activity</h3>
+          <div class="minimap"><div class="minimap-grid">
+            <span class="minimap-label user">You</span><div class="minimap-lane"><i class="minimap-tick user" style="left:3%"></i></div>
+            <span class="minimap-label harness">SHOUT</span><div class="minimap-lane"><i class="minimap-tick" style="left:9%"></i></div>
+            <span class="minimap-label model">Model</span><div class="minimap-lane"><i class="minimap-tick model" style="left:5%"></i><i class="minimap-tick model" style="left:7%"></i><i class="minimap-tick model" style="left:12%"></i></div>
+            <span class="minimap-label tool">Tools</span><div class="minimap-lane"><i class="minimap-tick tool" style="left:14%"></i></div>
+            <span class="minimap-rule"></span>
+            <span class="minimap-label agent">explorer</span><div class="minimap-lane"><i class="minimap-span" style="left:16%;width:34%"></i><i class="minimap-tick agent" style="left:20%"></i><i class="minimap-tick tool" style="left:25%"></i><i class="minimap-tick tool" style="left:29%"></i><i class="minimap-tick agent" style="left:36%"></i><i class="minimap-tick tool" style="left:41%"></i><i class="minimap-tick agent" style="left:48%"></i></div>
+            <span class="minimap-label agent">tester</span><div class="minimap-lane"><i class="minimap-span" style="left:16%;width:80%"></i><i class="minimap-tick tool" style="left:19%"></i><i class="minimap-tick tool" style="left:23%"></i><i class="minimap-tick agent" style="left:30%"></i><i class="minimap-tick tool" style="left:44%"></i></div>
+            <span class="minimap-label agent">reviewer</span><div class="minimap-lane"><i class="minimap-span" style="left:17%;width:79%"></i><i class="minimap-tick tool" style="left:21%"></i><i class="minimap-tick agent" style="left:33%"></i><i class="minimap-tick tool" style="left:52%"></i><i class="minimap-tick" style="left:66%;--c:var(--warn)"></i></div>
+          </div></div>
+        </div></div>
+        <div class="copy">
+          <strong style="color:var(--text)">What else the Inspector gains</strong>
+          <ul>
+            <li>An <em>Agents</em> list beside <em>Runs</em>, each row with state, steps, tokens and an open-in-tab button.</li>
+            <li>A per-agent filter on the Events view, driven by the new <code class="inline-code">agent</code> field on every event.</li>
+            <li>Token and time totals rolled up per agent and for the whole fan-out, since cost is the first question people ask about sub-agents.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<script>
+const root=document.documentElement,btn=document.getElementById('theme');
+btn.onclick=()=>{const d=root.dataset.theme==='dark';root.dataset.theme=d?'light':'dark';btn.textContent=d?'Switch to dark':'Switch to light'};
+if(new URLSearchParams(location.search).get('theme')==='light')btn.click();
+</script>
+</body>
+</html>

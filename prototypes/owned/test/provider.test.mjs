@@ -13,7 +13,7 @@ async function fakeCli(t, events) {
   await writeFile(binary, `#!/usr/bin/env node
 const fs = require('node:fs');
 const args = process.argv.slice(2);
-if(args[0] === '--version') { console.log('codex-cli 0.153.3'); process.exit(0); }
+if(args[0] === '--version') { console.log('codex-cli 0.157.1'); process.exit(0); }
 if(args[0] === 'debug') { console.log('{"models":[]}'); process.exit(0); }
 process.stdin.resume();
 process.stdin.on('end', () => {
@@ -43,4 +43,10 @@ test('provider rejects malformed trailing stream content', async t => {
 test('provider accepts valid completed stream without a final newline', async t => {
   const provider = await fakeCli(t, '{"type":"turn.completed","usage":{"input_tokens":12}}');
   assert.deepEqual(await provider.judge(request), { answer: true });
+});
+
+test('provider has a modern default timeout and accepts a disabled timeout', () => {
+  assert.equal(new CodexProvider().timeoutMs, 10 * 60 * 1000);
+  assert.equal(new CodexProvider({ timeoutMs: null }).timeoutMs, null);
+  assert.throws(() => new CodexProvider({ timeoutMs: 0 }), /positive integer or null/);
 });

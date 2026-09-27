@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src file:">
+  <meta name="color-scheme" content="light dark">
+  <title>SHOUT</title>
+  <style>
+    :root{--bg:#ffffff;--text:#18181b;--text-3:#8a8a94;--track:#e4e4e8;--accent:#0038a8;color-scheme:light}
+    @media (prefers-color-scheme:dark){:root{--bg:#0f0f11;--text:#ececef;--text-3:#6e6e78;--track:#26262b;--accent:#4b83ff;color-scheme:dark}}
+    html,body{height:100%;margin:0}
+    body{background:var(--bg);color:var(--text);font:14px/1.5 ui-sans-serif,system-ui,-apple-system,'Segoe UI',Inter,Roboto,sans-serif;display:grid;place-items:center;-webkit-user-select:none;user-select:none}
+    main{display:flex;flex-direction:column;align-items:center;gap:22px;width:min(440px,80vw);text-align:center}
+    img{width:220px;height:auto}
+    .light{display:block}.dark{display:none}
+    @media (prefers-color-scheme:dark){.light{display:none}.dark{display:block}}
+    .bar{width:160px;height:3px;border-radius:3px;background:var(--track);overflow:hidden}
+    .bar::after{content:'';display:block;width:40%;height:100%;border-radius:3px;background:var(--accent);animation:slide 1.1s ease-in-out infinite}
+    @keyframes slide{from{transform:translateX(-100%)}to{transform:translateX(250%)}}
+    #status{margin:0;color:var(--text-3);font-size:12.5px;min-height:1.5em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
+  </style>
+</head>
+<body>
+  <main>
+    <img class="light" src="../../shout/public/shout-wordmark.png" alt="SHOUT!">
+    <img class="dark" src="../../shout/public/shout-wordmark-dark.png" alt="SHOUT!">
+    <div class="bar" role="progressbar" aria-label="Starting SHOUT"></div>
+    <p id="status" aria-live="polite">Starting SHOUT…</p>
+  </main>
+</body>
+</html>

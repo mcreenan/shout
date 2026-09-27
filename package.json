@@ -6,18 +6,29 @@
   "scripts": {
     "start": "bash tools/start-gui.sh",
     "gui": "bash tools/start-gui.sh",
+    "desktop": "bash tools/start-desktop.sh",
+    "desktop:install": "bash tools/install-desktop-entry.sh install",
+    "desktop:uninstall": "bash tools/install-desktop-entry.sh uninstall",
+    "compare": "node --env-file-if-exists=.env tools/compare-harness.mjs",
     "test:gui": "node --test apps/shout/test/*.test.mjs",
     "test:browser": "node tools/gui-browser-smoke.mjs",
+    "test:desktop": "node tools/desktop-smoke.mjs",
     "setup": "bash tools/prototypes.sh setup",
     "test": "bash tools/prototypes.sh test && node tools/interactive-smoke.mjs && npm run test:gui",
-    "typecheck": "bash tools/prototypes.sh typecheck && node --check apps/shout/src/session.mjs && node --check apps/shout/src/server.mjs && node --check apps/shout/public/app.js",
+    "typecheck": "bash tools/prototypes.sh typecheck && for f in apps/shout/src/*.mjs apps/shout/public/*.js apps/desktop/src/*.mjs apps/desktop/src/*.cjs tools/*.mjs; do node --check \"$f\" || exit 1; done",
     "verify": "npm run typecheck && npm test",
     "native": "bash tools/prototypes.sh native start",
     "owned": "bash tools/prototypes.sh owned start",
     "native:demo": "bash tools/prototypes.sh native demo",
     "owned:demo": "bash tools/prototypes.sh owned demo",
     "native:live": "bash tools/prototypes.sh native live",
-    "owned:live": "bash tools/prototypes.sh owned live"
+    "owned:live": "bash tools/prototypes.sh owned live",
+    "skill": "node --env-file-if-exists=.env tools/run-skill.mjs",
+    "claude:smoke": "node tools/claude-live-smoke.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.283",
+    "zod": "4.6.5"
   },
   "devDependencies": {
     "playwright": "1.58.2"

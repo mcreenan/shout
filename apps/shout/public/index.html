@@ -18,20 +18,41 @@
     <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></symbol>
     <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></symbol>
     <symbol id="i-send" viewBox="0 0 24 24"><path d="M12 19V5M6 11l6-6 6 6"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="1.5" fill="currentColor" stroke="none"/></symbol>
     <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
     <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
     <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z"/></symbol>
     <symbol id="i-monitor" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></symbol>
+    <symbol id="i-split-right" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M12 4v16"/></symbol>
+    <symbol id="i-split-down" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 12h18"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></symbol>
+    <symbol id="i-open" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-8 8M18 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4"/></symbol>
+    <symbol id="i-chat" viewBox="0 0 24 24"><path d="M5 5h14a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H9l-4 3V6a1 1 0 0 1 1-1z"/></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24"><path d="M7 3h7l5 5v12a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/><path d="M14 3v5h5"/></symbol>
+    <symbol id="i-flow" viewBox="0 0 24 24"><circle cx="6" cy="6" r="2"/><circle cx="18" cy="12" r="2"/><circle cx="6" cy="18" r="2"/><path d="M8 6h4a4 4 0 0 1 4 4M8 18h4a4 4 0 0 0 4-4"/></symbol>
+    <symbol id="i-list" viewBox="0 0 24 24"><path d="M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01"/></symbol>
+    <symbol id="i-diff" viewBox="0 0 24 24"><path d="M12 3v8M8 7h8M8 17h8M5 21h14"/></symbol>
+    <symbol id="i-code" viewBox="0 0 24 24"><path d="M8 7l-5 5 5 5M16 7l5 5-5 5M13.5 4l-3 16"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></symbol>
+    <symbol id="i-skill" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M14 8l-4 8"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></symbol>
+    <symbol id="i-more" viewBox="0 0 24 24"><path d="M6 12h.01M12 12h.01M18 12h.01" stroke-width="3"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l7 3v5.5c0 4.2-2.9 7.9-7 9.5-4.1-1.6-7-5.3-7-9.5V6z"/></symbol>
   </svg>
   <div id="app" class="app">
     <aside class="sidebar" aria-label="Sessions">
       <div class="sidebar-top">
-        <a class="brand wordmark" href="/" aria-label="SHOUT home"><img src="/shout-wordmark.png" alt="SHOUT!" width="1983" height="793"></a>
+        <a class="brand wordmark" href="/" aria-label="SHOUT home"><img class="wordmark-light" src="/shout-wordmark.png" alt="SHOUT!" width="1983" height="793"><img class="wordmark-dark" src="/shout-wordmark-dark.png" alt="" width="1983" height="793"></a>
         <button class="icon-button sidebar-close" id="sidebar-close" aria-label="Close sessions"><svg><use href="#i-x"/></svg></button>
       </div>
       <button class="new-session" id="new-session"><svg><use href="#i-plus"/></svg>New session<kbd>N</kbd></button>
       <div class="sidebar-label">Sessions <span id="session-count">0</span></div>
       <nav id="session-list" class="session-list" aria-label="Session list"></nav>
+      <section id="sleeping-section" class="sleeping-section" aria-label="Sleeping sessions" hidden>
+        <button type="button" class="sleeping-toggle" id="sleeping-toggle" aria-expanded="false" aria-controls="sleeping-list"><span>Sleeping <span id="sleeping-count"></span></span><span class="sleeping-rule"></span><svg><use href="#i-chevron"/></svg></button>
+        <div id="sleeping-list" class="sleeping-list" hidden></div>
+      </section>
       <div class="sidebar-bottom">
         <div class="provider"><span class="engine-dot" id="engine-dot"></span><span id="provider-status">Connecting…</span></div>
         <div class="theme-switch" role="radiogroup" aria-label="Theme">
@@ -43,70 +64,75 @@
     </aside>
     <div class="scrim" id="scrim"></div>
     <main class="workspace">
-      <header class="topbar">
-        <button class="icon-button mobile-menu" id="menu-button" aria-label="Toggle sessions"><svg><use href="#i-menu"/></svg></button>
-        <a class="mobile-brand wordmark" href="/" aria-label="SHOUT home"><img src="/shout-wordmark.png" alt="SHOUT!" width="1983" height="793"></a>
-        <div class="session-heading">
-          <h1 id="session-title">Workspace</h1>
-          <div class="session-meta-line"><span id="mode-badge" class="badge" hidden></span><span id="workspace-path" class="workspace-path"></span></div>
-        </div>
-        <div class="topbar-actions">
-          <button class="toolbar-button" id="files-button" aria-pressed="false" title="Browse workspace files"><svg><use href="#i-folder"/></svg><span>Files</span></button>
-          <button class="toolbar-button" id="export-button" disabled title="Download session as JSON"><svg><use href="#i-download"/></svg><span>Export</span></button>
-          <button class="toolbar-button" id="viz-button" aria-pressed="true" title="Toggle inspector"><svg><use href="#i-panel"/></svg><span>Inspector</span></button>
-        </div>
-      </header>
       <div class="workspace-body">
-        <section class="conversation" aria-label="Conversation">
-          <div id="messages" class="messages" aria-live="polite" aria-relevant="additions"></div>
-          <div class="composer-area">
-            <div id="question-area"></div>
-            <div id="storage-warning" class="storage-warning" role="alert" hidden></div>
-            <div id="status-line" class="status-line" aria-live="polite"><span class="status-dot"></span><span id="status-text">Ready</span><button id="cancel-button" class="text-button danger" hidden>Cancel run</button></div>
-            <form id="composer" class="composer">
-              <label class="sr-only" for="message-input">Message SHOUT</label>
-              <textarea id="message-input" placeholder="Message SHOUT" rows="2"></textarea>
-              <div class="composer-bottom">
-                <span class="input-hint"><code>/test</code> runs tests<span class="nl"> · <kbd>Shift</kbd>+<kbd>Enter</kbd> for newline</span></span>
-                <button type="submit" id="send-button" class="send-button" aria-label="Send message"><svg><use href="#i-send"/></svg></button>
-              </div>
-            </form>
+        <div id="dock" class="dock" aria-label="Session tabs"></div>
+        <aside id="side-panel" class="side-panel" aria-label="Side panel">
+          <div class="side-header">
+            <div class="segmented" id="side-tabs" role="tablist" aria-label="Side panel view">
+              <button id="side-files-tab" role="tab" data-side="files" aria-selected="false">Files</button>
+              <button id="side-summary-tab" role="tab" data-side="summary" aria-selected="true">Inspector</button>
+            </div>
+            <span class="live-indicator" id="connection-status" role="status" hidden>Reconnecting</span>
+            <button class="icon-button" id="side-refresh" aria-label="Refresh files" title="Refresh files"><svg><use href="#i-refresh"/></svg></button>
+            <button class="icon-button" id="side-close" aria-label="Close side panel"><svg><use href="#i-x"/></svg></button>
           </div>
-        </section>
-        <aside id="inspector" class="inspector" aria-label="Inspector">
-          <div class="inspector-header">
-            <h2 id="inspector-title">Inspector</h2>
-            <span class="live-indicator" id="connection-status">Live</span>
-          </div>
-          <div class="inspector-tabs" role="tablist">
-            <button id="graph-tab" class="active" role="tab" aria-selected="true">Flow</button>
-            <button id="trace-tab" role="tab" aria-selected="false">Events <span class="count" id="event-count">0</span></button>
-            <button id="changes-tab" role="tab" aria-selected="false">Changes <span class="count" id="change-count">0</span></button>
-          </div>
-          <div id="viz-toolbar" class="viz-toolbar">
-            <label class="sr-only" for="run-filter">Filter by run</label><select id="run-filter"><option value="">All runs</option></select>
-            <label class="sr-only" for="event-filter">Filter events</label><input id="event-filter" type="search" placeholder="Filter events">
-          </div>
-          <div id="inspector-content" class="inspector-content"></div>
-          <div id="event-detail" class="event-detail" hidden></div>
-          <div class="inspector-footer"><span><i class="legend-dot user"></i>You</span><span><i class="legend-dot harness"></i>SHOUT</span><span><i class="legend-dot model"></i>Model</span><span><i class="legend-dot vm"></i>ALLEN</span><span><i class="legend-dot tool"></i>Tools</span></div>
+          <div id="side-content" class="side-content"></div>
         </aside>
       </div>
     </main>
   </div>
+  <div id="pane-store" class="pane-store" hidden>
+    <section id="chat-pane" class="conversation" aria-label="Conversation">
+      <div class="pane-float left">
+        <button type="button" class="float-button mobile-menu" id="menu-button" aria-label="Toggle sessions" title="Sessions"><svg><use href="#i-menu"/></svg></button>
+        <div id="chat-mode" class="chat-mode" role="radiogroup" aria-label="Chat view"><button type="button" role="radio" data-mode="chat" aria-checked="true" title="Conversation only">Chat</button><button type="button" role="radio" data-mode="flow" aria-checked="false" title="Conversation with every run step">Flow</button></div>
+      </div>
+      <button type="button" class="float-button pane-float right" id="viz-button" aria-label="Inspector" aria-pressed="true" title="Inspector"><svg><use href="#i-panel"/></svg></button>
+      <div id="messages" class="messages" aria-live="polite" aria-relevant="additions"></div>
+      <div id="flow-stage" class="flow-stage" hidden></div>
+      <div id="composer-area" class="composer-area">
+        <div id="question-area"></div>
+        <div id="storage-warning" class="storage-warning" role="alert" hidden></div>
+        <div id="status-line" class="status-line" aria-live="polite"><span class="status-dot"></span><span id="status-text">Ready</span></div>
+        <form id="composer" class="composer">
+          <label class="sr-only" for="message-input">Message SHOUT</label>
+          <div id="slash-menu" class="slash-menu" role="listbox" aria-label="Skills" hidden></div>
+          <textarea id="message-input" placeholder="Message SHOUT" rows="2" aria-autocomplete="list" aria-haspopup="listbox" aria-controls="slash-menu" aria-expanded="false"></textarea>
+          <div class="composer-bottom">
+            <div class="picker">
+              <button type="button" id="model-button" class="picker-button" aria-haspopup="listbox" aria-controls="model-list" aria-label="Model"></button>
+              <div id="model-list" class="popover" role="listbox" aria-label="Model" tabindex="-1" hidden></div>
+            </div>
+            <div class="picker">
+              <button type="button" id="effort-button" class="picker-button" aria-haspopup="listbox" aria-controls="effort-list" aria-label="Reasoning effort" title="Reasoning effort"></button>
+              <div id="effort-list" class="popover" role="listbox" aria-label="Reasoning effort" tabindex="-1" hidden></div>
+            </div>
+            <div class="picker">
+              <button type="button" id="more-button" class="picker-button icon-only" aria-haspopup="menu" aria-controls="more-menu" aria-label="More options" title="More options"><svg><use href="#i-more"/></svg></button>
+              <div id="more-menu" class="popover" role="menu" aria-label="More options" tabindex="-1" hidden></div>
+            </div>
+            <button type="button" id="cancel-button" class="send-button stop" aria-label="Cancel run" title="Cancel run" hidden><svg><use href="#i-stop"/></svg></button>
+            <button type="submit" id="send-button" class="send-button" aria-label="Send message"><svg><use href="#i-send"/></svg></button>
+          </div>
+        </form>
+      </div>
+    </section>
+  </div>
   <dialog id="new-dialog" aria-labelledby="new-dialog-title">
     <form id="new-form">
       <div class="dialog-heading"><h2 id="new-dialog-title">New session</h2><button type="button" class="icon-button" id="close-dialog" aria-label="Close"><svg><use href="#i-x"/></svg></button></div>
-      <div class="field-label">Sample workspace <span class="optional">optional</span></div>
-      <div id="dialog-scenarios" class="dialog-scenarios"></div>
       <label for="workspace-input">Workspace path</label><input id="workspace-input" name="workspace" placeholder="/path/to/your/project" autocomplete="off" spellcheck="false">
-      <div class="field-row">
-        <div><label for="mode-input">Model provider</label><select id="mode-input" name="mode"><option value="live">Live (Codex)</option><option value="fixture">Fixture (no model calls)</option></select></div>
-        <div><label for="test-command-input">Test command <span class="optional">optional</span></label><input id="test-command-input" name="testCommand" placeholder="npm test" autocomplete="off" spellcheck="false"></div>
-      </div>
+      <label for="test-command-input">Test command <span class="optional">optional</span></label><input id="test-command-input" name="testCommand" placeholder="npm test" autocomplete="off" spellcheck="false">
       <p class="field-help" id="model-help" hidden></p>
       <p id="new-error" class="form-error" role="alert" hidden></p>
       <div class="dialog-footer"><button type="button" id="cancel-dialog" class="secondary-button">Cancel</button><button type="submit" class="primary-button" id="create-button">Create session</button></div>
+    </form>
+  </dialog>
+  <dialog id="create-folder-dialog" class="confirm-dialog" aria-labelledby="create-folder-title">
+    <form method="dialog">
+      <h2 id="create-folder-title">Create this folder?</h2>
+      <p><code id="create-folder-path"></code></p>
+      <div class="dialog-footer"><button type="button" id="create-folder-cancel" class="secondary-button">Nevermind</button><button type="button" id="create-folder-confirm" class="primary-button">Create</button></div>
     </form>
   </dialog>
   <div id="toast" class="toast" role="status" hidden></div>

@@ -1,13 +1,46 @@
+import { CHAT, uid, createLayout, groups, findGroup, groupOfTab, focusedGroup, activate, addTab, moveTab, closeTab, splitWith, normalize, resize, serialize, restore } from './layout.js';
+import { languageFor, languageLabel, highlightLines, renderTokens } from './highlight.js';
+import { codeBlock, renderMarkdown } from './markdown-dom.js';
+import { createFlowCanvas } from './flow-canvas.js';
+
 const $ = (id) => document.getElementById(id);
-const state = { config: null, sessions: [], session: null, stream: null, tab: 'graph', selectedEvent: null, selectedScenario: null, messageSignature: '', questionSignature: '', busy: false, runFilter: '', eventFilter: '', drafts: new Map(), selection: 0 };
+const state = { sleepingOpen: localStorage.getItem('shout.sleepingOpen') === '1', sleepingShown: 10, chatMode: localStorage.getItem('shout.chatMode') === 'flow' ? 'flow' : 'chat', config: null, sessions: [], session: null, stream: null, selectedScenario: null, messageSignature: '', questionSignature: '', busy: false, drafts: new Map(), selection: 0, layout: createLayout(), side: 'summary', files: null, filesError: '', expanded: new Set(), lastStatus: null, skills: { sessionId: null, list: null, error: '', at: 0, pending: null } };
 const terminal = new Set(['completed', 'failed', 'cancelled', 'canceled', 'interrupted', 'idle', 'ready']);
+const VIEWS = { trace: { label: 'Events', icon: 'i-list' }, changes: { label: 'Changes', icon: 'i-diff' } };
+const PROGRAM = { label: 'Program', icon: 'i-code' };
+const ACTIVE_RUN = new Set(['starting', 'running', 'waiting_user']);
+const LANES = [['You', 'user'], ['SHOUT', 'harness'], ['Model', 'model'], ['ALLEN', 'vm'], ['Tools', 'tool']];
+const SCOPE_LABEL = { workspace: 'Workspace', user: 'User', builtin: 'Built-in', command: 'Command' };
+// Panes for file and visualization tabs, keyed by tab ID. The chat pane is the static #chat-pane element.
+const panes = new Map();
+const scrollMemory = new WeakMap();
 let toastTimer;
+let dragPayload = null;
+// Slash-command autocomplete state for the composer.
+const slash = { items: [], index: 0, dismissed: null };
 
 function el(tag, className, text) {
   const node = document.createElement(tag);
   if (className) node.className = className;
   if (text !== undefined) node.textContent = text;
   return node;
+}
+function icon(name) {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  const use = document.createElementNS('http://www.w3.org/2000/svg', 'use');
+  use.setAttribute('href', `#${name}`);
+  svg.append(use);
+  svg.setAttribute('aria-hidden', 'true');
+  return svg;
+}
+function iconButton(name, label, onClick, className = 'icon-button') {
+  const button = el('button', className);
+  button.type = 'button';
+  button.append(icon(name));
+  button.setAttribute('aria-label', label);
+  button.title = label;
+  button.addEventListener('click', onClick);
+  return button;
 }
 function toast(text) {
   $('toast').textContent = text;
@@ -22,7 +55,7 @@ async function api(path, options = {}) {
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
   });
   const data = await response.json();
-  if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
+  if (!response.ok) throw Object.assign(new Error(data.error || `Request failed (${response.status})`), { code: data.code, path: data.path });
   return data;
 }
 function time(value) {
@@ -32,6 +65,7 @@ function time(value) {
 function isActive(session = state.session) {
   return !!session && !terminal.has(session.status) && !!session.status;
 }
+const basename = (path) => path.split('/').pop();
 function scenarioCard(scenario, index, onClick) {
   const card = el('button', 'scenario-card');
   card.type = 'button';
@@ -46,16 +80,21 @@ function scenarioCard(scenario, index, onClick) {
 function renderWelcome() {
   const wrapper = el('div', 'welcome');
   if (state.session) {
-    wrapper.append(el('h2', '', 'No messages yet'), el('p', '', 'Describe the change you want. Proposed edits wait for your approval before they are applied.'));
+    wrapper.append(el('h2', '', 'No messages yet'), el('p', '', 'Describe the change you want, or type / to run a skill. Proposed edits wait for your approval before they are applied.'));
     return wrapper;
   }
   const logoFrame = el('div', 'welcome-wordmark wordmark');
-  const logo = el('img');
+  const logo = el('img', 'wordmark-light');
   logo.src = '/shout-wordmark.png';
   logo.alt = 'SHOUT!';
   logo.width = 1983;
   logo.height = 793;
-  logoFrame.append(logo);
+  const darkLogo = el('img', 'wordmark-dark');
+  darkLogo.src = '/shout-wordmark-dark.png';
+  darkLogo.alt = '';
+  darkLogo.width = 1983;
+  darkLogo.height = 793;
+  logoFrame.append(logo, darkLogo);
   wrapper.append(logoFrame, el('h2', '', 'Start a session'), el('p', '', 'Open a sample workspace, or point SHOUT at your own project.'));
   const grid = el('div', 'scenario-grid');
   (state.config?.scenarios || []).forEach((scenario, i) => grid.append(scenarioCard(scenario, i, () => openNewDialog(scenario.id))));
@@ -71,23 +110,70 @@ function appendContent(container, text) {
   for (let i = 0; i < chunks.length; i += 3) {
     if (chunks[i]) container.append(el('div', '', chunks[i]));
     if (i + 2 < chunks.length) {
-      if (chunks[i + 1]) container.append(el('div', 'code-language', chunks[i + 1]));
-      const pre = el('pre', 'code-block');
-      pre.append(el('code', '', chunks[i + 2]));
-      container.append(pre);
+      const lang = chunks[i + 1].trim();
+      if (lang) container.append(el('div', 'code-language', lang));
+      container.append(codeBlock(chunks[i + 2], languageFor(`x.${lang || 'txt'}`)));
     }
   }
 }
+// Assistant replies render as Markdown built with DOM nodes only; model output cannot become HTML.
+function appendMarkdown(container, text) {
+  renderMarkdown(container, text, { openFile: (path) => openFile(path, { split: 'right' }) });
+}
+function runStart(run) {
+  return state.session?.events?.find((event) => event.run === run.id)?.time;
+}
+// The effects a run performed, in order: the observable shape of the ALLEN program's execution.
+function runSteps(run) {
+  return (state.session?.events || []).filter((event) => event.run === run.id && ['tool.started', 'model.started', 'user.question'].includes(event.type))
+    .map((event) => ({ event, label: event.type === 'tool.started' ? event.tool : event.type === 'model.started' ? 'model.request' : 'user.ask', kind: classify(event).kind }));
+}
+function runCard(run) {
+  const runs = state.session.runs;
+  const card = el('div', 'run-card');
+  card.dataset.run = run.id;
+  const head = el('div', 'run-card-head');
+  const title = el('span', 'run-card-title');
+  title.append(icon(run.skill ? 'i-skill' : 'i-code'), el('strong', '', runName(run)), el('span', 'run-card-index', `Run ${runs.indexOf(run) + 1}`));
+  head.append(title, el('span', `status-pill ${runStateKind(run.state)}`, (run.state || 'unknown').replace(/_/g, ' ')));
+  const steps = el('ol', 'run-steps');
+  const all = runSteps(run);
+  for (const step of all.slice(0, 14)) steps.append(el('li', `run-step ${step.kind}`, step.label));
+  if (all.length > 14) steps.append(el('li', 'run-step more', `+${all.length - 14}`));
+  const actions = el('div', 'run-card-actions');
+  const program = el('button', 'text-button', 'View program');
+  program.addEventListener('click', () => openProgram(run.id, { beside: true }));
+  const flow = el('button', 'text-button', 'Flow');
+  flow.addEventListener('click', () => showFlowChat(run.id));
+  actions.append(program, flow);
+  card.append(head);
+  if (all.length) card.append(steps);
+  card.append(actions);
+  return card;
+}
 function renderMessages() {
   const messages = state.session?.messages || [];
-  const signature = JSON.stringify([state.session?.id, messages]);
+  const runs = state.session?.runs || [];
+  // Flow mode draws the session on the canvas, which reads it every frame; the welcome stays in the list.
+  const flow = state.chatMode === 'flow' && messages.length > 0;
+  $('messages').hidden = flow;
+  $('flow-stage').hidden = !flow;
+  $('chat-pane').classList.toggle('flow-mode', flow);
+  if (flow) return syncFlowCanvas();
+  const signature = JSON.stringify([state.session?.id, messages, runs.map((run) => [run.id, run.state, runSteps(run).map((step) => step.label)])]);
   if (signature === state.messageSignature) return;
   state.messageSignature = signature;
   const list = $('messages');
   const nearBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 100;
   list.replaceChildren();
   if (!messages.length) list.append(renderWelcome());
+  // Each run's card sits before the first message recorded after the run started.
+  const pending = runs.map((run) => ({ run, start: runStart(run) })).filter((item) => item.start);
+  const flushRuns = (before) => {
+    while (pending.length && (before === undefined || pending[0].start < before)) list.append(runCard(pending.shift().run));
+  };
   for (const message of messages) {
+    flushRuns(message.time);
     const role = ['user', 'assistant', 'system', 'tool'].includes(message.role) ? message.role : 'system';
     const item = el('article', `message ${role}`);
     item.dataset.messageId = message.id;
@@ -95,12 +181,277 @@ function renderMessages() {
     const header = el('div', 'message-header', role === 'assistant' ? 'SHOUT' : role === 'user' ? 'You' : role === 'tool' ? 'Tool result' : 'System');
     header.append(el('time', '', time(message.time)));
     const content = el('div', 'message-text');
-    appendContent(content, message.content);
+    if (role === 'assistant') appendMarkdown(content, message.content); else appendContent(content, message.content);
     body.append(header, content);
     item.append(body);
     list.append(item);
   }
+  flushRuns();
   if (nearBottom || messages.length <= 1) list.scrollTop = list.scrollHeight;
+}
+/* Flow mode: the chat pane shows the session as a canvas of phases, the composer stays underneath. */
+let flowCanvas = null;
+function flowSource() {
+  const session = state.session;
+  return session?.messages?.length ? { session, events: session.events || [], now: Date.now(), live: isActive(session) } : null;
+}
+function syncFlowCanvas() {
+  if (!flowCanvas) {
+    // The composer floats over the canvas; the followed card sits just above it, whatever its height.
+    flowCanvas = createFlowCanvas($('flow-stage'), { anchor: () => $('composer-area').offsetHeight + 20, openFile: (path) => openFile(path, { split: 'right' }) });
+    flowCanvas.start(flowSource);
+  }
+  if (flowCanvas.sessionId !== state.session?.id) { flowCanvas.reset(); flowCanvas.sessionId = state.session?.id; }
+}
+function setChatMode(mode) {
+  state.chatMode = mode === 'flow' ? 'flow' : 'chat';
+  localStorage.setItem('shout.chatMode', state.chatMode);
+  for (const button of $('chat-mode').children) button.setAttribute('aria-checked', String(button.dataset.mode === state.chatMode));
+  state.messageSignature = '';
+  renderMessages();
+  if (state.chatMode === 'chat') $('messages').scrollTop = $('messages').scrollHeight;
+}
+function showFlowChat(runId) {
+  setChatMode('flow');
+  activate(state.layout, CHAT);
+  commitLayout();
+  // The canvas lays the run out on its next frames; then scroll to it.
+  if (runId) setTimeout(() => flowCanvas?.showRun(runId), 120);
+}
+// ALLEN Option values arrive as { tag: 'Some', value } / { tag: 'None' }; plain values pass through.
+function optionValue(value) {
+  if (value && typeof value === 'object' && (value.tag === 'Some' || value.tag === 'None') && Object.keys(value).every((key) => key === 'tag' || key === 'value')) return value.value;
+  return value;
+}
+function humanize(name) {
+  const text = String(name).replace(/([a-z\d])([A-Z])/g, '$1 $2').replace(/[_-]+/g, ' ').trim().toLowerCase();
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+function schemaType(schema) {
+  return Array.isArray(schema?.type) ? schema.type.find((type) => type !== 'null') : schema?.type;
+}
+class FieldError extends Error {
+  constructor(message, input) { super(message); this.input = input; }
+}
+function growTextarea(input) {
+  input.addEventListener('input', () => { input.style.height = 'auto'; input.style.height = `${Math.min(240, input.scrollHeight + 2)}px`; });
+}
+// Form controls for the JSON Schema subset skills use. read() returns a value that matches the schema exactly,
+// or undefined for an optional field left empty. `initial` pre-fills matching values.
+function schemaField(schema, { label, required, top = false, initial }) {
+  const type = schemaType(schema);
+  if (type === 'object' && schema.properties && typeof schema.properties === 'object') {
+    const box = el(top ? 'div' : 'fieldset', 'ask-fields');
+    if (!top) {
+      const legend = el('legend', '', label);
+      if (!required) legend.append(el('span', 'optional', 'optional'));
+      box.append(legend);
+    }
+    const needed = new Set(Array.isArray(schema.required) ? schema.required : []);
+    const fields = Object.entries(schema.properties).map(([key, sub]) => [key, schemaField(sub, { label: humanize(key), required: needed.has(key), initial: initial && typeof initial === 'object' ? initial[key] : undefined })]);
+    for (const [, field] of fields) box.append(field.node);
+    const empty = () => fields.every(([, field]) => field.empty());
+    return {
+      node: box,
+      empty,
+      focus: () => fields[0]?.[1].focus(),
+      read() {
+        if (!required && empty()) return undefined;
+        const value = {};
+        for (const [key, field] of fields) {
+          const item = field.read();
+          if (item !== undefined) value[key] = item;
+        }
+        return value;
+      },
+    };
+  }
+  const id = uid('ask');
+  const wrap = el('div', 'ask-field');
+  const heading = el('label', top ? 'ask-label sr-only' : 'ask-label', label);
+  heading.htmlFor = id;
+  if (!required && !top) heading.append(el('span', 'optional', 'optional'));
+  let input;
+  let read;
+  let empty;
+  const missing = () => new FieldError(`${label} is required`, input);
+  if (type === 'boolean') {
+    input = el('input');
+    input.type = 'checkbox';
+    input.id = id;
+    const row = el('label', 'ask-check');
+    row.htmlFor = id;
+    row.append(input, document.createTextNode(label));
+    if (!required) row.append(el('span', 'optional', 'optional'));
+    wrap.append(row);
+    read = () => input.checked;
+    empty = () => !input.checked;
+  } else if (type === 'string' && Array.isArray(schema.enum)) {
+    input = el('select', 'ask-input');
+    if (!required) input.append(new Option('—', ''));
+    for (const option of schema.enum) input.append(new Option(String(option), String(option)));
+    wrap.append(heading);
+    read = () => (input.value === '' && !required ? undefined : input.value);
+    empty = () => input.value === '';
+  } else if (type === 'string') {
+    input = el('textarea', 'ask-input');
+    input.rows = top ? 3 : 1;
+    if (Number.isInteger(schema.maxLength)) input.maxLength = schema.maxLength;
+    growTextarea(input);
+    wrap.append(heading);
+    read = () => {
+      if (!input.value.trim()) { if (required) throw missing(); return undefined; }
+      return input.value;
+    };
+    empty = () => !input.value.trim();
+  } else if (type === 'integer' || type === 'number') {
+    input = el('input', 'ask-input ask-number');
+    input.type = 'number';
+    input.step = type === 'integer' ? '1' : 'any';
+    if (Number.isFinite(schema.minimum)) input.min = String(schema.minimum);
+    if (Number.isFinite(schema.maximum)) input.max = String(schema.maximum);
+    wrap.append(heading);
+    read = () => {
+      if (input.validity.badInput) throw new FieldError(`${label} must be a number`, input);
+      const raw = input.value.trim();
+      if (!raw) { if (required) throw missing(); return undefined; }
+      const value = Number(raw);
+      if (!Number.isFinite(value)) throw new FieldError(`${label} must be a number`, input);
+      if (type === 'integer' && !Number.isInteger(value)) throw new FieldError(`${label} must be a whole number`, input);
+      return value;
+    };
+    empty = () => !input.value.trim() && !input.validity.badInput;
+  } else if (type === 'array' && (!schema.items || ['string', 'integer', 'number'].includes(schemaType(schema.items)))) {
+    const itemType = schemaType(schema.items) || 'string';
+    input = el('textarea', 'ask-input');
+    input.rows = 3;
+    growTextarea(input);
+    wrap.append(heading, el('small', 'ask-hint', 'One per line'));
+    const lines = () => input.value.split('\n').map((line) => line.trim()).filter(Boolean);
+    read = () => {
+      const items = lines();
+      if (!items.length && !required) return undefined;
+      if (itemType === 'string') return items;
+      return items.map((line) => {
+        const value = Number(line);
+        if (!Number.isFinite(value) || (itemType === 'integer' && !Number.isInteger(value))) throw new FieldError(`${label}: "${line}" is not a ${itemType === 'integer' ? 'whole number' : 'number'}`, input);
+        return value;
+      });
+    };
+    empty = () => !lines().length;
+  } else {
+    input = el('textarea', 'ask-input mono');
+    input.rows = 3;
+    input.spellcheck = false;
+    growTextarea(input);
+    wrap.append(heading, el('small', 'ask-hint', 'JSON'));
+    read = () => {
+      const raw = input.value.trim();
+      if (!raw) { if (required) throw missing(); return undefined; }
+      try { return JSON.parse(raw); } catch { throw new FieldError(`${label} must be valid JSON`, input); }
+    };
+    empty = () => !input.value.trim();
+  }
+  input.id = id;
+  if (initial !== undefined && initial !== null) {
+    if (type === 'boolean') input.checked = initial === true;
+    else if (type === 'array' && Array.isArray(initial)) input.value = initial.join('\n');
+    else if (['string', 'integer', 'number'].includes(type) && typeof initial !== 'object') input.value = String(initial);
+    else if (!['string', 'integer', 'number', 'array'].includes(type)) input.value = JSON.stringify(initial, null, 2);
+    if (input.tagName === 'TEXTAREA') input.rows = Math.max(input.rows, Math.min(10, input.value.split('\n').length));
+  }
+  if (type !== 'boolean') wrap.append(input);
+  if (typeof schema?.description === 'string' && schema.description) wrap.append(el('small', 'ask-hint', schema.description));
+  return { node: wrap, read, empty, focus: () => input.focus({ preventScroll: true }) };
+}
+async function answerQuestion(question, value, controls) {
+  for (const control of controls) control.disabled = true;
+  try {
+    const result = await api(`/sessions/${encodeURIComponent(state.session.id)}/answer`, { method: 'POST', body: { id: question.id, value } });
+    if (result.id) applySnapshot(result);
+  } catch (error) {
+    toast(error.message);
+    for (const control of controls) control.disabled = false;
+  }
+}
+function questionDetails(question) {
+  const parts = [['Context', optionValue(question.prompt?.context)], ['Data', optionValue(question.prompt?.data)]].filter(([, value]) => value !== undefined && value !== null && value !== '');
+  if (!parts.length) return null;
+  const details = el('details', 'question-details');
+  details.append(el('summary', '', 'Details'));
+  for (const [name, value] of parts) {
+    if (parts.length > 1) details.append(el('div', 'details-label', name));
+    details.append(typeof value === 'string' ? el('div', 'details-text', value) : codeBlock(JSON.stringify(value, null, 2), 'json'));
+  }
+  return details;
+}
+function approvalCard(question, card) {
+  const prompt = typeof question.prompt === 'string' ? question.prompt : question.prompt?.system || (question.command ? 'Run this command?' : 'Approve these changes?');
+  card.append(el('h3', '', typeof question.title === 'string' && question.title ? question.title : 'Approval needed'), el('p', '', prompt));
+  const data = optionValue(question.prompt?.data);
+  if (typeof data?.summary === 'string') card.append(el('p', '', data.summary));
+  if (typeof question.command === 'string' && question.command) card.append(codeBlock(question.command, 'sh'));
+  const actions = el('div', 'question-actions');
+  const approve = el('button', 'approve-button', 'Approve & continue');
+  const decline = el('button', 'decline-button', 'Decline');
+  approve.addEventListener('click', () => answerQuestion(question, { accept: true }, [approve, decline]));
+  decline.addEventListener('click', () => answerQuestion(question, { accept: false }, [approve, decline]));
+  actions.append(approve, decline);
+  const proposed = Array.isArray(data?.changes) ? data.changes.length : state.session.changes?.length;
+  if (proposed) {
+    const changes = el('button', 'text-button', 'View changes');
+    changes.addEventListener('click', () => openViz('changes', { beside: true }));
+    actions.append(changes);
+  }
+  card.append(actions);
+}
+function askCard(question, card) {
+  const skill = (state.session.runs || []).findLast((run) => ACTIVE_RUN.has(run.state))?.skill;
+  const title = typeof question.title === 'string' && question.title ? question.title : skill ? `Question from /${skill}` : 'Question';
+  const prompt = typeof question.prompt === 'string' ? question.prompt : question.prompt?.system;
+  card.append(el('h3', '', title));
+  if (prompt) card.append(el('p', '', prompt));
+  const details = questionDetails(question);
+  const schema = question.schema && typeof question.schema === 'object' ? question.schema : {};
+  const actions = el('div', 'question-actions');
+  if (schemaType(schema) === 'boolean') {
+    const yes = el('button', 'approve-button', 'Yes');
+    const no = el('button', 'decline-button', 'No');
+    yes.addEventListener('click', () => answerQuestion(question, true, [yes, no]));
+    no.addEventListener('click', () => answerQuestion(question, false, [yes, no]));
+    actions.append(yes, no);
+    if (details) card.append(details);
+    card.append(actions);
+    return null;
+  }
+  const form = el('form', 'ask-form');
+  // A skill offers editable defaults by putting same-named fields in the prompt's data.
+  const data = question.prompt?.data;
+  const initial = data && typeof data === 'object' && data.tag === 'Some' ? data.value : data?.tag === 'None' ? undefined : data;
+  const field = schemaField(schema, { label: prompt ? 'Answer' : 'Your answer', required: true, top: true, initial });
+  const body = el('div', 'ask-body');
+  if (details) body.append(details);
+  body.append(field.node);
+  const submit = el('button', 'approve-button', 'Submit');
+  submit.type = 'submit';
+  actions.append(submit);
+  form.append(body, actions);
+  form.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); form.requestSubmit(); }
+  });
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    let value;
+    try { value = field.read(); } catch (error) {
+      if (!(error instanceof FieldError)) throw error;
+      toast(error.message);
+      error.input?.focus();
+      return;
+    }
+    answerQuestion(question, value, [submit, ...form.querySelectorAll('input, textarea, select')]);
+  });
+  card.append(form);
+  return field;
 }
 function renderQuestion() {
   const question = state.session?.question;
@@ -109,46 +460,107 @@ function renderQuestion() {
   state.questionSignature = signature;
   $('question-area').replaceChildren();
   if (!question) return;
-  const card = el('section', 'question-card');
-  card.setAttribute('aria-label', 'Review required');
-  const prompt = typeof question.prompt === 'string' ? question.prompt : question.prompt?.system || 'Approve these changes?';
-  card.append(el('h3', '', 'Approval needed'), el('p', '', prompt));
-  if (typeof question.prompt?.data?.value?.summary === 'string') card.append(el('p', '', question.prompt.data.value.summary));
-  const actions = el('div', 'question-actions');
-  const approve = el('button', 'approve-button', 'Approve & continue');
-  const decline = el('button', 'decline-button', 'Decline');
-  const changes = el('button', 'text-button', 'View changes');
-  changes.addEventListener('click', () => setTab('changes'));
-  for (const [button, accept] of [[approve, true], [decline, false]]) {
-    button.addEventListener('click', async () => {
-      approve.disabled = decline.disabled = true;
-      try {
-        const result = await api(`/sessions/${encodeURIComponent(state.session.id)}/answer`, { method: 'POST', body: { id: question.id, value: { accept } } });
-        if (result.id) applySnapshot(result);
-      } catch (error) {
-        toast(error.message);
-        approve.disabled = decline.disabled = false;
-      }
-    });
-  }
-  actions.append(approve, decline, changes);
-  card.append(actions);
+  const ask = question.kind === 'ask';
+  const card = el('section', `question-card${ask ? ' ask' : ''}`);
+  card.setAttribute('aria-label', ask ? 'Question' : 'Review required');
+  const field = ask ? askCard(question, card) : approvalCard(question, card);
   $('question-area').append(card);
+  // Move focus to a new question only when the user isn't typing somewhere else.
+  if (field && [document.body, $('message-input')].includes(document.activeElement)) field.focus();
+}
+function sessionRow(session, sleeping) {
+  const row = el('div', `session-row${session.id === state.session?.id ? ' active' : ''}${sleeping ? ' sleeping' : ''}`);
+  const button = el('button', 'session-item');
+  button.setAttribute('aria-current', session.id === state.session?.id ? 'page' : 'false');
+  button.append(el('span', 'session-name', session.title || 'Untitled session'));
+  if (sleeping) button.append(el('time', 'session-time', time(session.updatedAt)));
+  else {
+    const meta = el('span', 'session-meta');
+    meta.append(el('span', `status-pill ${statusKind(session)}`, session.question ? (session.question.kind === 'ask' ? 'awaiting answer' : 'awaiting approval') : session.status || 'ready'), el('span', '', `· ${session.mode === 'fixture' ? 'Fixture' : 'Live'}`), el('time', '', time(session.updatedAt)));
+    button.append(meta);
+  }
+  button.addEventListener('click', () => selectSession(session.id).catch((error) => toast(error.message)));
+  const action = el('button', 'icon-button session-action');
+  const label = sleeping ? 'Wake session' : 'Put session to sleep';
+  action.setAttribute('aria-label', `${label}: ${session.title || 'Untitled session'}`);
+  action.title = label;
+  action.innerHTML = `<svg><use href="#i-${sleeping ? 'sun' : 'moon'}"/></svg>`;
+  // Busy sessions stay awake so a running task or open question is never tucked out of sight.
+  action.hidden = !sleeping && (['thinking', 'running', 'waiting_user'].includes(session.status) || !!session.question);
+  action.addEventListener('click', () => setSleeping(session.id, !sleeping));
+  row.append(button, action);
+  return row;
 }
 function renderSidebar() {
-  $('session-count').textContent = String(state.sessions.length);
+  const awake = state.sessions.filter((session) => !session.sleeping);
+  const sleeping = state.sessions.filter((session) => session.sleeping).sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+  $('session-count').textContent = String(awake.length);
   $('session-list').replaceChildren();
   if (!state.sessions.length) $('session-list').append(el('p', 'empty-copy', 'No sessions yet'));
-  for (const session of state.sessions) {
-    const button = el('button', `session-item${session.id === state.session?.id ? ' active' : ''}`);
-    button.setAttribute('aria-current', session.id === state.session?.id ? 'page' : 'false');
-    button.append(el('span', 'session-name', session.title || 'Untitled session'));
-    const meta = el('span', 'session-meta');
-    meta.append(el('span', `status-pill ${statusKind(session)}`, session.question ? 'awaiting approval' : session.status || 'ready'), el('span', '', `· ${session.mode === 'fixture' ? 'Fixture' : 'Live'}`), el('time', '', time(session.updatedAt)));
-    button.append(meta);
-    button.addEventListener('click', () => selectSession(session.id).catch((error) => toast(error.message)));
-    $('session-list').append(button);
+  for (const session of awake) $('session-list').append(sessionRow(session, false));
+  $('sleeping-section').hidden = !sleeping.length;
+  $('sleeping-count').textContent = `(${sleeping.length})`;
+  $('sleeping-toggle').setAttribute('aria-expanded', String(state.sleepingOpen));
+  $('sleeping-section').classList.toggle('open', state.sleepingOpen);
+  const list = $('sleeping-list');
+  list.hidden = !state.sleepingOpen;
+  list.replaceChildren();
+  if (!state.sleepingOpen) return;
+  for (const session of sleeping.slice(0, state.sleepingShown)) list.append(sessionRow(session, true));
+  const more = sleeping.length - state.sleepingShown;
+  if (more > 0) {
+    const button = el('button', 'sleeping-more');
+    button.innerHTML = '<svg><use href="#i-plus"/></svg>';
+    button.append(`Show ${more} more`);
+    button.addEventListener('click', () => { state.sleepingShown += 25; renderSidebar(); });
+    list.append(button);
   }
+}
+const effortLabel = (effort) => ({ low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra high', max: 'Max' })[effort] || effort;
+const modelEfforts = (id) => state.config.models.find((item) => item.id === id)?.efforts || state.config.efforts;
+function renderModelPicker() {
+  const config = state.config;
+  if (!config?.models) return;
+  const model = $('model-select'), effort = $('effort-select');
+  if (!model.options.length) {
+    // Grouped by provider; models of a provider that is not signed in can't be chosen.
+    for (const provider of config.providers || []) {
+      const group = el('optgroup');
+      group.label = provider.label;
+      for (const item of config.models.filter((candidate) => candidate.provider === provider.id)) group.append(Object.assign(new Option(item.label, item.id), { disabled: !provider.available }));
+      model.append(group);
+    }
+  }
+  model.value = state.session?.model || config.defaultModel.model;
+  if (effort.dataset.model !== model.value) {
+    effort.replaceChildren(...modelEfforts(model.value).map((item) => new Option(effortLabel(item), item)));
+    effort.dataset.model = model.value;
+  }
+  effort.value = state.session?.effort || config.defaultModel.effort;
+  // The model is fixed once the session's first message is sent; effort can still change.
+  model.disabled = !state.session || state.busy || Boolean(state.session.modelLocked);
+  effort.disabled = !state.session || state.busy;
+}
+async function saveModel() {
+  const session = state.session;
+  if (!session) return;
+  // An effort the newly chosen model lacks becomes its highest one.
+  const model = $('model-select').value, efforts = modelEfforts(model);
+  const effort = efforts.includes($('effort-select').value) ? $('effort-select').value : efforts.at(-1);
+  try {
+    applySnapshot(await api(`/sessions/${encodeURIComponent(session.id)}/model`, { method: 'POST', body: { model, effort } }));
+  } catch (error) { toast(error.message); renderModelPicker(); }
+}
+async function setSleeping(id, sleeping) {
+  try {
+    const session = await api(`/sessions/${encodeURIComponent(id)}/sleep`, { method: 'POST', body: { sleeping } });
+    if (session.id === state.session?.id) applySnapshot(session);
+    else {
+      const index = state.sessions.findIndex((candidate) => candidate.id === session.id);
+      if (index >= 0) state.sessions[index] = { ...state.sessions[index], sleeping: session.sleeping, updatedAt: session.updatedAt };
+      renderSidebar();
+    }
+  } catch (error) { toast(error.message); }
 }
 function statusKind(session) {
   if (session?.question) return 'question';
@@ -158,23 +570,39 @@ function statusKind(session) {
 function renderStatus() {
   const session = state.session;
   const active = isActive(session);
-  $('session-title').textContent = session ? session.title || 'Untitled session' : 'Workspace';
-  $('workspace-path').textContent = session?.workspace || '';
-  $('workspace-path').title = session?.workspace || '';
-  $('mode-badge').hidden = !session;
-  $('mode-badge').textContent = session?.mode === 'fixture' ? 'Fixture' : 'Live';
-  $('mode-badge').title = session?.mode === 'fixture' ? 'Scripted judgments, no model calls' : 'Live Codex model';
-  $('mode-badge').classList.toggle('fixture', session?.mode === 'fixture');
-  $('export-button').disabled = !session;
+  document.title = session?.title ? `${session.title} · SHOUT` : 'SHOUT';
   $('storage-warning').hidden = !session?.storageError;
-  $('storage-warning').textContent = session?.storageError ? `Session could not be saved: ${typeof session.storageError === 'string' ? session.storageError : JSON.stringify(session.storageError)}. Export this session to keep a copy.` : '';
-  $('files-button').disabled = !session;
+  $('storage-warning').textContent = session?.storageError ? `Session could not be saved: ${typeof session.storageError === 'string' ? session.storageError : JSON.stringify(session.storageError)}.` : '';
   $('status-line').className = `status-line ${statusKind(session)}`;
-  $('status-text').textContent = session?.question ? 'Awaiting approval' : session?.status || 'Ready';
+  // Session state is shown by the composer's colour; the status text stays for screen readers.
+  $('composer').dataset.state = statusKind(session);
+  $('status-text').textContent = session?.question ? (session.question.kind === 'ask' ? 'Awaiting your answer' : 'Awaiting approval') : session?.status || 'Ready';
   $('cancel-button').hidden = !active;
+  $('send-button').hidden = active;
   $('send-button').disabled = active || state.busy;
-  $('message-input').placeholder = !session ? 'Create a session to start' : active ? 'Waiting for the current run…' : 'Describe a change, or /test';
+  $('message-input').placeholder = !session ? 'Create a session to start' : session.question ? 'Answer above to continue…' : active ? 'Working… press stop to cancel' : 'Describe a change, or type / for skills';
+  renderModelPicker();
+  let budget = $('time-budget-toggle');
+  if (!budget) {
+    const label = el('label', 'time-budget-toggle');
+    budget = el('input'); budget.type = 'checkbox'; budget.id = 'time-budget-toggle';
+    budget.addEventListener('change', async () => {
+      budget.disabled = true;
+      try {
+        const result = await api(`/sessions/${encodeURIComponent(state.session.id)}/budget`, { method: 'POST', body: { enabled: !budget.checked } });
+        applySnapshot(result);
+      } catch (error) { toast(error.message); renderStatus(); }
+    });
+    label.append(budget, document.createTextNode(' No time limits'));
+    $('status-line').append(label);
+  }
+  budget.closest('label').hidden = !session;
+  budget.checked = session?.timeBudgetsEnabled === false;
+  budget.disabled = active || state.busy;
+  budget.title = budget.checked ? 'Time budgets disabled for this session; cancellation remains available' : '10 minute model calls; 30 minute runs';
 }
+
+/* Visualization */
 function classify(event) {
   const type = event.type || '';
   if (type.startsWith('user.') || type.startsWith('message.user')) return { lane: 0, kind: 'user' };
@@ -183,141 +611,89 @@ function classify(event) {
   if (type.startsWith('vm.') || type.startsWith('effect.') || type === 'program.loaded') return { lane: 3, kind: 'vm' };
   return { lane: 1, kind: 'harness' };
 }
-function filteredEvents() {
-  return (state.session?.events || []).filter((event) => (!state.runFilter || event.run === state.runFilter) && (!state.eventFilter || JSON.stringify(event).toLowerCase().includes(state.eventFilter.toLowerCase())));
-}
-function shortLabel(event) {
-  const labels = { 'run.started': 'Run start', 'run.terminal': 'Run end', 'program.loaded': 'Program', 'model.started': 'Judge', 'model.completed': 'Judgment', 'tool.started': 'Call tool', 'tool.completed': 'Result', 'user.question': 'Review', 'user.answered': 'Answer', 'chat.started': 'Route', 'chat.completed': 'Route result', 'vm.event': 'VM event', 'effect.requested': 'Suspend', 'effect.resolved': 'Resume' };
-  return labels[event.type] || event.type.split('.').at(-1);
-}
-function selectEvent(event) {
-  state.selectedEvent = event.id;
-  renderInspector();
-}
-function renderEventDetail() {
-  const detail = $('event-detail');
-  const event = state.session?.events?.find((candidate) => candidate.id === state.selectedEvent);
-  detail.hidden = !event || state.tab === 'changes' || state.tab === 'files';
-  detail.replaceChildren();
-  if (detail.hidden) return;
-  const header = el('div', 'detail-header');
-  header.append(el('strong', '', `#${event.sequence} · ${event.type}`));
-  const close = el('button', 'icon-button');
-  close.innerHTML = '<svg><use href="#i-x"/></svg>';
-  close.setAttribute('aria-label', 'Close event details');
-  close.addEventListener('click', () => { state.selectedEvent = null; renderInspector(); });
-  header.append(close);
-  detail.append(header, el('pre', '', JSON.stringify(event, null, 2)));
-  if (event.type === 'program.loaded') {
-    const run = state.session.runs?.find((candidate) => candidate.id === event.run);
-    if (run?.source) detail.append(el('p', 'code-language', 'Executed ALLEN source'), el('pre', '', run.source));
-  }
-}
-function renderGraph(container, events) {
-  if (!events.length) return renderVizEmpty(container);
-  const stats = el('div', 'flow-summary');
-  const scopedEvents = (state.session?.events || []).filter((event) => !state.runFilter || event.run === state.runFilter);
-  for (const [label, type] of [[state.session?.mode === 'fixture' ? 'Scripted judgments' : 'Model calls', 'model.started'], ['Tool calls', 'tool.started'], ['VM runs', 'run.started']]) {
-    const stat = el('div', 'flow-stat');
-    stat.title = 'Totals for the selected run scope, before the text filter';
-    stat.append(el('strong', '', String(scopedEvents.filter((event) => event.type === type || type === 'model.started' && event.type === 'chat.started').length)), document.createTextNode(label));
-    stats.append(stat);
-  }
-  container.append(stats);
-  const lanes = el('div', 'lane-header');
-  for (const [name, kind] of [['You', 'user'], ['SHOUT', 'harness'], [state.session?.mode === 'fixture' ? 'Fixture' : 'Model', 'model'], ['ALLEN', 'vm'], ['Tools', 'tool']]) lanes.append(el('span', kind, name));
-  container.append(lanes);
-  let lastRun;
-  const effects = new Map();
-  for (const event of events) {
-    if (event.run && event.run !== lastRun) {
-      container.append(el('div', 'flow-run-label', `RUN ${event.run}`));
-      lastRun = event.run;
-    }
-    const row = el('div', 'flow-row');
-    const { lane, kind } = classify(event);
-    // A connector is drawn only when recorded events share a run + effect ID.
-    const effectKey = event.effectId && event.run ? `${event.run}:${event.effectId}` : null;
-    const previousLane = effectKey ? effects.get(effectKey) : undefined;
-    if (previousLane !== undefined && previousLane !== lane) {
-      const connector = el('div', 'flow-connector');
-      connector.style.left = `${Math.min(previousLane, lane) * 20 + 10}%`;
-      connector.style.width = `${Math.abs(previousLane - lane) * 20}%`;
-      if (lane < previousLane) connector.style.transform = 'rotate(180deg)';
-      connector.title = `Shared effect ${event.effectId}`;
-      row.append(connector);
-    }
-    if (effectKey) effects.set(effectKey, lane);
-    const node = el('button', `flow-node ${kind}${state.selectedEvent === event.id ? ' selected' : ''}`, shortLabel(event));
-    node.style.gridColumn = String(lane + 1);
-    node.title = `${event.type}${event.effectId ? ` · ${event.effectId}` : ''}`;
-    node.setAttribute('aria-label', `Event ${event.sequence}: ${event.type}`);
-    node.append(el('small', '', `#${event.sequence}`));
-    node.addEventListener('click', () => selectEvent(event));
-    row.append(node);
-    container.append(row);
-  }
+function filteredEvents(tab) {
+  return (state.session?.events || []).filter((event) => (!tab.runFilter || event.run === tab.runFilter) && (!tab.eventFilter || JSON.stringify(event).toLowerCase().includes(tab.eventFilter.toLowerCase())));
 }
 function renderVizEmpty(container) {
   const empty = el('div', 'viz-empty');
   empty.append(el('h3', '', state.session?.events?.length ? 'No matching events' : 'No events yet'));
   container.append(empty);
-  if (!state.session?.events?.length) {
-    const lanes = el('div', 'lane-header');
-    for (const [name, kind] of [['You', 'user'], ['SHOUT', 'harness'], ['Model', 'model'], ['ALLEN', 'vm'], ['Tools', 'tool']]) lanes.append(el('span', kind, name));
-    container.append(lanes);
-  }
 }
-function renderTrace(container, events) {
+function renderTrace(container, events, tab) {
   if (!events.length) return renderVizEmpty(container);
   for (const event of events) {
-    const button = el('button', `trace-event ${classify(event).kind}${state.selectedEvent === event.id ? ' selected' : ''}`);
+    const button = el('button', `trace-event ${classify(event).kind}${tab.selectedEvent === event.id ? ' selected' : ''}`);
     button.append(el('span', 'trace-index', `#${event.sequence}`));
     const main = el('span', 'trace-event-main');
     main.append(el('strong', '', event.type), el('small', '', `${time(event.time)}${event.effectId ? ` · effect ${event.effectId}` : event.run ? ` · ${event.run}` : ''}`));
     button.append(main);
-    button.addEventListener('click', () => selectEvent(event));
+    button.addEventListener('click', () => selectEvent(tab, event));
     container.append(button);
   }
 }
-function renderChanges(container) {
+function changeStats(change) {
+  const lines = diffLines(change.before ?? '', change.after ?? '');
+  return { lines, added: lines.filter((line) => line.type === 'add').length, removed: lines.filter((line) => line.type === 'del').length };
+}
+function diffStat({ added, removed }) {
+  const stat = el('span', 'diff-stat');
+  stat.append(el('span', 'add', `+${added}`), el('span', 'del', `−${removed}`));
+  return stat;
+}
+function renderChanges(container, tab) {
   const changes = state.session?.changes || [];
   if (!changes.length) container.append(el('p', 'empty-copy', 'No changes'));
   for (const change of changes) {
-    const lines = diffLines(change.before ?? '', change.after ?? '');
+    const stats = changeStats(change);
+    const lang = languageFor(change.path);
+    const before = highlightLines(change.before ?? '', lang);
+    const after = highlightLines(change.after ?? '', lang);
     const file = el('section', 'diff-file');
+    file.dataset.path = change.path;
     const title = el('div', 'diff-title');
-    const stat = el('span', 'diff-stat');
-    stat.append(el('span', 'add', `+${lines.filter((line) => line.type === 'add').length}`), el('span', 'del', `−${lines.filter((line) => line.type === 'del').length}`));
-    title.append(el('span', '', change.path + (change.before == null ? ' (new)' : change.after == null ? ' (deleted)' : '')), stat);
+    const name = el('span', '', change.path + (change.before == null ? ' (new)' : change.after == null ? ' (deleted)' : ''));
+    const open = iconButton('i-open', `Open ${change.path}`, () => openFile(change.path), 'icon-button small');
+    const titleEnd = el('span', 'diff-title-end');
+    titleEnd.append(diffStat(stats));
+    if (change.after != null) titleEnd.append(open);
+    title.append(name, titleEnd);
     const body = el('div', 'diff-body');
-    for (const line of collapseContext(lines)) {
+    for (const line of collapseContext(stats.lines)) {
       if (line.type === 'gap') { body.append(el('div', 'diff-line gap', `${line.count} unchanged line${line.count === 1 ? '' : 's'}`)); continue; }
       const row = el('div', `diff-line ${line.type}`);
-      row.append(el('span', 'sign', line.type === 'add' ? '+' : line.type === 'del' ? '−' : ''), el('span', 'code', line.text || ' '));
+      const tokens = line.type === 'del' ? before[line.a] : after[line.b];
+      row.append(el('span', 'ln', line.a === undefined ? '' : String(line.a + 1)), el('span', 'ln', line.b === undefined ? '' : String(line.b + 1)), el('span', 'sign', line.type === 'add' ? '+' : line.type === 'del' ? '−' : ''));
+      const code = el('span', 'code');
+      if (tokens?.length) renderTokens(code, tokens); else code.textContent = ' ';
+      row.append(code);
       body.append(row);
     }
     file.append(title, body);
     container.append(file);
   }
+  if (tab.focusPath) {
+    container.querySelector(`.diff-file[data-path="${CSS.escape(tab.focusPath)}"]`)?.scrollIntoView({ block: 'start' });
+    tab.focusPath = null;
+  }
 }
 // Line-level LCS diff. Workspace files are small and bounded; very large inputs fall back to remove-all/add-all.
+// Each line records its 0-based index in the old (a) and new (b) text.
 function diffLines(before, after) {
   const a = before ? before.split('\n') : [];
   const b = after ? after.split('\n') : [];
-  if (a.length * b.length > 4_000_000) return [...a.map((text) => ({ type: 'del', text })), ...b.map((text) => ({ type: 'add', text }))];
+  if (a.length * b.length > 4_000_000) return [...a.map((text, i) => ({ type: 'del', text, a: i })), ...b.map((text, j) => ({ type: 'add', text, b: j }))];
   const width = b.length + 1;
   const table = new Uint32Array((a.length + 1) * width);
   for (let i = a.length - 1; i >= 0; i--) for (let j = b.length - 1; j >= 0; j--) table[i * width + j] = a[i] === b[j] ? table[(i + 1) * width + j + 1] + 1 : Math.max(table[(i + 1) * width + j], table[i * width + j + 1]);
   const result = [];
   let i = 0, j = 0;
   while (i < a.length && j < b.length) {
-    if (a[i] === b[j]) { result.push({ type: 'same', text: a[i] }); i++; j++; }
-    else if (table[(i + 1) * width + j] >= table[i * width + j + 1]) result.push({ type: 'del', text: a[i++] });
-    else result.push({ type: 'add', text: b[j++] });
+    if (a[i] === b[j]) { result.push({ type: 'same', text: a[i], a: i++, b: j++ }); }
+    else if (table[(i + 1) * width + j] >= table[i * width + j + 1]) result.push({ type: 'del', text: a[i], a: i++ });
+    else result.push({ type: 'add', text: b[j], b: j++ });
   }
-  while (i < a.length) result.push({ type: 'del', text: a[i++] });
-  while (j < b.length) result.push({ type: 'add', text: b[j++] });
+  while (i < a.length) result.push({ type: 'del', text: a[i], a: i++ });
+  while (j < b.length) result.push({ type: 'add', text: b[j], b: j++ });
   return result;
 }
 function collapseContext(lines, context = 3) {
@@ -336,71 +712,933 @@ function collapseContext(lines, context = 3) {
   }
   return output;
 }
-function renderInspector() {
-  const container = $('inspector-content');
+function selectEvent(tab, event) {
+  tab.selectedEvent = event.id;
+  renderViz(tab);
+}
+function renderEventDetail(tab, detail) {
+  const event = tab.view !== 'changes' && state.session?.events?.find((candidate) => candidate.id === tab.selectedEvent);
+  detail.hidden = !event;
+  detail.replaceChildren();
+  if (!event) return;
+  const header = el('div', 'detail-header');
+  header.append(el('strong', '', `#${event.sequence} · ${event.type}`));
+  header.append(iconButton('i-x', 'Close event details', () => { tab.selectedEvent = null; renderViz(tab); }));
+  detail.append(header, codeBlock(JSON.stringify(event, null, 2), 'json'));
+  if (event.type === 'program.loaded') {
+    const run = state.session.runs?.find((candidate) => candidate.id === event.run);
+    if (run?.source) {
+      const open = el('button', 'secondary-button detail-action');
+      open.append(icon('i-code'), document.createTextNode('Open ALLEN program'));
+      open.addEventListener('click', () => openProgram(run.id, { beside: true }));
+      detail.append(open);
+    }
+  }
+}
+function vizPane(tab) {
+  const pane = el('div', 'viz-pane');
+  const toolbar = el('div', 'viz-toolbar');
+  const views = el('div', 'segmented');
+  views.setAttribute('role', 'tablist');
+  views.setAttribute('aria-label', 'Visualization');
+  for (const [view, { label }] of Object.entries(VIEWS)) {
+    const button = el('button', '', label);
+    button.dataset.view = view;
+    button.setAttribute('role', 'tab');
+    button.addEventListener('click', () => { tab.view = view; tab.selectedEvent = null; saveLayout(); renderTabStrips(); renderViz(tab); });
+    views.append(button);
+  }
+  const runFilter = el('select', 'run-filter');
+  runFilter.setAttribute('aria-label', 'Filter by run');
+  runFilter.addEventListener('change', () => { tab.runFilter = runFilter.value; tab.selectedEvent = null; renderViz(tab); });
+  const eventFilter = el('input', 'event-filter');
+  eventFilter.type = 'search';
+  eventFilter.placeholder = 'Filter events';
+  eventFilter.setAttribute('aria-label', 'Filter events');
+  eventFilter.addEventListener('input', () => { tab.eventFilter = eventFilter.value; renderViz(tab); });
+  toolbar.append(views, runFilter, eventFilter);
+  const main = el('div', 'viz-main');
+  const content = el('div', 'viz-content keep-scroll');
+  const detail = el('div', 'event-detail');
+  detail.hidden = true;
+  main.append(content, detail);
+  const legend = el('div', 'viz-legend');
+  for (const [name, kind] of LANES) {
+    const item = el('span');
+    item.append(el('i', `legend-dot ${kind}`), document.createTextNode(name));
+    legend.append(item);
+  }
+  pane.append(toolbar, main, legend);
+  Object.assign(pane, { views, runFilter, eventFilter, content, detail, legend });
+  return pane;
+}
+function renderViz(tab) {
+  const pane = panes.get(tab.id);
+  if (!pane) return;
+  const isChanges = tab.view === 'changes';
+  for (const button of pane.views.children) {
+    button.classList.toggle('active', button.dataset.view === tab.view);
+    button.setAttribute('aria-selected', String(button.dataset.view === tab.view));
+  }
+  pane.runFilter.hidden = pane.eventFilter.hidden = pane.legend.hidden = isChanges;
+  const runIds = [...new Set((state.session?.events || []).map((event) => event.run).filter(Boolean))];
+  const signature = JSON.stringify(runIds);
+  if (pane.runFilter.dataset.signature !== signature) {
+    pane.runFilter.dataset.signature = signature;
+    pane.runFilter.replaceChildren(new Option('All runs', ''), ...runIds.map((id, i) => new Option(`Run ${i + 1} · ${id.slice(-8)}`, id)));
+  }
+  pane.runFilter.value = tab.runFilter || '';
+  if (pane.eventFilter.value !== (tab.eventFilter || '')) pane.eventFilter.value = tab.eventFilter || '';
+  const container = pane.content;
   const oldScroll = container.scrollTop;
   const nearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 85;
-  $('inspector-title').textContent = state.tab === 'files' ? 'Workspace files' : 'Inspector';
-  $('event-count').textContent = String(state.session?.events?.length || 0);
-  $('change-count').textContent = String(state.session?.changes?.length || 0);
-  $('viz-toolbar').hidden = state.tab === 'changes' || state.tab === 'files';
-  for (const tab of ['graph', 'trace', 'changes']) {
-    $(`${tab}-tab`).classList.toggle('active', state.tab === tab);
-    $(`${tab}-tab`).setAttribute('aria-selected', String(state.tab === tab));
-  }
-  $('files-button').setAttribute('aria-pressed', String(state.tab === 'files'));
-  const runIds = [...new Set((state.session?.events || []).map((event) => event.run).filter(Boolean))];
-  const optionsSignature = JSON.stringify(runIds);
-  if ($('run-filter').dataset.signature !== optionsSignature) {
-    $('run-filter').dataset.signature = optionsSignature;
-    $('run-filter').replaceChildren(new Option('All runs', ''), ...runIds.map((id, i) => new Option(`Run ${i + 1} · ${id.slice(-8)}`, id)));
-    $('run-filter').value = state.runFilter;
-  }
-  if (state.tab === 'files') return;
+  const sameView = container.dataset.view === tab.view;
+  container.dataset.view = tab.view;
   container.replaceChildren();
-  if (state.tab === 'graph') renderGraph(container, filteredEvents());
-  else if (state.tab === 'trace') renderTrace(container, filteredEvents());
-  else renderChanges(container);
-  renderEventDetail();
-  container.scrollTop = nearBottom && !state.selectedEvent && state.tab !== 'changes' ? container.scrollHeight : oldScroll;
+  if (tab.view === 'trace') renderTrace(container, filteredEvents(tab), tab);
+  else renderChanges(container, tab);
+  renderEventDetail(tab, pane.detail);
+  if (!sameView) container.scrollTop = tab.view === 'changes' ? 0 : container.scrollHeight;
+  else if (container.isConnected && !pane.closest('.pane-store')) container.scrollTop = nearBottom && !tab.selectedEvent && tab.view !== 'changes' ? container.scrollHeight : oldScroll;
 }
-function setTab(tab) {
-  state.tab = tab;
-  $('inspector').hidden = false;
-  $('viz-button').setAttribute('aria-pressed', 'true');
-  renderInspector();
-  if (tab === 'files') loadFiles();
+function renderVizPanes() {
+  for (const tab of Object.values(state.layout.tabs)) if (tab.kind === 'viz') renderViz(tab);
+}
+
+/* ALLEN program */
+function runStateKind(runState) {
+  return ['completed', 'failed', 'interrupted'].includes(runState) ? runState : ACTIVE_RUN.has(runState) ? 'active' : '';
+}
+function workflowName(source) {
+  return state.config?.workflows?.find((workflow) => workflow.source === source)?.name || 'ALLEN program';
+}
+function runName(run) {
+  return run.skill ? `/${run.skill}` : run.generated ? 'program' : workflowName(run.source);
+}
+// Resolves what a program tab shows: a pinned run, the latest run, or a workflow file before any run.
+function programTarget(tab) {
+  const runs = state.session?.runs || [];
+  if (tab.run?.startsWith('workflow:')) {
+    const workflow = state.config?.workflows?.find((candidate) => candidate.name === tab.run.slice(9));
+    return { source: workflow?.source, name: workflow?.name || 'ALLEN program', run: null };
+  }
+  const run = (tab.run && runs.find((candidate) => candidate.id === tab.run)) || runs.at(-1);
+  if (run) return { source: run.source, name: runName(run), run };
+  const workflow = state.config?.workflows?.[0];
+  return { source: workflow?.source, name: workflow?.name || 'ALLEN program', run: null };
+}
+// Maps source lines that perform an effect to the key used for the run's recorded events.
+function effectKey(line) {
+  if (!/\bawait\b/.test(line)) return null;
+  const tool = /tools\.([\w.]+)\.call\b/.exec(line);
+  if (tool) return `tool:${tool[1]}`;
+  if (/\bmodel\.request\b/.test(line)) return 'model';
+  if (/\buser\.ask\b/.test(line)) return 'user';
+  return null;
+}
+function eventEffectKey(event) {
+  if (event.type.startsWith('tool.')) return `tool:${event.tool}`;
+  if (event.type.startsWith('model.')) return 'model';
+  if (event.type.startsWith('user.')) return 'user';
+  return null;
+}
+function programPane(tab) {
+  const pane = el('div', 'program-pane');
+  const header = el('div', 'pane-header program-header');
+  const select = el('select', 'program-run');
+  select.setAttribute('aria-label', 'Program source');
+  select.addEventListener('change', () => { tab.run = select.value; saveLayout(); renderTabStrips(); renderProgram(tab); });
+  const status = el('span', 'status-pill');
+  const meta = el('span', 'pane-meta');
+  const flow = iconButton('i-flow', 'Show this run in Flow chat', () => showFlowChat(programTarget(tab).run?.id), 'icon-button small');
+  header.append(select, status, meta, flow);
+  const scroller = el('div', 'code-scroll keep-scroll');
+  pane.append(header, scroller);
+  Object.assign(pane, { select, status, meta, flow, scroller });
+  return pane;
+}
+function renderProgram(tab) {
+  const pane = panes.get(tab.id);
+  if (!pane) return;
+  const runs = state.session?.runs || [];
+  const target = programTarget(tab);
+  const options = [['', runs.length ? `Latest run (Run ${runs.length})` : 'Latest run'], ...runs.map((run, i) => [run.id, `Run ${i + 1} · ${runName(run)}`]), ...(state.config?.workflows || []).map((workflow) => [`workflow:${workflow.name}`, `File · ${workflow.name}`])];
+  const signature = JSON.stringify(options);
+  if (pane.select.dataset.signature !== signature) {
+    pane.select.dataset.signature = signature;
+    pane.select.replaceChildren(...options.map(([value, label]) => new Option(label, value)));
+  }
+  pane.select.value = options.some(([value]) => value === tab.run) ? tab.run : '';
+  pane.status.hidden = !target.run;
+  pane.status.className = `status-pill ${runStateKind(target.run?.state)}`;
+  pane.status.textContent = target.run ? (target.run.state || 'unknown').replace(/_/g, ' ') : '';
+  pane.flow.hidden = !target.run;
+  if (!target.source) {
+    pane.dataset.source = '';
+    pane.scroller.replaceChildren(el('p', 'empty-copy', 'No ALLEN program yet'));
+    return;
+  }
+  const key = `${target.run?.id || target.name}:${target.source.length}`;
+  if (pane.dataset.source !== key) {
+    pane.dataset.source = key;
+    const lines = highlightLines(target.source, 'allen');
+    if (lines.length > 1 && !lines.at(-1).length) lines.pop();
+    const raw = target.source.split('\n');
+    const view = el('div', 'code-view program-view');
+    view.style.setProperty('--gutter', `${String(lines.length).length + 1}ch`);
+    pane.effectRows = [];
+    lines.forEach((tokens, i) => {
+      const row = el('div', 'code-line');
+      const code = renderTokens(el('span', 'lc'), tokens);
+      // Wrapped continuation lines hang at the statement's indentation.
+      code.style.setProperty('--indent', /^ */.exec(raw[i] || '')[0].length + 2);
+      row.append(el('span', 'ln', String(i + 1)), code);
+      const effect = effectKey(raw[i] || '');
+      if (effect) {
+        row.classList.add('effect-line', effect === 'model' ? 'model' : effect === 'user' ? 'user' : 'tool');
+        const inlay = el('button', 'inlay');
+        inlay.addEventListener('click', () => {
+          const { run } = programTarget(tab);
+          const first = (state.session?.events || []).find((event) => event.run === run?.id && eventEffectKey(event) === effect);
+          openViz('trace', { beside: true, apply: (viz) => { viz.runFilter = run?.id || ''; viz.eventFilter = ''; viz.selectedEvent = first?.id || null; } });
+        });
+        row.append(inlay);
+        pane.effectRows.push({ row, inlay, effect });
+      }
+      view.append(row);
+    });
+    pane.meta.textContent = `${lines.length} lines`;
+    pane.scroller.replaceChildren(view);
+  }
+  // Annotate effect lines with what this run actually did there.
+  const events = target.run ? (state.session?.events || []).filter((event) => event.run === target.run.id) : [];
+  const starts = { tool: 'tool.started', model: 'model.started', user: 'user.question' };
+  const active = target.run && ACTIVE_RUN.has(target.run.state);
+  const last = active ? events.filter((event) => eventEffectKey(event)).at(-1) : null;
+  const current = last && ['tool.started', 'model.started', 'user.question'].includes(last.type) ? eventEffectKey(last) : null;
+  for (const { row, inlay, effect } of pane.effectRows) {
+    const type = starts[effect.split(':')[0]];
+    const count = events.filter((event) => event.type === type && eventEffectKey(event) === effect).length;
+    const live = current === effect;
+    row.classList.toggle('current', live);
+    row.classList.toggle('unreached', !!target.run && !count);
+    inlay.hidden = !target.run || (active && !count && !live);
+    inlay.textContent = live ? (effect === 'user' ? 'waiting for you' : 'running…') : count ? `${count}× ${effect === 'model' ? 'judgment' : effect === 'user' ? 'question' : 'call'}${count === 1 ? '' : 's'}` : 'not reached';
+    inlay.title = count ? 'Show these events' : 'This effect did not run';
+    inlay.disabled = !count;
+  }
+  if (current) pane.effectRows.find((item) => item.effect === current)?.row.scrollIntoView({ block: 'nearest' });
+}
+function renderProgramPanes() {
+  for (const tab of Object.values(state.layout.tabs)) if (tab.kind === 'program') renderProgram(tab);
+}
+function openProgram(run = '', { split, beside } = {}) {
+  if (!state.session) return;
+  let tab = !split && Object.values(state.layout.tabs).find((candidate) => candidate.kind === 'program');
+  if (tab) { tab.run = run; activate(state.layout, tab.id); }
+  else {
+    tab = { id: uid('program'), kind: 'program', run };
+    place(tab, { split, beside });
+  }
+  commitLayout();
+  renderProgram(tab);
+  if (window.matchMedia('(max-width:1040px)').matches && !$('side-panel').hidden) showSide(state.side);
+}
+
+/* Files */
+function filePane(tab) {
+  const pane = el('div', 'file-pane');
+  const header = el('div', 'pane-header');
+  const crumbs = el('div', 'crumbs');
+  const parts = tab.path.split('/');
+  parts.forEach((part, i) => {
+    if (i) crumbs.append(el('span', 'crumb-sep', '/'));
+    crumbs.append(el('span', i === parts.length - 1 ? 'crumb-file' : 'crumb', part));
+  });
+  const meta = el('span', 'pane-meta', languageLabel(tab.path));
+  header.append(crumbs, meta, iconButton('i-refresh', 'Reload file', () => loadFileInto(tab), 'icon-button small'));
+  const scroller = el('div', 'code-scroll keep-scroll');
+  scroller.append(el('p', 'empty-copy', 'Loading…'));
+  pane.append(header, scroller);
+  Object.assign(pane, { meta, scroller });
+  return pane;
+}
+async function loadFileInto(tab) {
+  const pane = panes.get(tab.id);
+  const sessionId = state.session?.id;
+  if (!pane || !sessionId) return;
+  try {
+    const file = await api(`/sessions/${encodeURIComponent(sessionId)}/file?path=${encodeURIComponent(tab.path)}`);
+    if (state.session?.id !== sessionId || panes.get(tab.id) !== pane) return;
+    const lines = highlightLines(file.content, languageFor(tab.path));
+    if (lines.length > 1 && !lines.at(-1).length && file.content.endsWith('\n')) lines.pop();
+    const view = el('div', 'code-view');
+    view.style.setProperty('--gutter', `${String(lines.length).length + 1}ch`);
+    lines.forEach((tokens, i) => {
+      const row = el('div', 'code-line');
+      row.append(el('span', 'ln', String(i + 1)), renderTokens(el('span', 'lc'), tokens));
+      view.append(row);
+    });
+    pane.meta.textContent = `${languageLabel(tab.path)} · ${lines.length} line${lines.length === 1 ? '' : 's'}`;
+    const { scrollTop, scrollLeft } = pane.scroller;
+    pane.scroller.replaceChildren(view);
+    pane.scroller.scrollTop = scrollTop;
+    pane.scroller.scrollLeft = scrollLeft;
+  } catch (error) {
+    if (panes.get(tab.id) === pane) pane.scroller.replaceChildren(el('p', 'empty-copy', error.message));
+  }
+}
+function reloadFilePanes() {
+  for (const tab of Object.values(state.layout.tabs)) if (tab.kind === 'file' && panes.has(tab.id)) loadFileInto(tab);
 }
 async function loadFiles() {
   const sessionId = state.session?.id;
   if (!sessionId) return;
-  $('event-detail').hidden = true;
-  $('inspector-content').replaceChildren(el('p', 'empty-copy', 'Loading files…'));
   try {
     const { files } = await api(`/sessions/${encodeURIComponent(sessionId)}/files`);
-    if (state.session?.id !== sessionId || state.tab !== 'files') return;
-    const container = $('inspector-content');
-    container.replaceChildren();
-    if (!files.length) container.append(el('p', 'empty-copy', 'No readable files'));
-    for (const path of files) {
-      const button = el('button', 'file-entry', path);
-      button.addEventListener('click', () => loadFile(sessionId, path));
-      container.append(button);
+    if (state.session?.id !== sessionId) return;
+    if (!state.files) {
+      // Expand everything for small workspaces; otherwise start with top-level folders collapsed.
+      const dirs = new Set(files.flatMap((path) => path.split('/').slice(0, -1).map((_, i, parts) => parts.slice(0, i + 1).join('/'))));
+      state.expanded = files.length <= 40 ? dirs : new Set();
     }
-  } catch (error) { toast(error.message); }
+    state.files = files;
+    state.filesError = '';
+  } catch (error) {
+    if (state.session?.id !== sessionId) return;
+    state.filesError = error.message;
+  }
+  if (state.side === 'files') renderSide();
 }
-async function loadFile(sessionId, path) {
+function fileTree(paths) {
+  const root = { dirs: new Map(), files: [] };
+  for (const path of paths) {
+    const parts = path.split('/');
+    let node = root;
+    parts.slice(0, -1).forEach((part, i) => {
+      if (!node.dirs.has(part)) node.dirs.set(part, { path: parts.slice(0, i + 1).join('/'), dirs: new Map(), files: [] });
+      node = node.dirs.get(part);
+    });
+    node.files.push(path);
+  }
+  return root;
+}
+function renderTreeNode(container, node, depth, openPaths) {
+  for (const [name, dir] of [...node.dirs].sort(([a], [b]) => a.localeCompare(b))) {
+    const open = state.expanded.has(dir.path);
+    const row = el('button', `tree-row tree-dir${open ? ' open' : ''}`);
+    row.style.setProperty('--depth', depth);
+    row.setAttribute('aria-expanded', String(open));
+    row.append(icon('i-chevron'), el('span', 'tree-name', name));
+    row.addEventListener('click', () => {
+      if (open) state.expanded.delete(dir.path); else state.expanded.add(dir.path);
+      renderSide();
+    });
+    container.append(row);
+    if (open) renderTreeNode(container, dir, depth + 1, openPaths);
+  }
+  for (const path of [...node.files].sort((a, b) => basename(a).localeCompare(basename(b)))) {
+    const item = el('div', `tree-file${openPaths.active === path ? ' active' : openPaths.all.has(path) ? ' open' : ''}`);
+    item.style.setProperty('--depth', depth);
+    const row = el('button', 'tree-row');
+    row.title = path;
+    row.draggable = true;
+    row.append(icon('i-file'), el('span', 'tree-name', basename(path)));
+    row.setAttribute('aria-label', path);
+    row.addEventListener('click', () => openFile(path));
+    row.addEventListener('dragstart', (event) => startDrag(event, { file: path }));
+    row.addEventListener('dragend', endDrag);
+    item.append(row, iconButton('i-split-right', `Open ${basename(path)} to the side`, () => openFile(path, { split: 'right' }), 'icon-button small tree-side'));
+    container.append(item);
+  }
+}
+function renderFilesPanel(container) {
+  if (!state.session) return container.append(el('p', 'empty-copy', 'No session selected'));
+  if (state.filesError) return container.append(el('p', 'empty-copy', state.filesError));
+  if (!state.files) return container.append(el('p', 'empty-copy', 'Loading files…'));
+  if (!state.files.length) return container.append(el('p', 'empty-copy', 'No readable files'));
+  const tabs = Object.values(state.layout.tabs).filter((tab) => tab.kind === 'file');
+  const focusedTab = state.layout.tabs[focusedGroup(state.layout).active];
+  const tree = el('div', 'file-tree');
+  tree.setAttribute('role', 'tree');
+  renderTreeNode(tree, fileTree(state.files), 0, { all: new Set(tabs.map((tab) => tab.path)), active: focusedTab?.kind === 'file' ? focusedTab.path : null });
+  container.append(tree);
+}
+
+/* Skills */
+// The list is cheap to fetch and skills can change on disk at any time, so callers refresh freely within a short cache.
+function loadSkills({ force = false } = {}) {
+  const sessionId = state.session?.id;
+  if (!sessionId) return Promise.resolve(null);
+  if (state.skills.sessionId !== sessionId) state.skills = { sessionId, list: null, error: '', at: 0, pending: null };
+  const skills = state.skills;
+  if (skills.pending) return skills.pending;
+  if (!force && Date.now() - skills.at < 2000) return Promise.resolve(skills.list);
+  skills.pending = api(`/sessions/${encodeURIComponent(sessionId)}/skills`).then((data) => {
+    skills.list = Array.isArray(data?.skills) ? data.skills : [];
+    skills.error = '';
+  }, (error) => { skills.error = error.message; }).then(() => {
+    skills.pending = null;
+    skills.at = Date.now();
+    if (state.skills !== skills) return null;
+    updateSlash();
+    return skills.list;
+  });
+  return skills.pending;
+}
+function skillBadges(skill) {
+  const badges = [];
+  if (skill.ok === false) {
+    const count = Array.isArray(skill.diagnostics) ? skill.diagnostics.length : 0;
+    badges.push(el('span', 'skill-error', count > 1 ? `${count} errors` : 'has errors'));
+  }
+  return badges;
+}
+// Puts `/name ` at the start of the composer, keeping any draft text as the skill's arguments.
+function useSkill(name) {
+  if (!state.session) return;
+  const input = $('message-input');
+  const rest = input.value.replace(/^\/\S*[ \t]*/, '');
+  input.value = `/${name} ${rest}`;
+  activate(state.layout, CHAT);
+  commitLayout();
+  if (window.matchMedia('(max-width:1040px)').matches && !$('side-panel').hidden) showSide(state.side);
+  resizeComposer();
+  input.focus();
+  input.setSelectionRange(name.length + 2, name.length + 2);
+}
+function skillPane(tab) {
+  const pane = el('div', 'skill-pane');
+  const header = el('div', 'pane-header');
+  const crumbs = el('div', 'crumbs');
+  crumbs.append(el('span', 'crumb-file', `/${tab.name}`));
+  const meta = el('span', 'pane-meta');
+  const run = el('button', 'pane-button');
+  run.type = 'button';
+  run.append(icon('i-send'), document.createTextNode('Run'));
+  run.title = `Insert /${tab.name} into the message`;
+  run.addEventListener('click', () => useSkill(tab.name));
+  header.append(crumbs, meta, run, iconButton('i-refresh', 'Reload skill', () => loadSkillInto(tab), 'icon-button small'));
+  const scroller = el('div', 'code-scroll keep-scroll');
+  scroller.append(el('p', 'empty-copy', 'Loading…'));
+  pane.append(header, scroller);
+  Object.assign(pane, { meta, run, scroller });
+  return pane;
+}
+function chipList(values, kindOf) {
+  if (!Array.isArray(values) || !values.length) return el('span', 'skill-none', 'None');
+  const list = el('span', 'chips');
+  for (const value of values) list.append(el('span', `run-step ${kindOf(String(value))}`, String(value)));
+  return list;
+}
+async function loadSkillInto(tab) {
+  const pane = panes.get(tab.id);
+  const sessionId = state.session?.id;
+  if (!pane || !sessionId) return;
   try {
-    const file = await api(`/sessions/${encodeURIComponent(sessionId)}/file?path=${encodeURIComponent(path)}`);
-    if (state.session?.id !== sessionId || state.tab !== 'files') return;
-    const container = $('inspector-content');
-    const back = el('button', 'file-back', '← Files');
-    back.addEventListener('click', loadFiles);
-    container.replaceChildren(back, el('div', 'diff-title', file.path), el('pre', 'code-block', file.content));
-  } catch (error) { toast(error.message); }
+    const skill = await api(`/sessions/${encodeURIComponent(sessionId)}/skills/${encodeURIComponent(tab.name)}`);
+    if (state.session?.id !== sessionId || panes.get(tab.id) !== pane) return;
+    const source = typeof skill.source === 'string' ? skill.source : '';
+    const diagnostics = Array.isArray(skill.diagnostics) ? skill.diagnostics : [];
+    const summary = el('div', 'skill-summary');
+    if (skill.description) summary.append(el('p', 'skill-description', skill.description));
+    const facts = el('dl', 'skill-facts');
+    const fact = (name, value) => { facts.append(el('dt', '', name)); const dd = el('dd'); dd.append(value); facts.append(dd); };
+    if (skill.args) fact('Arguments', el('code', 'skill-path', `/${skill.name} ${skill.args}`));
+    fact('Scope', document.createTextNode(SCOPE_LABEL[skill.scope] || skill.scope || ''));
+    if (skill.path) fact('Path', el('span', 'skill-path', skill.path));
+    fact('Capabilities', chipList(skill.capabilities, (value) => (value.startsWith('model') ? 'model' : value.startsWith('user') ? 'user' : 'vm')));
+    fact('Tools', chipList(skill.tools, () => 'tool'));
+    summary.append(facts);
+    const lines = highlightLines(source, 'allen');
+    if (lines.length > 1 && !lines.at(-1).length) lines.pop();
+    const raw = source.split('\n');
+    const view = el('div', 'code-view program-view skill-view');
+    view.style.setProperty('--gutter', `${String(lines.length).length + 1}ch`);
+    const rows = lines.map((tokens, i) => {
+      const row = el('div', 'code-line');
+      const code = renderTokens(el('span', 'lc'), tokens);
+      code.style.setProperty('--indent', /^ */.exec(raw[i] || '')[0].length + 2);
+      row.append(el('span', 'ln', String(i + 1)), code);
+      view.append(row);
+      return row;
+    });
+    if (skill.ok === false || diagnostics.length) {
+      const box = el('div', 'skill-diagnostics');
+      box.append(el('h4', '', diagnostics.length ? `${diagnostics.length} compile error${diagnostics.length === 1 ? '' : 's'}` : 'This skill does not compile'));
+      const list = el('ol');
+      for (const diagnostic of diagnostics) {
+        const line = Number(diagnostic.line);
+        const row = Number.isInteger(line) && line >= 1 ? rows[line - 1] : null;
+        const item = el('li');
+        const button = el('button', 'diag-item');
+        button.type = 'button';
+        const location = row ? `${line}${diagnostic.column ? `:${diagnostic.column}` : ''}` : '—';
+        button.append(el('span', 'diag-loc', location));
+        if (diagnostic.code) button.append(el('span', 'diag-code', String(diagnostic.code)));
+        button.append(el('span', 'diag-message', String(diagnostic.message ?? '')));
+        button.disabled = !row;
+        button.addEventListener('click', () => row?.scrollIntoView({ block: 'center' }));
+        item.append(button);
+        list.append(item);
+        if (row) {
+          row.classList.add('diag');
+          const note = row.querySelector('.diag-inlay') || row.appendChild(el('span', 'diag-inlay'));
+          note.textContent = note.textContent ? `${note.textContent} · ${diagnostic.message}` : String(diagnostic.message ?? diagnostic.code ?? 'error');
+          row.title = note.textContent;
+        }
+      }
+      if (diagnostics.length) box.append(list);
+      summary.append(box);
+    }
+    pane.meta.textContent = `ALLEN · ${lines.length} line${lines.length === 1 ? '' : 's'}`;
+    const { scrollTop } = pane.scroller;
+    pane.scroller.replaceChildren(summary, source ? view : el('p', 'empty-copy', 'No source'));
+    pane.scroller.scrollTop = scrollTop;
+  } catch (error) {
+    if (panes.get(tab.id) === pane) pane.scroller.replaceChildren(el('p', 'empty-copy', error.message));
+  }
 }
+function reloadSkillPanes() {
+  for (const tab of Object.values(state.layout.tabs)) if (tab.kind === 'skill' && panes.has(tab.id)) loadSkillInto(tab);
+}
+function openSkill(name, options = {}) {
+  if (!state.session) return;
+  const existing = Object.values(state.layout.tabs).find((tab) => tab.kind === 'skill' && tab.name === name);
+  if (existing && !options.split) activate(state.layout, existing.id);
+  else place({ id: uid('skill'), kind: 'skill', name }, { beside: !options.split, ...options });
+  commitLayout();
+  if (window.matchMedia('(max-width:1040px)').matches) showSide(state.side);
+}
+
+/* Inspector summary */
+function summarySection(title, action) {
+  const section = el('section', 'summary-section');
+  const heading = el('div', 'summary-heading');
+  heading.append(el('h3', '', title));
+  if (action) heading.append(action);
+  section.append(heading);
+  return section;
+}
+function viewLauncher(view, meta) {
+  const info = view === 'program' ? PROGRAM : VIEWS[view];
+  const openIt = (options) => (view === 'program' ? openProgram('', options) : openViz(view, options));
+  const row = el('div', 'view-launcher');
+  const open = el('button', 'view-open');
+  open.draggable = true;
+  open.append(icon(info.icon), el('span', 'view-name', info.label), el('span', 'view-meta', meta));
+  open.setAttribute('aria-label', `Open ${info.label} in a tab`);
+  open.title = 'Open in a tab (drag to place)';
+  open.addEventListener('click', () => openIt());
+  open.addEventListener('dragstart', (event) => startDrag(event, { view }));
+  open.addEventListener('dragend', endDrag);
+  row.append(open, iconButton('i-split-right', `Open ${info.label} to the side`, () => openIt({ split: 'right' }), 'icon-button small'), iconButton('i-split-down', `Open ${info.label} below`, () => openIt({ split: 'bottom' }), 'icon-button small'));
+  return row;
+}
+function minimap(events) {
+  // Decorative overview of the most recent events by lane; the whole strip opens Flow chat.
+  const recent = events.slice(-96);
+  const button = el('button', 'minimap');
+  button.setAttribute('aria-label', 'Show Flow chat');
+  button.title = 'Show Flow chat';
+  const grid = el('div', 'minimap-grid');
+  grid.setAttribute('aria-hidden', 'true');
+  const tracks = LANES.map(([name, kind]) => {
+    const track = el('div', `minimap-lane ${kind}`);
+    grid.append(el('span', `minimap-label ${kind}`, name), track);
+    return track;
+  });
+  recent.forEach((event, i) => {
+    const { lane, kind } = classify(event);
+    const tick = el('i', `minimap-tick ${kind}`);
+    tick.style.left = `${recent.length === 1 ? 50 : (i / (recent.length - 1)) * 100}%`;
+    tracks[lane].append(tick);
+  });
+  button.append(grid);
+  button.addEventListener('click', () => showFlowChat());
+  return button;
+}
+function renderSummary(container) {
+  const session = state.session;
+  if (!session) return container.append(el('p', 'empty-copy', 'No session selected'));
+  const events = session.events || [];
+  const changes = session.changes || [];
+  const runs = session.runs || [];
+  const views = summarySection('Views');
+  const latest = runs.at(-1);
+  views.append(viewLauncher('program', latest ? runName(latest) : state.config?.workflows?.[0]?.name || ''));
+  views.append(viewLauncher('trace', `${events.length} event${events.length === 1 ? '' : 's'}`), viewLauncher('changes', changes.length ? `${changes.length} file${changes.length === 1 ? '' : 's'}` : ''));
+  container.append(views);
+  if (events.length) {
+    const activity = summarySection('Activity');
+    activity.append(minimap(events));
+    container.append(activity);
+  }
+  if (runs.length) {
+    const section = summarySection('Runs');
+    runs.slice(-5).reverse().forEach((run) => {
+      const index = runs.indexOf(run);
+      const row = el('button', 'summary-row');
+      const runEvents = events.filter((event) => event.run === run.id);
+      row.append(el('span', `status-pill ${runStateKind(run.state)}`, `Run ${index + 1}`), el('span', 'summary-row-meta', `${(run.state || 'unknown').replace(/_/g, ' ')} · ${runEvents.length} events`));
+      row.title = `Show Run ${index + 1} in Flow chat`;
+      row.addEventListener('click', () => showFlowChat(run.id));
+      const item = el('div', 'summary-run');
+      item.append(row, iconButton('i-code', `Open Run ${index + 1} program`, () => openProgram(run.id), 'icon-button small'));
+      section.append(item);
+    });
+    container.append(section);
+  }
+  if (changes.length) {
+    const section = summarySection('Changes');
+    for (const change of changes) {
+      const row = el('button', 'summary-row');
+      row.append(el('span', 'summary-path', change.path), diffStat(changeStats(change)));
+      row.title = `Show ${change.path} in Changes`;
+      row.addEventListener('click', () => openViz('changes', { beside: true, apply: (tab) => { tab.focusPath = change.path; } }));
+      section.append(row);
+    }
+    container.append(section);
+  }
+  if (events.length) {
+    const section = summarySection('Recent events');
+    for (const event of events.slice(-6).reverse()) {
+      const row = el('button', `summary-row trace-event ${classify(event).kind}`);
+      const main = el('span', 'trace-event-main');
+      main.append(el('strong', '', event.type), el('small', '', `#${event.sequence} · ${time(event.time)}`));
+      row.append(main);
+      row.addEventListener('click', () => openViz('trace', { apply: (tab) => { tab.selectedEvent = event.id; tab.runFilter = ''; tab.eventFilter = ''; } }));
+      section.append(row);
+    }
+    container.append(section);
+  }
+}
+function renderSide() {
+  const open = !$('side-panel').hidden;
+  $('viz-button').setAttribute('aria-pressed', String(open && state.side === 'summary'));
+  for (const [id, side] of [['side-files-tab', 'files'], ['side-summary-tab', 'summary']]) {
+    $(id).classList.toggle('active', state.side === side);
+    $(id).setAttribute('aria-selected', String(state.side === side));
+  }
+  $('side-refresh').hidden = state.side === 'summary' || !state.session;
+  $('connection-status').hidden = state.side !== 'summary' || !state.session;
+  if (!open) return;
+  const container = $('side-content');
+  const scroll = container.scrollTop;
+  container.replaceChildren();
+  if (state.side === 'files') renderFilesPanel(container);
+  else renderSummary(container);
+  container.scrollTop = scroll;
+}
+function showSide(side) {
+  const open = !$('side-panel').hidden;
+  if (open && state.side === side) { $('side-panel').hidden = true; localStorage.setItem('shout.side', 'closed'); renderSide(); return; }
+  state.side = side;
+  $('side-panel').hidden = false;
+  localStorage.setItem('shout.side', side);
+  if (side === 'files' && !state.files) loadFiles();
+  renderSide();
+}
+
+/* Dock: tab groups in resizable splits */
+function saveLayout() {
+  if (state.session) try { localStorage.setItem(`shout.layout.${state.session.id}`, serialize(state.layout)); } catch {}
+}
+function commitLayout() {
+  normalize(state.layout);
+  saveLayout();
+  renderDock();
+  if (state.side !== 'summary') renderSide();
+}
+function tabInfo(tab) {
+  if (tab.kind === 'chat') return { label: 'Chat', icon: 'i-chat', title: 'Session chat' };
+  if (tab.kind === 'file') return { label: basename(tab.path), icon: 'i-file', title: tab.path };
+  if (tab.kind === 'skill') return { label: `/${tab.name}`, icon: 'i-skill', title: `Skill /${tab.name}` };
+  if (tab.kind === 'program') {
+    const index = (state.session?.runs || []).findIndex((run) => run.id === tab.run);
+    return { label: index >= 0 ? `Program · Run ${index + 1}` : tab.run?.startsWith('workflow:') ? tab.run.slice(9) : PROGRAM.label, icon: PROGRAM.icon, title: 'ALLEN program' };
+  }
+  return { label: VIEWS[tab.view].label, icon: VIEWS[tab.view].icon, title: `${VIEWS[tab.view].label} visualization` };
+}
+function paneFor(tab) {
+  if (tab.kind === 'chat') return $('chat-pane');
+  if (!panes.has(tab.id)) {
+    const pane = tab.kind === 'file' ? filePane(tab) : tab.kind === 'program' ? programPane(tab) : tab.kind === 'skill' ? skillPane(tab) : vizPane(tab);
+    panes.set(tab.id, pane);
+    if (tab.kind === 'file') loadFileInto(tab); else if (tab.kind === 'program') renderProgram(tab); else if (tab.kind === 'skill') loadSkillInto(tab); else renderViz(tab);
+  }
+  return panes.get(tab.id);
+}
+function renderDock() {
+  for (const node of document.querySelectorAll('#dock .keep-scroll, #dock #messages')) scrollMemory.set(node, [node.scrollTop, node.scrollLeft]);
+  $('pane-store').append($('chat-pane'), ...panes.values());
+  for (const [id, pane] of panes) if (!state.layout.tabs[id]) { pane.remove(); panes.delete(id); }
+  $('dock').replaceChildren(renderNode(state.layout.root));
+  for (const node of document.querySelectorAll('#dock .keep-scroll, #dock #messages')) {
+    const saved = scrollMemory.get(node);
+    if (saved) [node.scrollTop, node.scrollLeft] = saved;
+  }
+}
+function renderNode(node) {
+  if (node.type === 'group') return renderGroup(node);
+  const box = el('div', `split ${node.dir}`);
+  node.children.forEach((child, i) => {
+    if (i) box.append(resizer(node, i));
+    const cell = renderNode(child);
+    cell.style.flex = `${node.sizes[i]} 1 0`;
+    box.append(cell);
+  });
+  return box;
+}
+function canSplit(group) {
+  const tab = state.layout.tabs[group.active];
+  return group.tabs.length > 1 || (tab && tab.kind !== 'chat');
+}
+function splitActive(group, side) {
+  const tab = state.layout.tabs[group.active];
+  if (!tab) return;
+  if (group.tabs.length > 1) splitWith(state.layout, tab.id, group.id, side);
+  else if (tab.kind !== 'chat') {
+    // A lone tab is duplicated so both panes show it; viz filters carry over.
+    const copy = { ...tab, id: uid(tab.kind) };
+    state.layout.tabs[copy.id] = copy;
+    splitWith(state.layout, copy.id, group.id, side);
+  }
+  commitLayout();
+}
+function renderTab(group, tab, index) {
+  const info = tabInfo(tab);
+  const active = group.active === tab.id;
+  const item = el('div', `tab${active ? ' active' : ''}`);
+  item.dataset.tab = tab.id;
+  item.draggable = true;
+  const label = el('button', 'tab-label');
+  label.setAttribute('role', 'tab');
+  label.setAttribute('aria-selected', String(active));
+  label.title = info.title;
+  label.append(icon(info.icon), el('span', 'tab-text', info.label));
+  if (tab.kind === 'chat') label.append(el('span', `tab-dot ${statusKind(state.session)}`));
+  if (tab.kind === 'viz' && tab.view === 'changes' && state.session?.changes?.length) label.append(el('span', 'count', String(state.session.changes.length)));
+  label.addEventListener('click', () => { activate(state.layout, tab.id); commitLayout(); });
+  item.append(label);
+  if (tab.kind !== 'chat') {
+    item.append(iconButton('i-x', `Close ${info.label}`, () => { closeTab(state.layout, tab.id); commitLayout(); }, 'tab-close'));
+    item.addEventListener('auxclick', (event) => { if (event.button === 1) { event.preventDefault(); closeTab(state.layout, tab.id); commitLayout(); } });
+  }
+  item.addEventListener('dragstart', (event) => startDrag(event, { tab: tab.id }));
+  item.addEventListener('dragend', endDrag);
+  item.addEventListener('dragover', (event) => {
+    if (!dragPayload) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const box = item.getBoundingClientRect();
+    const after = event.clientX > box.left + box.width / 2;
+    item.classList.toggle('drop-before', !after);
+    item.classList.toggle('drop-after', after);
+  });
+  item.addEventListener('dragleave', () => item.classList.remove('drop-before', 'drop-after'));
+  item.addEventListener('drop', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const after = item.classList.contains('drop-after');
+    item.classList.remove('drop-before', 'drop-after');
+    const id = tabForPayload(dragPayload);
+    if (id) { moveTab(state.layout, id, group.id, index + (after ? 1 : 0)); commitLayout(); }
+  });
+  return item;
+}
+function renderTabStrips() {
+  // Refreshes tab labels and badges in place, without reparenting panes (keeps composer focus).
+  for (const strip of document.querySelectorAll('#dock .tab-list')) {
+    const group = findGroup(state.layout, strip.dataset.group);
+    if (group) strip.replaceChildren(...group.tabs.map((id, i) => renderTab(group, state.layout.tabs[id], i)));
+  }
+}
+function renderGroup(group) {
+  const box = el('div', `group${group.id === state.layout.focus ? ' focused' : ''}`);
+  box.dataset.group = group.id;
+  box.addEventListener('pointerdown', () => focusGroup(group.id), true);
+  box.addEventListener('focusin', () => focusGroup(group.id));
+  const strip = el('div', 'tab-strip');
+  const list = el('div', 'tab-list');
+  list.dataset.group = group.id;
+  list.setAttribute('role', 'tablist');
+  group.tabs.forEach((id, i) => list.append(renderTab(group, state.layout.tabs[id], i)));
+  const actions = el('div', 'group-actions');
+  const splittable = canSplit(group);
+  for (const [side, name, label] of [['right', 'i-split-right', 'Split right'], ['bottom', 'i-split-down', 'Split down']]) {
+    const button = iconButton(name, splittable ? label : `${label} (open another tab first)`, () => splitActive(group, side), 'icon-button small');
+    button.disabled = !splittable;
+    actions.append(button);
+  }
+  strip.append(list, actions);
+  strip.addEventListener('dragover', (event) => { if (dragPayload) event.preventDefault(); });
+  strip.addEventListener('drop', (event) => {
+    event.preventDefault();
+    const id = tabForPayload(dragPayload);
+    if (id) { moveTab(state.layout, id, group.id); commitLayout(); }
+  });
+  const body = el('div', 'group-body');
+  const tab = state.layout.tabs[group.active];
+  if (tab) body.append(paneFor(tab));
+  const overlay = el('div', 'drop-overlay');
+  body.append(overlay);
+  const zoneOf = (event) => {
+    const box = body.getBoundingClientRect();
+    const x = (event.clientX - box.left) / box.width;
+    const y = (event.clientY - box.top) / box.height;
+    const edges = [['left', x], ['right', 1 - x], ['top', y], ['bottom', 1 - y]].sort((a, b) => a[1] - b[1]);
+    return edges[0][1] < 0.25 ? edges[0][0] : 'center';
+  };
+  body.addEventListener('dragover', (event) => {
+    if (!dragPayload) return;
+    event.preventDefault();
+    overlay.dataset.zone = zoneOf(event);
+  });
+  body.addEventListener('dragleave', (event) => { if (!body.contains(event.relatedTarget)) delete overlay.dataset.zone; });
+  body.addEventListener('drop', (event) => {
+    event.preventDefault();
+    const zone = zoneOf(event);
+    delete overlay.dataset.zone;
+    const id = tabForPayload(dragPayload);
+    if (!id) return;
+    if (zone === 'center') moveTab(state.layout, id, group.id);
+    else splitWith(state.layout, id, group.id, zone);
+    commitLayout();
+  });
+  box.append(strip, body);
+  return box;
+}
+function resizer(split, index) {
+  const handle = el('div', `resizer ${split.dir}`);
+  handle.setAttribute('role', 'separator');
+  handle.setAttribute('aria-orientation', split.dir === 'row' ? 'vertical' : 'horizontal');
+  handle.setAttribute('aria-label', 'Resize panes');
+  handle.tabIndex = 0;
+  const apply = () => {
+    handle.previousElementSibling.style.flexGrow = String(split.sizes[index - 1]);
+    handle.nextElementSibling.style.flexGrow = String(split.sizes[index]);
+  };
+  handle.addEventListener('pointerdown', (event) => {
+    event.preventDefault();
+    handle.setPointerCapture(event.pointerId);
+    handle.classList.add('dragging');
+    const horizontal = split.dir === 'row';
+    const a = handle.previousElementSibling.getBoundingClientRect();
+    const b = handle.nextElementSibling.getBoundingClientRect();
+    const start = horizontal ? a.left : a.top;
+    const total = horizontal ? b.right - a.left : b.bottom - a.top;
+    const move = (moveEvent) => { resize(split, index, ((horizontal ? moveEvent.clientX : moveEvent.clientY) - start) / total); apply(); };
+    const up = () => {
+      handle.classList.remove('dragging');
+      handle.removeEventListener('pointermove', move);
+      handle.removeEventListener('pointerup', up);
+      handle.removeEventListener('pointercancel', up);
+      saveLayout();
+    };
+    handle.addEventListener('pointermove', move);
+    handle.addEventListener('pointerup', up);
+    handle.addEventListener('pointercancel', up);
+  });
+  handle.addEventListener('keydown', (event) => {
+    const step = { ArrowLeft: -0.05, ArrowUp: -0.05, ArrowRight: 0.05, ArrowDown: 0.05 }[event.key];
+    if (!step) return;
+    event.preventDefault();
+    const pair = split.sizes[index - 1] + split.sizes[index];
+    resize(split, index, split.sizes[index - 1] / pair + step);
+    apply();
+    saveLayout();
+  });
+  return handle;
+}
+function focusGroup(id) {
+  if (state.layout.focus === id) return;
+  state.layout.focus = id;
+  for (const node of document.querySelectorAll('#dock .group')) node.classList.toggle('focused', node.dataset.group === id);
+  saveLayout();
+  if (state.side !== 'summary') renderSide();
+}
+function startDrag(event, payload) {
+  dragPayload = payload;
+  event.dataTransfer.effectAllowed = 'move';
+  event.dataTransfer.setData('text/plain', payload.file || payload.view || payload.tab || `/${payload.skill}`);
+  document.body.classList.add('dragging-tab');
+}
+function endDrag() {
+  dragPayload = null;
+  document.body.classList.remove('dragging-tab');
+  for (const node of document.querySelectorAll('.drop-overlay[data-zone]')) delete node.dataset.zone;
+}
+// Resolves a drag payload to a registered tab ID. New tabs are registered but not yet placed.
+function tabForPayload(payload) {
+  if (!payload) return null;
+  if (payload.tab) return state.layout.tabs[payload.tab] ? payload.tab : null;
+  if (!state.session) return null;
+  if (payload.file) {
+    const existing = Object.values(state.layout.tabs).find((tab) => tab.kind === 'file' && tab.path === payload.file);
+    if (existing) return existing.id;
+    const tab = { id: uid('file'), kind: 'file', path: payload.file };
+    state.layout.tabs[tab.id] = tab;
+    return tab.id;
+  }
+  if (payload.skill) {
+    const existing = Object.values(state.layout.tabs).find((tab) => tab.kind === 'skill' && tab.name === payload.skill);
+    if (existing) return existing.id;
+    const tab = { id: uid('skill'), kind: 'skill', name: payload.skill };
+    state.layout.tabs[tab.id] = tab;
+    return tab.id;
+  }
+  if (payload.view === 'program') {
+    const tab = { id: uid('program'), kind: 'program', run: '' };
+    state.layout.tabs[tab.id] = tab;
+    return tab.id;
+  }
+  if (payload.view) {
+    const tab = { id: uid('viz'), kind: 'viz', view: payload.view };
+    state.layout.tabs[tab.id] = tab;
+    return tab.id;
+  }
+  return null;
+}
+function place(tab, { split, beside } = {}) {
+  const layout = state.layout;
+  layout.tabs[tab.id] = tab;
+  if (split) return splitWith(layout, tab.id, focusedGroup(layout).id, split);
+  if (beside) {
+    // Prefer an existing pane that isn't showing the chat; otherwise open one to the right of it.
+    const other = groups(layout.root).find((candidate) => !candidate.tabs.includes(CHAT));
+    if (other) return addTab(layout, tab, other.id);
+    return splitWith(layout, tab.id, groupOfTab(layout, CHAT).id, 'right');
+  }
+  return addTab(layout, tab);
+}
+function openFile(path, options = {}) {
+  if (!state.session) return;
+  const existing = Object.values(state.layout.tabs).find((tab) => tab.kind === 'file' && tab.path === path);
+  if (existing && !options.split) activate(state.layout, existing.id);
+  else place(existing && options.split ? { ...existing, id: uid('file') } : { id: uid('file'), kind: 'file', path }, options);
+  commitLayout();
+  if (window.matchMedia('(max-width:1040px)').matches) showSide(state.side);
+}
+function openViz(view, { split, beside, apply } = {}) {
+  let tab = !split && Object.values(state.layout.tabs).find((candidate) => candidate.kind === 'viz' && candidate.view === view);
+  if (tab) activate(state.layout, tab.id);
+  else {
+    tab = { id: uid('viz'), kind: 'viz', view };
+    place(tab, { split, beside });
+  }
+  apply?.(tab);
+  commitLayout();
+  renderViz(tab);
+  if (window.matchMedia('(max-width:1040px)').matches && !$('side-panel').hidden) showSide(state.side);
+}
+
 function applySnapshot(session) {
   if (!session?.id || state.session && session.id !== state.session.id) return;
+  // A POST response can arrive after a newer SSE snapshot; never step back to an older revision.
+  const revision = (snapshot) => snapshot.revision ?? snapshot.sequence ?? 0;
+  if (state.session && revision(session) < revision(state.session)) return;
+  const wasActive = isActive(state.session);
   state.session = session;
   const index = state.sessions.findIndex((candidate) => candidate.id === session.id);
   if (index >= 0) state.sessions[index] = session;
@@ -409,7 +1647,12 @@ function applySnapshot(session) {
   renderMessages();
   renderQuestion();
   renderStatus();
-  renderInspector();
+  renderTabStrips();
+  renderVizPanes();
+  renderProgramPanes();
+  if (state.side === 'summary') renderSide();
+  // Approved patches change files on disk; refresh open file views once a run settles.
+  if (wasActive && !isActive(session)) { reloadFilePanes(); loadFiles(); loadSkills({ force: true }); reloadSkillPanes(); }
 }
 async function selectSession(id) {
   const selection = ++state.selection;
@@ -420,12 +1663,18 @@ async function selectSession(id) {
   state.session = null;
   state.messageSignature = '';
   state.questionSignature = '';
-  state.selectedEvent = null;
-  state.runFilter = '';
-  state.eventFilter = '';
-  $('event-filter').value = '';
-  state.tab = state.tab === 'files' ? 'graph' : state.tab;
+  state.files = null;
+  state.filesError = '';
+  state.skills = { sessionId: id, list: null, error: '', at: 0, pending: null };
+  closeSlash();
+  for (const pane of panes.values()) pane.remove();
+  panes.clear();
+  state.layout = restore(localStorage.getItem(`shout.layout.${id}`));
   applySnapshot(session);
+  renderDock();
+  renderSide();
+  if (state.side === 'files' && !$('side-panel').hidden) loadFiles();
+  loadSkills();
   $('message-input').value = state.drafts.get(id) || (session.messages.length ? '' : session.suggestedPrompt || '');
   resizeComposer();
   localStorage.setItem('shout.session', id);
@@ -450,17 +1699,8 @@ async function selectSession(id) {
   };
   $('messages').scrollTop = $('messages').scrollHeight;
 }
-function renderDialogScenarios() {
-  $('dialog-scenarios').replaceChildren();
-  (state.config?.scenarios || []).forEach((scenario, i) => {
-    const card = scenarioCard(scenario, i, () => {
-      state.selectedScenario = state.selectedScenario === scenario.id ? null : scenario.id;
-      renderDialogScenarios();
-    });
-    card.classList.toggle('selected', state.selectedScenario === scenario.id);
-    card.setAttribute('aria-pressed', String(state.selectedScenario === scenario.id));
-    $('dialog-scenarios').append(card);
-  });
+// A sample opened from the welcome screen supplies its own workspace and test command.
+function prepareDialogFields() {
   $('workspace-input').disabled = !!state.selectedScenario;
   $('workspace-input').placeholder = state.selectedScenario ? 'A fresh copy of the sample is created' : '/path/to/your/project';
   $('workspace-input').value = state.selectedScenario ? '' : state.config?.defaultWorkspace || state.config?.cwd || '';
@@ -471,29 +1711,56 @@ function openNewDialog(scenarioId = null) {
   state.selectedScenario = scenarioId;
   $('new-error').hidden = true;
   $('new-form').reset();
-  if (state.config && !state.config.provider?.available) $('mode-input').value = 'fixture';
-  renderDialogScenarios();
+  prepareDialogFields();
   $('new-dialog').showModal();
 }
 $('new-session').addEventListener('click', () => openNewDialog());
+$('model-select').addEventListener('change', saveModel);
+$('effort-select').addEventListener('change', saveModel);
+$('sleeping-toggle').addEventListener('click', () => {
+  state.sleepingOpen = !state.sleepingOpen;
+  state.sleepingShown = 10;
+  localStorage.setItem('shout.sleepingOpen', state.sleepingOpen ? '1' : '0');
+  renderSidebar();
+});
 $('close-dialog').addEventListener('click', () => $('new-dialog').close());
 $('cancel-dialog').addEventListener('click', () => $('new-dialog').close());
 $('new-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   $('create-button').disabled = true;
   $('new-error').hidden = true;
+  try { await createSession(); }
+  catch (error) {
+    // A folder that doesn't exist yet can be created on the spot.
+    if (error.code === 'workspace_missing') {
+      $('create-folder-path').textContent = error.path;
+      $('create-folder-dialog').showModal();
+    } else {
+      $('new-error').textContent = error.message;
+      $('new-error').hidden = false;
+    }
+  } finally { $('create-button').disabled = false; }
+});
+async function createSession({ createWorkspace = false } = {}) {
+  const scenario = state.config?.scenarios.find((item) => item.id === state.selectedScenario);
+  const session = await api('/sessions', { method: 'POST', body: { ...(scenario ? { scenario: scenario.id } : { workspace: $('workspace-input').value.trim(), testCommand: $('test-command-input').value.trim() || undefined, createWorkspace }) } });
+  await selectSession(session.id);
+  $('new-dialog').close();
+  $('message-input').value = scenario?.prompt || '';
+  resizeComposer();
+  $('message-input').focus();
+}
+$('create-folder-cancel').addEventListener('click', () => $('create-folder-dialog').close());
+$('create-folder-confirm').addEventListener('click', async () => {
+  $('create-folder-confirm').disabled = true;
   try {
-    const scenario = state.config?.scenarios.find((item) => item.id === state.selectedScenario);
-    const session = await api('/sessions', { method: 'POST', body: { mode: $('mode-input').value, ...(scenario ? { scenario: scenario.id } : { workspace: $('workspace-input').value.trim(), testCommand: $('test-command-input').value.trim() || undefined }) } });
-    await selectSession(session.id);
-    $('new-dialog').close();
-    $('message-input').value = scenario?.prompt || '';
-    resizeComposer();
-    $('message-input').focus();
+    await createSession({ createWorkspace: true });
+    $('create-folder-dialog').close();
   } catch (error) {
+    $('create-folder-dialog').close();
     $('new-error').textContent = error.message;
     $('new-error').hidden = false;
-  } finally { $('create-button').disabled = false; }
+  } finally { $('create-folder-confirm').disabled = false; }
 });
 $('composer').addEventListener('submit', async (event) => {
   event.preventDefault();
@@ -518,13 +1785,115 @@ function resizeComposer() {
   $('message-input').style.height = 'auto';
   $('message-input').style.height = `${Math.min(190, $('message-input').scrollHeight)}px`;
 }
-$('message-input').addEventListener('input', resizeComposer);
+// The slash token under edit: the first word of the message while the caret is still inside it.
+function slashToken() {
+  const input = $('message-input');
+  if (!state.session || document.activeElement !== input || input.selectionStart !== input.selectionEnd) return null;
+  if (!/^\/\S*$/.test(input.value.slice(0, input.selectionStart))) return null;
+  return /^\/\S*/.exec(input.value)[0];
+}
+function skillMatches(query) {
+  const q = query.toLowerCase();
+  const byName = (a, b) => a.name.localeCompare(b.name);
+  const list = (state.skills.list || []).filter((skill) => typeof skill?.name === 'string');
+  const prefix = list.filter((skill) => skill.name.toLowerCase().startsWith(q)).sort(byName);
+  const rest = q ? list.filter((skill) => !prefix.includes(skill) && `${skill.name}\n${skill.description || ''}`.toLowerCase().includes(q)).sort(byName) : [];
+  return [...prefix, ...rest];
+}
+function closeSlash() {
+  slash.items = [];
+  $('slash-menu').hidden = true;
+  $('slash-menu').replaceChildren();
+  $('message-input').setAttribute('aria-expanded', 'false');
+  $('message-input').removeAttribute('aria-activedescendant');
+}
+function markSlashActive() {
+  const options = $('slash-menu').children;
+  for (let i = 0; i < options.length; i++) {
+    options[i].classList.toggle('active', i === slash.index);
+    options[i].setAttribute('aria-selected', String(i === slash.index));
+  }
+  const active = options[slash.index];
+  if (active) {
+    $('message-input').setAttribute('aria-activedescendant', active.id);
+    active.scrollIntoView({ block: 'nearest' });
+  }
+}
+function updateSlash() {
+  const token = slashToken();
+  if (slash.dismissed !== null && token !== slash.dismissed) slash.dismissed = null;
+  if (token === null || token === slash.dismissed) return closeSlash();
+  // Refresh the list each time the menu is about to open; loadSkills re-renders the menu when it lands.
+  if ($('slash-menu').hidden) loadSkills();
+  const previous = slash.items[slash.index]?.name;
+  const items = skillMatches(token.slice(1));
+  if (!items.length) return closeSlash();
+  const changed = items.length !== slash.items.length || items.some((skill, i) => skill !== slash.items[i]);
+  slash.items = items;
+  slash.index = Math.max(0, items.findIndex((skill) => skill.name === previous));
+  if (changed || $('slash-menu').hidden) {
+    $('slash-menu').replaceChildren(...items.map((skill, i) => {
+      const option = el('div', `slash-option${skill.ok === false ? ' broken' : ''}`);
+      option.id = `slash-option-${i}`;
+      option.setAttribute('role', 'option');
+      const head = el('span', 'skill-row-head');
+      head.append(el('span', 'slash-name', `/${skill.name}`));
+      if (skill.args) head.append(el('span', 'slash-args', skill.args));
+      head.append(...skillBadges(skill));
+      option.append(head, el('span', 'slash-scope', SCOPE_LABEL[skill.scope] || 'Command'));
+      if (skill.description) option.append(el('span', 'slash-desc', skill.description));
+      // Keep focus in the composer while clicking an option.
+      option.addEventListener('mousedown', (event) => event.preventDefault());
+      option.addEventListener('click', () => completeSlash(skill));
+      option.addEventListener('mousemove', () => { if (slash.index !== i) { slash.index = i; markSlashActive(); } });
+      return option;
+    }));
+  }
+  $('slash-menu').hidden = false;
+  $('message-input').setAttribute('aria-expanded', 'true');
+  markSlashActive();
+}
+function completeSlash(skill) {
+  const input = $('message-input');
+  const rest = input.value.slice((/^\/\S*/.exec(input.value)?.[0] || '').length);
+  input.value = `/${skill.name}${/^\s/.test(rest) ? rest : ` ${rest}`}`;
+  input.focus();
+  input.setSelectionRange(skill.name.length + 2, skill.name.length + 2);
+  resizeComposer();
+  closeSlash();
+}
+// Returns true when the key was consumed by the open menu.
+function slashKeydown(event) {
+  if ($('slash-menu').hidden || !slash.items.length || event.isComposing) return false;
+  if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+    slash.index = (slash.index + (event.key === 'ArrowDown' ? 1 : -1) + slash.items.length) % slash.items.length;
+    markSlashActive();
+  } else if (event.key === 'Escape') {
+    slash.dismissed = slashToken();
+    closeSlash();
+  } else if (event.key === 'Tab' && !event.shiftKey) {
+    completeSlash(slash.items[slash.index]);
+  } else if (event.key === 'Enter' && !event.shiftKey) {
+    // An already complete command name sends; anything else completes the highlighted skill.
+    const token = slashToken();
+    if (slash.items.some((skill) => `/${skill.name}` === token)) { closeSlash(); return false; }
+    completeSlash(slash.items[slash.index]);
+  } else return false;
+  event.preventDefault();
+  return true;
+}
+$('message-input').addEventListener('input', () => { resizeComposer(); updateSlash(); });
 $('message-input').addEventListener('keydown', (event) => {
+  if (slashKeydown(event)) return;
   if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
     event.preventDefault();
     $('composer').requestSubmit();
   }
 });
+$('message-input').addEventListener('keyup', (event) => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) updateSlash(); });
+$('message-input').addEventListener('click', updateSlash);
+$('message-input').addEventListener('focus', updateSlash);
+$('message-input').addEventListener('blur', closeSlash);
 $('cancel-button').addEventListener('click', async () => {
   $('cancel-button').disabled = true;
   try {
@@ -533,26 +1902,13 @@ $('cancel-button').addEventListener('click', async () => {
   } catch (error) { toast(error.message); }
   finally { $('cancel-button').disabled = false; }
 });
-$('viz-button').addEventListener('click', () => {
-  if (state.tab === 'files') { setTab('graph'); return; }
-  $('inspector').hidden = !$('inspector').hidden;
-  $('viz-button').setAttribute('aria-pressed', String(!$('inspector').hidden));
-});
-$('files-button').addEventListener('click', () => setTab(state.tab === 'files' ? 'graph' : 'files'));
-for (const tab of ['graph', 'trace', 'changes']) $(`${tab}-tab`).addEventListener('click', () => setTab(tab));
-$('run-filter').addEventListener('change', (event) => { state.runFilter = event.target.value; state.selectedEvent = null; renderInspector(); });
-$('event-filter').addEventListener('input', (event) => { state.eventFilter = event.target.value; renderInspector(); });
-$('export-button').addEventListener('click', async () => {
-  if (!state.session) return;
-  try {
-    const data = await api(`/sessions/${encodeURIComponent(state.session.id)}/export`);
-    const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }));
-    const link = el('a');
-    link.href = url;
-    link.download = `shout-${state.session.id}.json`;
-    link.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-  } catch (error) { toast(error.message); }
+$('viz-button').addEventListener('click', () => showSide('summary'));
+$('side-files-tab').addEventListener('click', () => { if (state.side !== 'files') showSide('files'); });
+$('side-summary-tab').addEventListener('click', () => { if (state.side !== 'summary') showSide('summary'); });
+$('side-close').addEventListener('click', () => showSide(state.side));
+$('side-refresh').addEventListener('click', () => {
+  loadFiles();
+  reloadFilePanes();
 });
 $('menu-button').addEventListener('click', () => $('app').classList.toggle('menu-open'));
 for (const id of ['scrim', 'sidebar-close']) $(id).addEventListener('click', () => $('app').classList.remove('menu-open'));
@@ -570,27 +1926,34 @@ document.addEventListener('keydown', (event) => {
 window.addEventListener('beforeunload', () => state.stream?.close());
 
 async function init() {
-  if (window.matchMedia('(max-width:1040px)').matches) {
-    $('inspector').hidden = true;
-    $('viz-button').setAttribute('aria-pressed', 'false');
+  const side = localStorage.getItem('shout.side');
+  state.side = side === 'files' ? 'files' : 'summary';
+  $('side-panel').hidden = side === 'closed' || window.matchMedia('(max-width:1040px)').matches;
+  for (const button of $('chat-mode').children) {
+    button.setAttribute('aria-checked', String(button.dataset.mode === state.chatMode));
+    button.addEventListener('click', () => setChatMode(button.dataset.mode));
   }
+  renderDock();
   renderMessages();
   renderStatus();
-  renderInspector();
+  renderSide();
   try {
     const [config, sessions] = await Promise.all([api('/config'), api('/sessions')]);
     state.config = config;
     state.sessions = Array.isArray(sessions) ? sessions : sessions.sessions || [];
-    $('provider-status').textContent = config.provider?.available ? 'Codex connected' : 'Live model unavailable';
+    const providers = config.providers || [];
+    $('provider-status').textContent = config.provider?.available ? providers.filter((item) => item.available).map((item) => item.label).join(' · ') || 'Connected' : 'Live model unavailable';
     $('engine-dot').className = `engine-dot ${config.provider?.available ? 'ok' : 'off'}`;
-    $('provider-status').title = config.provider?.available ? '' : config.provider?.error || '';
+    $('provider-status').title = providers.filter((item) => !item.available).map((item) => item.error).filter(Boolean).join(' ') || (config.provider?.available ? '' : config.provider?.error || '');
     if (!config.provider?.available) {
-      $('model-help').textContent = `Live model unavailable: ${config.provider?.error || 'sign in to Codex CLI.'} Use Fixture mode in the meantime.`;
+      $('model-help').textContent = `Live model unavailable: ${config.provider?.error || 'sign in to Codex or Claude Code.'}`;
       $('model-help').hidden = false;
     }
     state.messageSignature = '';
+    renderModelPicker();
     renderMessages();
     renderSidebar();
+    renderProgramPanes();
     const remembered = decodeURIComponent(location.hash.slice(1)) || localStorage.getItem('shout.session');
     if (remembered && state.sessions.some((session) => session.id === remembered)) await selectSession(remembered);
   } catch (error) {

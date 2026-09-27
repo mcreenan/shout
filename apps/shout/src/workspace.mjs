@@ -6,7 +6,7 @@ import { spawn } from 'node:child_process';
 
 const SCENARIO_ROOT = fileURLToPath(new URL('../scenarios/', import.meta.url));
 const MAX_FILES = 200;
-const MAX_FILE_BYTES = 64 * 1024;
+const MAX_FILE_BYTES = 256 * 1024;
 const MAX_CONTEXT_BYTES = 512 * 1024;
 const BLOCKED = /^(?:\..*|node_modules|vendor|target|dist|build|coverage|secrets?|credentials?)(?:$)/i;
 const SECRET_FILE = /(?:^|[._-])(?:env|secrets?|credentials?|private[_-]?key)(?:[._-]|$)|\.(?:pem|key|p12|pfx)$/i;
@@ -39,17 +39,6 @@ export async function createScenario(id, baseDir) {
   return { workspace, prompt: scenario.prompt, testCommand: 'node --test *.test.mjs' };
 }
 
-/** Explicitly scripted demo patches, never a substitute for a live model judgment. */
-export async function fixtureChanges(scenarioId, files) {
-  const filenames = { pricing: 'pricing.mjs', slug: 'slug.mjs', validation: 'validators.mjs' };
-  const filename = filenames[scenarioId];
-  if (!filename) throw new Error(`No fixture patch for scenario: ${scenarioId}`);
-  const current = files.find(file => file.path === filename);
-  if (!current) throw new Error(`Scenario file missing: ${filename}`);
-  const after = await fs.readFile(path.join(SCENARIO_ROOT, 'solutions', `${scenarioId}.mjs`), 'utf8');
-  return current.content === after ? [] : [{ path: filename, before: current.content, after }];
-}
-
 /** Workspace confinement protects against accidental escapes, not hostile concurrent OS actors. */
 export class Workspace {
   constructor(workspace, { testCommand = '', testTimeoutMs = 30_000, maxOutputBytes = 128 * 1024 } = {}) {
@@ -69,7 +58,8 @@ export class Workspace {
   async resolveFile(relative, { allowMissing = false } = {}) {
     if (typeof relative !== 'string' || !relative || relative.includes('\\') || relative.includes('\0') || path.isAbsolute(relative)) throw new Error('Invalid relative workspace path');
     const parts = relative.split('/');
-    if (parts.some(part => !part || part === '.' || part === '..' || BLOCKED.test(part) || SECRET_FILE.test(part))) throw new Error(`Protected or invalid path: ${relative}`);
+    // `.shout/` holds workspace skills; other hidden and generated paths stay protected.
+    if (parts.some((part, index) => !part || part === '.' || part === '..' || (BLOCKED.test(part) && !(index === 0 && part === '.shout' && parts.length > 1)) || SECRET_FILE.test(part))) throw new Error(`Protected or invalid path: ${relative}`);
     let current = this.path;
     for (let index = 0; index < parts.length; index += 1) {
       current = path.join(current, parts[index]);
@@ -82,25 +72,82 @@ export class Workspace {
     return current;
   }
 
-  async list() {
+  /** Strict listing for whole-workspace snapshots. `limit` returns a truncated listing instead of failing. */
+  async list({ limit } = {}) {
     const files = [];
     let visited = 0;
+    let truncated = false;
     const walk = async (directory, prefix = '') => {
       for (const entry of (await fs.readdir(directory, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
-        if (++visited > 5000) throw new Error('Workspace traversal exceeds 5000 entries; select a smaller workspace');
+        if (truncated) return;
+        if (++visited > (limit ? 20000 : 5000)) {
+          if (limit) { truncated = true; return; }
+          throw new Error('Workspace traversal exceeds 5000 entries; select a smaller workspace');
+        }
         if (BLOCKED.test(entry.name) || SECRET_FILE.test(entry.name) || entry.isSymbolicLink()) continue;
         const relative = prefix + entry.name;
         if (entry.isDirectory()) {
           await this.resolveFile(relative);
           await walk(path.join(directory, entry.name), `${relative}/`);
         } else if (entry.isFile() && (TEXT_FILE.test(entry.name) || /^(?:Dockerfile|Makefile|LICENSE)$/.test(entry.name))) {
+          if (limit && files.length >= limit) { truncated = true; return; }
           files.push(relative);
-          if (files.length > MAX_FILES) throw new Error(`Workspace exceeds ${MAX_FILES} text files; select a smaller workspace`);
+          if (!limit && files.length > MAX_FILES) throw new Error(`Workspace exceeds ${MAX_FILES} text files; select a smaller workspace`);
         }
       }
     };
     await walk(this.path);
-    return files;
+    return limit ? { files, truncated } : files;
+  }
+
+  /** Literal, case-sensitive line search over eligible text files. */
+  async search(query, { maxResults = 100 } = {}) {
+    if (typeof query !== 'string' || !query) throw new Error('Search query must be a non-empty string');
+    const matches = [];
+    const { files, truncated: listTruncated } = await this.list({ limit: 5000 });
+    for (const file of files) {
+      let content;
+      try { content = await this.read(file); } catch { continue; }
+      if (!content.includes(query)) continue;
+      const lines = content.split('\n');
+      for (let index = 0; index < lines.length; index += 1) {
+        if (!lines[index].includes(query)) continue;
+        if (matches.length >= maxResults) return { matches, truncated: true };
+        matches.push({ path: file, line: index + 1, text: lines[index].slice(0, 400) });
+      }
+    }
+    return { matches, truncated: listTruncated };
+  }
+
+  /**
+   * Turns exact snippet edits into full before/after changes without writing.
+   * Each `find` must occur exactly once in the file's current (or already edited)
+   * content; an empty `find` creates a new file. Stale-edit checks still apply
+   * when the resulting changes are applied.
+   */
+  async planEdits(edits) {
+    if (!Array.isArray(edits) || !edits.length) throw new Error('Provide at least one edit');
+    const files = new Map();
+    for (const edit of edits) {
+      if (!edit || typeof edit.path !== 'string' || typeof edit.find !== 'string' || typeof edit.replace !== 'string') throw new Error('Each edit requires path, find, and replace strings');
+      if (!files.has(edit.path)) {
+        let before = null;
+        try { before = await this.read(edit.path); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+        files.set(edit.path, { before, after: before });
+      }
+      const file = files.get(edit.path);
+      if (edit.find === '') {
+        if (file.after !== null) throw new Error(`An empty find creates a new file, but ${edit.path} already exists`);
+        file.after = edit.replace;
+        continue;
+      }
+      if (file.after === null) throw new Error(`File not found: ${edit.path}`);
+      const first = file.after.indexOf(edit.find);
+      if (first < 0) throw new Error(`Edit text not found in ${edit.path}: ${JSON.stringify(edit.find.slice(0, 120))}`);
+      if (file.after.indexOf(edit.find, first + 1) >= 0) throw new Error(`Edit text occurs more than once in ${edit.path}; include more surrounding context: ${JSON.stringify(edit.find.slice(0, 120))}`);
+      file.after = file.after.slice(0, first) + edit.replace + file.after.slice(first + edit.find.length);
+    }
+    return [...files].map(([path, { before, after }]) => ({ path, before: before ?? '', after })).filter(change => change.before !== change.after);
   }
 
   async read(relative) {
@@ -198,11 +245,18 @@ export class Workspace {
   async test({ signal } = {}) {
     signal?.throwIfAborted();
     if (!this.testCommand.trim()) return { passed: false, output: 'No test command configured; verification skipped.', exitCode: -1, skipped: true };
+    const result = await this.run(this.testCommand, { signal, label: 'test command' });
+    return { ...result, passed: result.exitCode === 0 && !result.stopped };
+  }
+
+  /** Runs one shell command in the workspace with a timeout, output cap and process-group cancellation. */
+  async run(command, { signal, timeoutMs = this.testTimeoutMs, label = 'command' } = {}) {
+    signal?.throwIfAborted();
     return await new Promise((resolve, reject) => {
       // A Node test runner marks its children as test workers. User test commands
       // are independent runs, including when this module itself is under test.
       const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('NODE_TEST_')));
-      const child = spawn('/bin/bash', ['-c', this.testCommand], { cwd: this.path, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+      const child = spawn('/bin/bash', ['-c', command], { cwd: this.path, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
       let output = '';
       let bytes = 0;
       let stopped = '';
@@ -217,7 +271,7 @@ export class Workspace {
       const abort = () => stop('cancelled');
       signal?.addEventListener('abort', abort, { once: true });
       if (signal?.aborted) abort();
-      const timeout = setTimeout(() => stop('timeout'), this.testTimeoutMs);
+      const timeout = setTimeout(() => stop('timeout'), timeoutMs);
       const append = data => {
         const remaining = this.maxOutputBytes - bytes;
         if (remaining > 0) output += data.subarray(0, remaining).toString('utf8');
@@ -230,8 +284,8 @@ export class Workspace {
       child.once('error', error => { cleanup(); reject(error); });
       child.once('close', code => {
         cleanup();
-        if (stopped) output += `\n[SHOUT: test command ${stopped}]\n`;
-        resolve({ passed: code === 0 && !stopped, output, exitCode: code ?? -1, ...(stopped ? { stopped } : {}) });
+        if (stopped) output += `\n[SHOUT: ${label} ${stopped}]\n`;
+        resolve({ output, exitCode: code ?? -1, ...(stopped ? { stopped } : {}) });
       });
     });
   }

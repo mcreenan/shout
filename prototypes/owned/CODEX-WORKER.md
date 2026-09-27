@@ -1,6 +1,6 @@
 # Codex judgment worker contract
 
-Verified with `codex-cli 0.153.3` on 2026-09-23. The worker uses the existing Codex login through the CLI. No authentication files or tokens were inspected, copied, or exported. The owned harness still owns routing, VM execution, callback dispatch, capabilities, and user interaction; Codex supplies one bounded structured judgment.
+Verified with `codex-cli 0.157.1` on 2026-09-26 (first verified with 0.153.3 on 2026-09-23). The worker uses the existing Codex login through the CLI. No authentication files or tokens were inspected, copied, or exported. The owned harness still owns routing, VM execution, callback dispatch, capabilities, and user interaction; Codex supplies one bounded structured judgment.
 
 ## The restriction that matters
 
@@ -113,7 +113,7 @@ Raw local evidence and the generated catalog remain in ignored `.scratch/worker-
 
 - Parse JSONL incrementally, keep stderr separate, reject malformed output and failed/error turns, and validate the final JSON against the callback schema. Do not trust shape enforcement alone.
 - Treat any tool, command, patch, or MCP event as a contract violation; terminate the worker and fail the callback. This is detection, not rollback of an action that already occurred.
-- Put a finite deadline and output-size limit around each subprocess. Cancellation must terminate it and settle the waiting callback. Remove temporary files afterward.
+- By default, put a 10-minute deadline and a 1 MiB output-size limit around each subprocess. SHOUT may explicitly disable the time deadline per session for long-running agentic work; output limits and all count limits remain enforced. Timeout errors must state the configured duration. Cancellation must always terminate the subprocess and settle the waiting callback, whether or not its deadline is enabled. Remove temporary files afterward.
 - `--ephemeral` disables session-file persistence; it is not a promise that the CLI writes no logs or authentication bookkeeping. `--ignore-user-config` does not claim to eliminate system or managed configuration. Preserve the ordinary CLI authentication boundary.
 - `read-only` is defense in depth. It does not mean the model has no tools or cannot read data. The relevant local evidence here is the restricted catalog, disabled features, narrowed instructions, and observed event stream together.
 - These two successful probes establish this prototype's behavior on this installed binary. Model self-report is supporting evidence, not a formal tool-registry audit. Revalidate on Codex upgrades. A future direct model API provider with an empty tool list would provide a simpler long-term judgment boundary.

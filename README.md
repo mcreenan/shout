@@ -13,7 +13,7 @@ npm run setup
 npm start
 ```
 
-Open **http://127.0.0.1:4310** on this machine, or use a LAN/Tailscale URL printed at startup. The app listens on `0.0.0.0` by default. Choose **New session** for your own workspace, or click one of the three guided scenarios. Live mode uses your signed-in **Codex CLI 0.153.3**; **Fixture** mode uses explicitly scripted judgments with real ALLEN execution, file edits and tests.
+Open **http://127.0.0.1:4310** on this machine, or use a LAN/Tailscale URL printed at startup. The app listens on `0.0.0.0` by default. Choose **New session** for your own workspace, or click one of the three guided scenarios. SHOUT uses your signed-in **Codex CLI 0.157.1**.
 
 - **Fix a checkout calculation:** repair discount/tax ordering.
 - **Implement a missing slug utility:** add normalized, tested string handling.
@@ -21,11 +21,13 @@ Open **http://127.0.0.1:4310** on this machine, or use a LAN/Tailscale URL print
 
 Send the prepared prompt, inspect **Changes**, and choose **Approve & continue**. ALLEN handles the execution and bounded repair loop; every new patch requires approval. Enter `/test` to run the configured tests directly, without a model call. Open the **Inspector** to explore the flow, filter events, inspect tool inputs/results, or read the exact executed ALLEN source.
 
-Sessions and traces persist locally; in-flight executions become interrupted after an app restart. Workspace reads and edits are bounded to small projects. Full usage, architecture, limits and verification: **[GUI guide](apps/shout/README.md)**.
+**Skills** are repeatable workflows written in ALLEN and run as slash commands: type `/` in the composer. Built-ins include `/code`, `/review`, `/explain`, `/commit`, `/find`, `/todo` and `/test`. `/new-skill <what it should do>` writes, compile-checks and saves a new one to the workspace's `.shout/skills/`. The VM runs each skill's control flow; the model is asked only for typed judgments, and SHOUT asks before any write or shell command. See the [skill authoring guide](apps/shout/skills/GUIDE.md).
+
+Sessions and traces persist locally; in-flight executions become interrupted after an app restart. Workspace reads and edits are bounded to 256 KiB files. Full usage, architecture, limits and verification: **[GUI guide](apps/shout/README.md)**.
 
 ```sh
-npm run verify        # 60 automated tests plus original interactive checks
-npm run test:browser  # Real Chromium UI acceptance flow (offline model fixtures)
+npm run verify        # 88 automated tests plus original interactive checks
+npm run test:browser  # Real Chromium UI acceptance flow (scripted agent and judgments)
 ```
 
 Browser tests use `/usr/bin/chromium`, `CHROMIUM_BIN`, or Playwright's installed Chromium (`npx playwright install chromium`). The app itself only needs your normal browser.
@@ -43,7 +45,7 @@ Both completed actual model-backed runs. Their original verification includes 26
 
 ## Try them
 
-Requirements: Linux with Bash, Git, `flock`, a Rust/Cargo toolchain, and Node 22+ with npm. Initial setup downloads the pinned upstream runtime and npm dependencies. Live runs additionally require **Codex CLI 0.153.3**, signed in through its normal login. Offline runs need no model credentials.
+Requirements: Linux with Bash, Git, `flock`, a Rust/Cargo toolchain, and Node 22+ with npm. Initial setup downloads the pinned upstream runtime and npm dependencies. Live runs additionally require **Codex CLI 0.157.1**, signed in through its normal login. Offline runs need no model credentials.
 
 ```sh
 git clone https://github.com/mcreenan/shout.git
