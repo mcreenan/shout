@@ -1,7 +1,7 @@
 // Tab/split layout tree for a session's dock. Pure data operations; rendering lives in app.js.
 // A node is either { type: 'group', id, tabs: [tabId], active } or { type: 'split', id, dir: 'row' | 'col', children, sizes }.
 export const CHAT = 'chat';
-const TAB_KINDS = new Set(['chat', 'file', 'viz', 'program', 'skill']);
+const TAB_KINDS = new Set(['chat', 'file', 'viz', 'program', 'skill', 'agent']);
 const VIEWS = new Set(['trace', 'changes']);
 let counter = 0;
 export const uid = (prefix) => `${prefix}-${Date.now().toString(36)}${(counter++).toString(36)}`;
@@ -134,7 +134,7 @@ export function resize(split, index, fraction) {
   split.sizes[index] = pair - left;
 }
 export function serialize(layout) {
-  const tabs = Object.fromEntries(Object.values(layout.tabs).map(({ id, kind, path, view, run, name }) => [id, { id, kind, path, view, run, name }]));
+  const tabs = Object.fromEntries(Object.values(layout.tabs).map(({ id, kind, path, view, run, name, agent }) => [id, { id, kind, path, view, run, name, agent }]));
   return JSON.stringify({ root: layout.root, tabs, focus: layout.focus });
 }
 function validNode(node, seen) {
@@ -153,7 +153,8 @@ export function restore(text) {
       if (tab.kind === 'file' && typeof tab.path !== 'string') continue;
       if (tab.kind === 'viz' && !VIEWS.has(tab.view)) continue;
       if (tab.kind === 'skill' && typeof tab.name !== 'string') continue;
-      tabs[id] = { id, kind: tab.kind, ...(tab.kind === 'file' ? { path: tab.path } : {}), ...(tab.kind === 'viz' ? { view: tab.view } : {}), ...(tab.kind === 'program' ? { run: typeof tab.run === 'string' ? tab.run : '' } : {}), ...(tab.kind === 'skill' ? { name: tab.name } : {}) };
+      if (tab.kind === 'agent' && typeof tab.agent !== 'string') continue;
+      tabs[id] = { id, kind: tab.kind, ...(tab.kind === 'file' ? { path: tab.path } : {}), ...(tab.kind === 'viz' ? { view: tab.view } : {}), ...(tab.kind === 'program' ? { run: typeof tab.run === 'string' ? tab.run : '' } : {}), ...(tab.kind === 'skill' ? { name: tab.name } : {}), ...(tab.kind === 'agent' ? { agent: tab.agent } : {}) };
     }
     const layout = { root: raw.root, tabs, focus: raw.focus };
     for (const candidate of groups(layout.root)) candidate.tabs = candidate.tabs.filter((id) => tabs[id]);

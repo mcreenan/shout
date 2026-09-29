@@ -1,0 +1,2071 @@
+SHOUT JOSH/ALLEN patch 0008-compile-diagnostics-program-check: compile diagnostics from program/load and program/check (josh/1.8)
+Base: mcreenan/josh-allen abb8a9782fc438d1b87e8aa2fdaea65e5db633c3 plus the earlier patches in this directory.
+Generated from branch shout/effect-origin of .worktrees/josh-allen:
+  git diff --binary --src-prefix=a/ --dst-prefix=b/ 6a698fd f581f77
+Commits:
+  f581f77 Return compile diagnostics from program/load and add program/check
+
+diff --git a/README.md b/README.md
+index 1e0a749..05dec9f 100644
+--- a/README.md
++++ b/README.md
+@@ -42,7 +42,7 @@ still the simpler choice for a direct task.
+ 
+ JOSH/ALLEN is early alpha. During the `0.1.x` series, the repository supports
+ one source language, bytecode format, runtime contract, replay format, and
+-`josh/1.7` protocol. The current runtime rejects artifacts from older builds.
++`josh/1.8` protocol. The current runtime rejects artifacts from older builds.
+ 
+ A breaking change replaces the previous language and artifacts. The same
+ change must update the implementation, specifications, tests, conformance
+diff --git a/crates/allen-compiler/src/lib.rs b/crates/allen-compiler/src/lib.rs
+index 26b5b23..76e0dda 100644
+--- a/crates/allen-compiler/src/lib.rs
++++ b/crates/allen-compiler/src/lib.rs
+@@ -28,10 +28,12 @@ pub use frontend::{
+     extract_inline_manifest, prepare_source, prepare_tools, reachable_source_modules,
+ };
+ pub use package::{
+-    CompiledPackage, CompiledPackageSourceTest, assemble_inline_compilation,
+-    assemble_inline_source, assemble_loaded_package, assemble_loaded_source_test,
+-    assemble_loose_compilation, assemble_root_source_package,
+-    assemble_root_source_package_with_resources, assemble_source_test, prepare_loaded_source_tests,
++    AssemblyError, CompiledPackage, CompiledPackageSourceTest, assemble_inline_compilation,
++    assemble_inline_source, assemble_inline_source_checked, assemble_loaded_package,
++    assemble_loaded_source_test, assemble_loose_compilation, assemble_root_source_package,
++    assemble_root_source_package_with_resources,
++    assemble_root_source_package_with_resources_checked, assemble_source_test,
++    prepare_loaded_source_tests,
+ };
+ 
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+@@ -103,9 +105,25 @@ pub fn compile(source: &str) -> Result<Module, Vec<Diagnostic>> {
+ 
+ #[must_use]
+ pub fn render_diagnostic(path: &str, source: &str, diagnostic: &Diagnostic) -> String {
+-    let offset = diagnostic.span.start.min(source.len());
+-    let prefix = &source[..offset];
+-    let bytes = prefix.as_bytes();
++    let (line, column) = source_position(source, diagnostic.span.start);
++    format!(
++        "{path}:{line}:{column}: error[{}]: {}",
++        diagnostic.code, diagnostic.message
++    )
++}
++
++/// The 1-based line and column of a UTF-8 byte offset in source text.
++///
++/// `\n`, `\r\n`, and a lone `\r` each end one line. Columns count Unicode
++/// scalar values. An offset past the end, or inside a character, is moved to
++/// the nearest earlier character boundary.
++#[must_use]
++pub fn source_position(source: &str, offset: usize) -> (usize, usize) {
++    let mut offset = offset.min(source.len());
++    while !source.is_char_boundary(offset) {
++        offset -= 1;
++    }
++    let bytes = &source.as_bytes()[..offset];
+     let mut line = 1;
+     let mut line_start = 0;
+     let mut position = 0;
+@@ -127,17 +145,79 @@ pub fn render_diagnostic(path: &str, source: &str, diagnostic: &Diagnostic) -> S
+             _ => position += 1,
+         }
+     }
+-    let column = source[line_start..offset].chars().count() + 1;
+-    format!(
+-        "{path}:{line}:{column}: error[{}]: {}",
+-        diagnostic.code, diagnostic.message
+-    )
++    (line, source[line_start..offset].chars().count() + 1)
++}
++
++/// Precomputed line starts for repeated [`source_position`] lookups.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct SourceLines {
++    text: String,
++    /// Byte offsets that begin a line: 0, and each offset after a `\n`,
++    /// a `\r\n`, or a lone `\r`.
++    line_starts: Vec<usize>,
++}
++
++impl SourceLines {
++    #[must_use]
++    pub fn new(text: &str) -> Self {
++        let bytes = text.as_bytes();
++        let mut line_starts = vec![0];
++        for (index, byte) in bytes.iter().enumerate() {
++            let ends_line = match byte {
++                b'\n' => true,
++                b'\r' => bytes.get(index + 1) != Some(&b'\n'),
++                _ => false,
++            };
++            if ends_line {
++                line_starts.push(index + 1);
++            }
++        }
++        Self {
++            text: text.to_owned(),
++            line_starts,
++        }
++    }
++
++    /// The same 1-based line and column as [`source_position`].
++    #[must_use]
++    pub fn position(&self, offset: usize) -> (usize, usize) {
++        let mut offset = offset.min(self.text.len());
++        while !self.text.is_char_boundary(offset) {
++            offset -= 1;
++        }
++        // An offset between the two bytes of `\r\n` already follows a line end.
++        if offset > 0
++            && self.text.as_bytes()[offset - 1] == b'\r'
++            && self.text.as_bytes().get(offset) == Some(&b'\n')
++        {
++            return (
++                self.line_starts.partition_point(|start| *start <= offset) + 1,
++                1,
++            );
++        }
++        let line = self.line_starts.partition_point(|start| *start <= offset);
++        let start = self.line_starts[line - 1];
++        (line, self.text[start..offset].chars().count() + 1)
++    }
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn source_lines_match_source_position_at_every_offset() {
++        let text = "a\r\nb\rc\n\n🦀d\r\r\ne\u{e9}f\r";
++        let lines = SourceLines::new(text);
++        for offset in 0..=text.len() + 2 {
++            assert_eq!(
++                lines.position(offset),
++                source_position(text, offset),
++                "{offset}"
++            );
++        }
++    }
++
+     #[test]
+     fn diagnostic_rendering_counts_every_source_line_terminator_once() {
+         for terminator in ["\n", "\r\n", "\r"] {
+diff --git a/crates/allen-compiler/src/package.rs b/crates/allen-compiler/src/package.rs
+index 556d53e..83dff5c 100644
+--- a/crates/allen-compiler/src/package.rs
++++ b/crates/allen-compiler/src/package.rs
+@@ -109,23 +109,70 @@ pub fn assemble_inline_source(
+     source: &str,
+     catalog: &FrozenCatalog,
+ ) -> Result<CompiledPackage, String> {
+-    let compiled = compile_inline_manifest_source_with_catalog(source, catalog)
+-        .map_err(|diagnostics| render_inline_diagnostics(source, diagnostics))?;
+-    assemble_compiled_inline_source(compiled)
++    assemble_inline_source_checked(source, catalog).map_err(|error| error.render())
+ }
+ 
+-fn render_inline_diagnostics(source: &str, diagnostics: Vec<crate::Diagnostic>) -> String {
+-    diagnostics
+-        .into_iter()
+-        .map(|diagnostic| {
+-            render_diagnostic(
+-                diagnostic.source.as_deref().unwrap_or("main.allen"),
+-                source,
+-                &diagnostic,
+-            )
+-        })
+-        .collect::<Vec<_>>()
+-        .join("\n")
++/// Compile one loose or inline-manifest source file, keeping structured errors.
++///
++/// The source is compiled as module `main.allen`. This is the same path as
++/// [`assemble_inline_source`], whose error is [`AssemblyError::render`].
++///
++/// # Errors
++///
++/// Returns compiler diagnostics, or a manifest, entry, or boundary error.
++pub fn assemble_inline_source_checked(
++    source: &str,
++    catalog: &FrozenCatalog,
++) -> Result<CompiledPackage, AssemblyError> {
++    let compiled =
++        compile_inline_manifest_source_with_catalog(source, catalog).map_err(|diagnostics| {
++            AssemblyError::Diagnostics {
++                root: "main.allen".to_owned(),
++                sources: BTreeMap::from([("main.allen".to_owned(), source.to_owned())]),
++                diagnostics,
++            }
++        })?;
++    assemble_compiled_inline_source(compiled).map_err(AssemblyError::Program)
++}
++
++/// Why one source program could not be assembled into an artifact.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub enum AssemblyError {
++    /// Compiler diagnostics. A diagnostic without a `source` belongs to `root`,
++    /// and `sources` maps each module identity to its text.
++    Diagnostics {
++        root: String,
++        sources: BTreeMap<String, String>,
++        diagnostics: Vec<crate::Diagnostic>,
++    },
++    /// A package, manifest, entry, or boundary error without a source span.
++    Program(String),
++}
++
++impl AssemblyError {
++    /// Render the error as the one-line-per-diagnostic text used by the CLI.
++    #[must_use]
++    pub fn render(&self) -> String {
++        match self {
++            Self::Diagnostics {
++                root,
++                sources,
++                diagnostics,
++            } => diagnostics
++                .iter()
++                .map(|diagnostic| {
++                    let module = diagnostic.source.as_deref().unwrap_or(root);
++                    let text = sources
++                        .get(module)
++                        .or_else(|| sources.get(root))
++                        .map_or("", String::as_str);
++                    render_diagnostic(module, text, diagnostic)
++                })
++                .collect::<Vec<_>>()
++                .join("\n"),
++            Self::Program(message) => message.clone(),
++        }
++    }
+ }
+ 
+ fn assemble_compiled_inline_source(
+@@ -615,6 +662,31 @@ pub fn assemble_root_source_package_with_resources(
+     catalog: Option<&FrozenCatalog>,
+     limits: &LoadLimits,
+ ) -> Result<CompiledPackage, String> {
++    assemble_root_source_package_with_resources_checked(
++        manifest_text,
++        sources,
++        resources,
++        lock_text,
++        catalog,
++        limits,
++    )
++    .map_err(|error| error.render())
++}
++
++/// Verify and assemble one in-memory package, keeping structured errors.
++///
++/// # Errors
++///
++/// Returns compiler diagnostics keyed by module identity, or a package,
++/// resource, lock, tool, or boundary error.
++pub fn assemble_root_source_package_with_resources_checked(
++    manifest_text: &str,
++    sources: &BTreeMap<String, String>,
++    resources: &BTreeMap<String, Vec<u8>>,
++    lock_text: Option<&str>,
++    catalog: Option<&FrozenCatalog>,
++    limits: &LoadLimits,
++) -> Result<CompiledPackage, AssemblyError> {
+     let loaded = load_verified_root_package_with_resources(
+         manifest_text,
+         sources,
+@@ -622,8 +694,20 @@ pub fn assemble_root_source_package_with_resources(
+         lock_text,
+         limits,
+     )
+-    .map_err(|error| error.to_string())?;
+-    assemble_loaded_package(&loaded, catalog)
++    .map_err(|error| AssemblyError::Program(error.to_string()))?;
++    let (bundle, mut prepared, templates, resources) =
++        prepare_loaded_package(&loaded, catalog).map_err(AssemblyError::Program)?;
++    let compilation = compile_package_bundle_with_prepared_tools_and_templates(
++        &bundle,
++        &mut prepared,
++        &templates,
++    )
++    .map_err(|diagnostics| AssemblyError::Diagnostics {
++        root: bundle.root.clone(),
++        sources: bundle.sources.clone(),
++        diagnostics,
++    })?;
++    finish_loaded_package(&loaded, compilation, prepared, resources).map_err(AssemblyError::Program)
+ }
+ 
+ /// Compile one verified package graph into the canonical current artifact.
+diff --git a/crates/allen-runtime/src/lib.rs b/crates/allen-runtime/src/lib.rs
+index c26b6eb..1e67607 100644
+--- a/crates/allen-runtime/src/lib.rs
++++ b/crates/allen-runtime/src/lib.rs
+@@ -5825,7 +5825,10 @@ fn response_schema(
+     }
+ }
+ 
+-fn schema_descriptor(
++/// The strict JSON boundary descriptor of one value type, the format used by
++/// typed-response schemas and entry contracts.
++#[must_use]
++pub fn schema_descriptor(
+     value_type: &ValueType,
+     enums: &[allen_bytecode::EnumType],
+ ) -> serde_json::Value {
+diff --git a/crates/josh-host/src/check.rs b/crates/josh-host/src/check.rs
+new file mode 100644
+index 0000000..4eed23b
+--- /dev/null
++++ b/crates/josh-host/src/check.rs
+@@ -0,0 +1,298 @@
++//! Compile a source bundle and describe why it does not compile.
++//!
++//! `program/load`, `program/check`, and embedders that check programs without
++//! a connection share [`compile_source_bundle`], so a source that does not
++//! compile produces identical diagnostics on every path.
++
++use std::collections::BTreeMap;
++
++use allen_compiler::{
++    AssemblyError, CompiledPackage, Diagnostic, SourceLines, assemble_inline_source_checked,
++    assemble_root_source_package_with_resources_checked,
++};
++use allen_package::LoadLimits;
++use allen_schema::FrozenCatalog;
++use base64::Engine as _;
++use josh_protocol::{
++    CompilerDiagnostic, DiagnosticLabel, DiagnosticSeverity, FileEncoding, MAX_DIAGNOSTICS,
++    ProgramInvalidData, SourceFile, WireError, WireErrorCode,
++};
++
++use crate::HostError;
++
++/// Code for a program error that has no source span, such as an invalid
++/// manifest, entry, or boundary type.
++const PROGRAM_ERROR_CODE: &str = "E3005";
++const MAX_DIAGNOSTIC_TEXT: usize = 1_024;
++
++/// Why a program could not be compiled, verified, or loaded.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct ProgramError {
++    pub error: HostError,
++    /// Present when a source program does not compile.
++    pub diagnostics: Vec<CompilerDiagnostic>,
++}
++
++impl ProgramError {
++    /// The wire error, with the diagnostics as `data` when there are any.
++    #[must_use]
++    pub fn wire(&self) -> WireError {
++        let mut error = self.error.wire();
++        if !self.diagnostics.is_empty() {
++            error.data = serde_json::to_value(ProgramInvalidData {
++                diagnostics: self.diagnostics.clone(),
++            })
++            .ok();
++        }
++        error
++    }
++
++    /// Keep the leading diagnostics whose wire form fits in `budget` bytes.
++    pub(crate) fn fit(mut self, budget: usize) -> Self {
++        let mut used = 0_usize;
++        let kept = self
++            .diagnostics
++            .iter()
++            .take_while(|diagnostic| {
++                used = used.saturating_add(
++                    serde_json::to_vec(diagnostic).map_or(usize::MAX, |bytes| bytes.len() + 1),
++                );
++                used <= budget
++            })
++            .count();
++        self.diagnostics
++            .truncate(kept.max(1).min(self.diagnostics.len()));
++        self
++    }
++}
++
++impl From<HostError> for ProgramError {
++    fn from(error: HostError) -> Self {
++        Self {
++            error,
++            diagnostics: Vec::new(),
++        }
++    }
++}
++
++const fn invalid(message: &'static str) -> HostError {
++    HostError {
++        code: WireErrorCode::ProgramInvalid,
++        message,
++    }
++}
++
++/// Compile one `source_bundle` against a frozen catalog, as `program/load`
++/// does.
++///
++/// A bundle with `allen.toml` is a package; otherwise it must be one loose or
++/// inline-manifest `src/main.allen`. `max_bytes` bounds the decoded bundle.
++///
++/// # Errors
++///
++/// Returns `program.invalid` for a malformed or oversized bundle, and, with
++/// diagnostics, for a source program that does not compile.
++pub fn compile_source_bundle(
++    files: &[SourceFile],
++    catalog: &FrozenCatalog,
++    max_bytes: u64,
++) -> Result<CompiledPackage, ProgramError> {
++    let mut manifest = None;
++    let mut lock = None;
++    let mut sources = BTreeMap::new();
++    let mut resources = BTreeMap::new();
++    let mut decoded_bytes = 0_u64;
++    for file in files {
++        let decoded = match file.encoding {
++            FileEncoding::Utf8 => file.content.as_bytes().to_vec(),
++            FileEncoding::Base64 => base64::engine::general_purpose::STANDARD
++                .decode(&file.content)
++                .map_err(|_| invalid("source data is invalid"))?,
++        };
++        let file_bytes = u64::try_from(decoded.len()).unwrap_or(u64::MAX);
++        decoded_bytes = decoded_bytes
++            .checked_add(file_bytes)
++            .ok_or_else(|| invalid("source program is too large"))?;
++        if decoded_bytes > max_bytes {
++            return Err(invalid("source program is too large").into());
++        }
++        match file.path.as_str() {
++            "allen.toml" => manifest = Some(file.content.as_str()),
++            "allen.lock" => lock = Some(file.content.as_str()),
++            path if is_source_path(path) => {
++                sources.insert(path.to_owned(), file.content.clone());
++            }
++            path => {
++                resources.insert(path.to_owned(), decoded);
++            }
++        }
++    }
++    let mut limits = LoadLimits::default();
++    limits.source_bytes = limits.source_bytes.min(max_bytes);
++    limits.manifest_bytes = limits.manifest_bytes.min(max_bytes);
++    limits.modules = limits.modules.min(files.len());
++    limits.filesystem_entries = limits.filesystem_entries.min(files.len());
++    limits.path_bytes = limits.path_bytes.min(4_096);
++    let (compiled, root) = if let Some(manifest) = manifest {
++        (
++            assemble_root_source_package_with_resources_checked(
++                manifest,
++                &sources,
++                &resources,
++                lock,
++                Some(catalog),
++                &limits,
++            ),
++            "allen.toml",
++        )
++    } else if lock.is_none() && sources.len() == 1 {
++        let source = sources
++            .get("src/main.allen")
++            .ok_or_else(|| invalid("loose source must be named src/main.allen"))?;
++        (
++            assemble_inline_source_checked(source, catalog),
++            "src/main.allen",
++        )
++    } else {
++        return Err(invalid("source manifest is missing").into());
++    };
++    compiled.map_err(|error| {
++        let mut texts = sources;
++        if let Some(manifest) = manifest {
++            texts.insert("allen.toml".to_owned(), manifest.to_owned());
++        }
++        ProgramError {
++            error: invalid("source program does not compile"),
++            diagnostics: compiler_diagnostics(&error, &texts, root),
++        }
++    })
++}
++
++// Source paths are case-sensitive package paths.
++#[allow(clippy::case_sensitive_file_extension_comparisons)]
++fn is_source_path(path: &str) -> bool {
++    path.starts_with("src/") && path.ends_with(".allen")
++}
++
++/// Whether a compiler module identity names a bundle path: they are equal, or
++/// one ends with the other after a `/` (package identities such as
++/// `pkg://name@1.0.0/src/main.allen`, and the loose-source module `main.allen`).
++fn same_file(module: &str, path: &str) -> bool {
++    let suffix = |long: &str, short: &str| {
++        long.strip_suffix(short)
++            .is_some_and(|prefix| prefix.ends_with('/'))
++    };
++    module == path || suffix(module, path) || suffix(path, module)
++}
++
++/// Convert an assembly failure into wire diagnostics.
++///
++/// `texts` maps bundle paths to their text, and a diagnostic names the bundle
++/// path of its module (a diagnostic without a module belongs to the compiled
++/// root module). A failure without a source span is one diagnostic at the
++/// start of `root`.
++#[must_use]
++pub fn compiler_diagnostics(
++    error: &AssemblyError,
++    texts: &BTreeMap<String, String>,
++    root: &str,
++) -> Vec<CompilerDiagnostic> {
++    let empty = String::new();
++    match error {
++        AssemblyError::Diagnostics {
++            root: root_module,
++            diagnostics,
++            ..
++        } => {
++            let lines = texts
++                .iter()
++                .map(|(path, text)| (path.as_str(), SourceLines::new(text)))
++                .collect::<BTreeMap<_, _>>();
++            diagnostics
++                .iter()
++                .take(MAX_DIAGNOSTICS)
++                .map(|diagnostic| {
++                    let module = diagnostic.source.as_deref().unwrap_or(root_module);
++                    let path = texts
++                        .keys()
++                        .find(|path| same_file(module, path))
++                        .map_or(module, String::as_str);
++                    let fallback = SourceLines::new(&empty);
++                    let lines = lines.get(path).unwrap_or(&fallback);
++                    diagnostic_payload(diagnostic, path, lines)
++                })
++                .collect()
++        }
++        AssemblyError::Program(message) => {
++            let lines = SourceLines::new(texts.get(root).unwrap_or(&empty));
++            let diagnostic = Diagnostic {
++                code: PROGRAM_ERROR_CODE,
++                message: message.clone(),
++                span: allen_compiler::Span { start: 0, end: 0 },
++                labels: Vec::new(),
++                source: None,
++            };
++            vec![diagnostic_payload(&diagnostic, root, &lines)]
++        }
++    }
++}
++
++fn diagnostic_payload(
++    diagnostic: &Diagnostic,
++    path: &str,
++    lines: &SourceLines,
++) -> CompilerDiagnostic {
++    let span = |span: allen_compiler::Span| {
++        let (line, column) = lines.position(span.start);
++        let (end_line, end_column) = lines.position(span.end.max(span.start));
++        (
++            u32::try_from(span.start).unwrap_or(u32::MAX),
++            u32::try_from(span.end.max(span.start)).unwrap_or(u32::MAX),
++            u32::try_from(line).unwrap_or(u32::MAX),
++            u32::try_from(column).unwrap_or(u32::MAX),
++            u32::try_from(end_line).unwrap_or(u32::MAX),
++            u32::try_from(end_column).unwrap_or(u32::MAX),
++        )
++    };
++    let (start, end, line, column, end_line, end_column) = span(diagnostic.span);
++    CompilerDiagnostic {
++        code: diagnostic.code.to_owned(),
++        severity: DiagnosticSeverity::Error,
++        message: bounded(&diagnostic.message),
++        source: path.to_owned(),
++        start,
++        end,
++        line,
++        column,
++        end_line,
++        end_column,
++        labels: diagnostic
++            .labels
++            .iter()
++            .take(16)
++            .map(|label| {
++                let (start, end, line, column, end_line, end_column) = span(label.span);
++                DiagnosticLabel {
++                    message: bounded(&label.message),
++                    source: path.to_owned(),
++                    start,
++                    end,
++                    line,
++                    column,
++                    end_line,
++                    end_column,
++                }
++            })
++            .collect(),
++        notes: Vec::new(),
++        help: None,
++    }
++}
++
++fn bounded(text: &str) -> String {
++    let mut end = text.len().min(MAX_DIAGNOSTIC_TEXT);
++    while !text.is_char_boundary(end) {
++        end -= 1;
++    }
++    text[..end].to_owned()
++}
+diff --git a/crates/josh-host/src/lib.rs b/crates/josh-host/src/lib.rs
+index e913a3a..cec28fe 100644
+--- a/crates/josh-host/src/lib.rs
++++ b/crates/josh-host/src/lib.rs
+@@ -2,12 +2,14 @@
+ 
+ //! Reference session state and stdio adapter for the current JOSH protocol.
+ 
++mod check;
+ mod events;
+ mod grants;
+ mod origin;
+ mod server;
+ mod session;
+ 
++pub use check::{ProgramError, compile_source_bundle, compiler_diagnostics};
+ pub use origin::{ProgramDebug, readable_function_name};
+ pub use server::run_connection;
+ pub use session::{HostError, PreparedExecution, Session};
+diff --git a/crates/josh-host/src/origin.rs b/crates/josh-host/src/origin.rs
+index 226c560..21d5868 100644
+--- a/crates/josh-host/src/origin.rs
++++ b/crates/josh-host/src/origin.rs
+@@ -23,36 +23,18 @@ use josh_protocol::{
+ /// Origins retained for typed-response retries of recent effects.
+ const ORIGIN_STORE_CAPACITY: usize = 1_024;
+ 
+-/// Source text indexed by line for 1-based line and column positions.
++/// Source text indexed by line for the compiler's 1-based line and column
++/// positions, so origins and diagnostics agree with rendered compiler errors.
+ #[derive(Debug)]
+-struct LineIndex {
+-    text: String,
+-    line_starts: Vec<usize>,
+-}
++struct LineIndex(allen_compiler::SourceLines);
+ 
+ impl LineIndex {
+     fn new(text: &str) -> Self {
+-        let mut line_starts = vec![0];
+-        line_starts.extend(
+-            text.bytes()
+-                .enumerate()
+-                .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
+-        );
+-        Self {
+-            text: text.to_owned(),
+-            line_starts,
+-        }
++        Self(allen_compiler::SourceLines::new(text))
+     }
+ 
+-    /// The 1-based line and column (in Unicode scalar values) of a byte offset.
+     fn position(&self, offset: u32) -> Option<(u32, u32)> {
+-        let mut offset = usize::try_from(offset).ok()?.min(self.text.len());
+-        while !self.text.is_char_boundary(offset) {
+-            offset -= 1;
+-        }
+-        let line = self.line_starts.partition_point(|start| *start <= offset);
+-        let line_start = self.line_starts[line - 1];
+-        let column = self.text[line_start..offset].chars().count() + 1;
++        let (line, column) = self.0.position(usize::try_from(offset).ok()?);
+         Some((u32::try_from(line).ok()?, u32::try_from(column).ok()?))
+     }
+ }
+diff --git a/crates/josh-host/src/server.rs b/crates/josh-host/src/server.rs
+index d10cd90..1d07d69 100644
+--- a/crates/josh-host/src/server.rs
++++ b/crates/josh-host/src/server.rs
+@@ -30,16 +30,17 @@ use josh_protocol::{
+     ExecutionResult, ExecutionStartParams, FrameReader, GrantDuration, HostProjectionSetParams,
+     InitializeParams, ModelRequestParams, PeerInfo, PermissionRequestParams,
+     PermissionRequestResult, PermissionRevokeParams, PermissionRight, PermissionTargetKind,
+-    ProgramLoadParams, PromptPolicy, PromptSegmentPayload, ProtocolError, ProtocolTracker,
+-    ReceiveAction, ResponseSchemaPayload, RuntimeReadyParams, StructuredPromptPayload,
+-    SubAgentAskParams, SubAgentCreateParams, SubAgentCreateResult, SubAgentMessageParams,
+-    SubAgentProjectionPayload, SubAgentRunParams, ToolInvokeParams, ToolInvokeResult,
+-    TranscriptPart, TranscriptRole, TypedResponseResult, UserAskParams, Validate,
++    ProgramCheckParams, ProgramLoadParams, PromptPolicy, PromptSegmentPayload, ProtocolError,
++    ProtocolTracker, ReceiveAction, ResponseSchemaPayload, RuntimeReadyParams,
++    StructuredPromptPayload, SubAgentAskParams, SubAgentCreateParams, SubAgentCreateResult,
++    SubAgentMessageParams, SubAgentProjectionPayload, SubAgentRunParams, ToolInvokeParams,
++    ToolInvokeResult, TranscriptPart, TranscriptRole, TypedResponseResult, UserAskParams, Validate,
+     ValidationIssuePayload, WireError, WireErrorCode, WireMessage, encode_frame,
+     notification_params, request_params, response_result,
+ };
+ use serde_json::Value;
+ 
++use crate::check::ProgramError;
+ use crate::events::{EventClock, SystemEventClock, execution_event};
+ use crate::grants::GrantRegistry;
+ use crate::origin::{OriginStore, ProgramDebug};
+@@ -211,8 +212,12 @@ where
+                     }
+                     "program/load" => {
+                         let result = request_params::<ProgramLoadParams>(&message, "program/load")
+-                            .map_err(invalid_request)
+-                            .and_then(|params| lock_session(&session)?.load_program(&params));
++                            .map_err(|error| ProgramError::from(invalid_request(error)))
++                            .and_then(|params| {
++                                lock_session(&session)
++                                    .map_err(ProgramError::from)?
++                                    .load_program(&params)
++                            });
+                         match result {
+                             Ok(result) => {
+                                 write_result(&writer, id, &result)?;
+@@ -220,6 +225,26 @@ where
+                                 state.commit_response(id).map_err(state_error)?;
+                                 state.program_loaded().map_err(state_error)?;
+                             }
++                            Err(error) => {
++                                write_wire_error(&writer, id, error.wire())?;
++                                lock_tracker(&tracker)?
++                                    .commit_response(id)
++                                    .map_err(state_error)?;
++                            }
++                        }
++                    }
++                    "program/check" => {
++                        let result =
++                            request_params::<ProgramCheckParams>(&message, "program/check")
++                                .map_err(invalid_request)
++                                .and_then(|params| lock_session(&session)?.check_program(&params));
++                        match result {
++                            Ok(result) => {
++                                write_result(&writer, id, &result)?;
++                                lock_tracker(&tracker)?
++                                    .commit_response(id)
++                                    .map_err(state_error)?;
++                            }
+                             Err(error) => finish_failed_request(&writer, &tracker, id, error)?,
+                         }
+                     }
+diff --git a/crates/josh-host/src/session.rs b/crates/josh-host/src/session.rs
+index 5e41123..1a01e32 100644
+--- a/crates/josh-host/src/session.rs
++++ b/crates/josh-host/src/session.rs
+@@ -8,11 +8,9 @@ use std::time::Duration;
+ use allen_bytecode::{
+     DecodeLimits, VerifiedArtifact, compute_strict_schema_digest, decode_and_verify, encode,
+ };
+-use allen_compiler::{assemble_inline_source, assemble_root_source_package_with_resources};
+-use allen_package::LoadLimits;
+ use allen_runtime::{
+     HostPolicy, LaunchRequest, PreparedLaunch, RuntimeError, RuntimeProviders, ToolProvider,
+-    execute_prepared_with_context, prepare_launch,
++    execute_prepared_with_context, prepare_launch, schema_descriptor,
+ };
+ use allen_sandbox_fs::Rights;
+ use allen_schema::{
+@@ -25,11 +23,13 @@ use base64::Engine as _;
+ use josh_protocol::{
+     CatalogSetParams, CatalogSetResult, CatalogToolSummary, EntryContract, ExecutionMode,
+     ExecutionResult, ExecutionStartParams, HostProjectionSetParams, HostProjectionSetResult,
+-    InitializeParams, InitializeResult, PeerInfo, ProgramLoadParams, ProgramLoadResult,
+-    ProjectionSectionKind, ProtocolLimits, SessionBindingLevel, Validate, WireError, WireErrorCode,
++    InitializeParams, InitializeResult, PeerInfo, ProgramCheckResult, ProgramLoadParams,
++    ProgramLoadResult, ProjectionSectionKind, ProtocolLimits, SessionBindingLevel, Validate,
++    WireError, WireErrorCode,
+ };
+ use sha2::{Digest as _, Sha256};
+ 
++use crate::check::{ProgramError, compile_source_bundle};
+ use crate::origin::ProgramDebug;
+ 
+ const RUNTIME_NAME: &str = "allen-reference";
+@@ -65,6 +65,24 @@ impl std::fmt::Display for HostError {
+ 
+ impl std::error::Error for HostError {}
+ 
++/// A compiled and verified program before it is stored.
++struct CompiledProgram {
++    verified: VerifiedArtifact,
++    artifact_digest: String,
++    tool_contract_digest: String,
++    required_tools: Vec<String>,
++    exec_commands: Vec<String>,
++    exec_environment: Vec<String>,
++    entries: Vec<EntryContract>,
++    debug: Option<Arc<ProgramDebug>>,
++}
++
++impl CompiledProgram {
++    fn tables(&self, budget: usize) -> Option<josh_protocol::ProgramDebugPayload> {
++        self.debug.as_ref().map(|debug| debug.tables(budget))
++    }
++}
++
+ #[derive(Debug)]
+ struct LoadedProgram {
+     artifact: Arc<VerifiedArtifact>,
+@@ -442,21 +460,16 @@ impl Session {
+         Ok(result)
+     }
+ 
+-    /// Decodes, verifies, and stores one complete bytecode artifact.
++    /// Compiles, verifies, and stores one program.
+     ///
+     /// # Errors
+     ///
+-    /// Returns a stable program error and creates no program ID on failure.
++    /// Returns a stable program error and creates no program ID on failure. A
++    /// source program that does not compile carries compiler diagnostics.
+     pub fn load_program(
+         &mut self,
+         params: &ProgramLoadParams,
+-    ) -> Result<ProgramLoadResult, HostError> {
+-        params.validate().map_err(|_| {
+-            HostError::new(WireErrorCode::ProgramInvalid, "program load is invalid")
+-        })?;
+-        let catalog = self.catalog.as_ref().ok_or_else(|| {
+-            HostError::new(WireErrorCode::RequestInvalidState, "catalog is not frozen")
+-        })?;
++    ) -> Result<ProgramLoadResult, ProgramError> {
+         if self.programs.len()
+             >= usize::try_from(self.effective_limits.max_loaded_programs)
+                 .unwrap_or(MAX_LOADED_PROGRAMS)
+@@ -465,21 +478,104 @@ impl Session {
+             return Err(HostError::new(
+                 WireErrorCode::RequestLimit,
+                 "loaded program limit reached",
+-            ));
++            )
++            .into());
+         }
++        let program = self.compile_program(params)?;
++        let program_id = format!("program-{}", self.next_program_id);
++        self.next_program_id = self.next_program_id.saturating_add(1);
++        let result = ProgramLoadResult {
++            program_id: program_id.clone(),
++            artifact_digest: program.artifact_digest.clone(),
++            tool_contract_digest: program.tool_contract_digest.clone(),
++            diagnostics: Vec::new(),
++            entries: program.entries.clone(),
++            required_tools: program.required_tools.clone(),
++            exec_commands: program.exec_commands.clone(),
++            exec_environment: program.exec_environment.clone(),
++            debug: program.tables(self.table_budget()),
++        };
++        self.programs.insert(
++            program_id,
++            Arc::new(LoadedProgram {
++                artifact: Arc::new(program.verified),
++                artifact_digest: program.artifact_digest,
++                debug: program.debug,
++            }),
++        );
++        Ok(result)
++    }
++
++    /// Compiles and verifies one program against the frozen catalog without
++    /// loading it.
++    ///
++    /// # Errors
++    ///
++    /// Returns a stable program error for a malformed bundle or an invalid
++    /// artifact. A source program that does not compile is a successful check
++    /// with diagnostics.
++    pub fn check_program(
++        &self,
++        params: &ProgramLoadParams,
++    ) -> Result<ProgramCheckResult, HostError> {
++        match self.compile_program(params) {
++            Ok(program) => Ok(ProgramCheckResult {
++                diagnostics: Vec::new(),
++                artifact_digest: Some(program.artifact_digest.clone()),
++                entries: program.entries.clone(),
++                required_tools: program.required_tools.clone(),
++                exec_commands: program.exec_commands.clone(),
++                exec_environment: program.exec_environment.clone(),
++                debug: program.tables(self.table_budget()),
++            }),
++            Err(error) if !error.diagnostics.is_empty() => {
++                let error = error.fit(self.table_budget());
++                Ok(ProgramCheckResult {
++                    diagnostics: error.diagnostics,
++                    artifact_digest: None,
++                    entries: Vec::new(),
++                    required_tools: Vec::new(),
++                    exec_commands: Vec::new(),
++                    exec_environment: Vec::new(),
++                    debug: None,
++                })
++            }
++            Err(error) => Err(error.error),
++        }
++    }
++
++    /// Bytes of a response frame that debug tables and diagnostics may use,
++    /// leaving most of the frame for the other result fields.
++    pub(crate) fn table_budget(&self) -> usize {
++        usize::try_from(self.effective_limits.max_frame_bytes / 4).unwrap_or(usize::MAX)
++    }
++
++    fn compile_program(&self, params: &ProgramLoadParams) -> Result<CompiledProgram, ProgramError> {
++        params.validate().map_err(|_| {
++            HostError::new(WireErrorCode::ProgramInvalid, "program load is invalid")
++        })?;
++        let catalog = self.catalog.as_ref().ok_or_else(|| {
++            HostError::new(WireErrorCode::RequestInvalidState, "catalog is not frozen")
++        })?;
+         let bytes = match params {
+             ProgramLoadParams::Bytecode { artifact } => base64::engine::general_purpose::STANDARD
+                 .decode(artifact)
+                 .map_err(|_| {
+                     HostError::new(WireErrorCode::ProgramInvalid, "program artifact is invalid")
+                 })?,
+-            ProgramLoadParams::SourceBundle { files } => assemble_source_bundle(
+-                files,
+-                catalog,
+-                self.effective_limits
+-                    .max_frame_bytes
+-                    .min(self.effective_limits.max_catalog_bytes),
+-            )?,
++            ProgramLoadParams::SourceBundle { files } => {
++                let compiled = compile_source_bundle(
++                    files,
++                    catalog,
++                    self.effective_limits
++                        .max_frame_bytes
++                        .min(self.effective_limits.max_catalog_bytes),
++                )
++                .map_err(|error| error.fit(self.table_budget()))?;
++                encode(&compiled.artifact).map_err(|_| {
++                    HostError::new(WireErrorCode::ProgramInvalid, "source program is invalid")
++                })?
++            }
+         };
+         let mut limits = DecodeLimits::default();
+         limits.artifact_bytes = limits
+@@ -501,47 +597,39 @@ impl Session {
+             .collect::<Vec<_>>();
+         let exec_commands = manifest.exec_commands.clone();
+         let exec_environment = manifest.exec_environment.clone();
++        let module = verified.verified_module().module();
+         let entries = verified
+             .entries()
+             .iter()
+-            .map(|entry| EntryContract {
+-                name: entry.name.clone(),
+-                input_schema: digest_text(&compute_strict_schema_digest(
+-                    &verified.schemas()[entry.input_schema as usize],
+-                )),
+-                output_schema: digest_text(&compute_strict_schema_digest(
+-                    &verified.schemas()[entry.output_schema as usize],
+-                )),
+-                input_contract_digest: digest_text(&entry.input_contract_digest),
+-                output_contract_digest: digest_text(&entry.output_contract_digest),
++            .map(|entry| {
++                let input = &verified.schemas()[entry.input_schema as usize];
++                let output = &verified.schemas()[entry.output_schema as usize];
++                EntryContract {
++                    name: entry.name.clone(),
++                    input_schema: digest_text(&compute_strict_schema_digest(input)),
++                    output_schema: digest_text(&compute_strict_schema_digest(output)),
++                    input_contract_digest: digest_text(&entry.input_contract_digest),
++                    output_contract_digest: digest_text(&entry.output_contract_digest),
++                    input_descriptor: schema_descriptor(&input.value_type, &module.enum_types),
++                    output_descriptor: schema_descriptor(&output.value_type, &module.enum_types),
++                    effects: module
++                        .functions
++                        .get(entry.function as usize)
++                        .and_then(|function| module.effect_sets.get(function.effects as usize))
++                        .cloned()
++                        .unwrap_or_default(),
++                }
+             })
+             .collect();
+-        let program_debug = program_debug(params, &verified, &required_tools);
+-        // Leave most of the response frame for the other result fields.
+-        let table_budget =
+-            usize::try_from(self.effective_limits.max_frame_bytes / 4).unwrap_or(usize::MAX);
+-        let debug = program_debug
+-            .as_ref()
+-            .map(|program_debug| program_debug.tables(table_budget));
+-        let program_id = format!("program-{}", self.next_program_id);
+-        self.next_program_id = self.next_program_id.saturating_add(1);
+-        self.programs.insert(
+-            program_id.clone(),
+-            Arc::new(LoadedProgram {
+-                artifact: Arc::new(verified),
+-                artifact_digest: artifact_digest.clone(),
+-                debug: program_debug,
+-            }),
+-        );
+-        Ok(ProgramLoadResult {
+-            program_id,
++        let debug = program_debug(params, &verified, &required_tools);
++        Ok(CompiledProgram {
++            verified,
+             artifact_digest,
+             tool_contract_digest,
+-            diagnostics: Vec::new(),
+-            entries,
+             required_tools,
+             exec_commands,
+             exec_environment,
++            entries,
+             debug,
+         })
+     }
+@@ -730,82 +818,6 @@ fn program_debug(
+     )))
+ }
+ 
+-// Source paths are case-sensitive package paths.
+-#[allow(clippy::case_sensitive_file_extension_comparisons)]
+-fn assemble_source_bundle(
+-    files: &[josh_protocol::SourceFile],
+-    catalog: &FrozenCatalog,
+-    max_bytes: u64,
+-) -> Result<Vec<u8>, HostError> {
+-    let mut manifest = None;
+-    let mut lock = None;
+-    let mut sources = BTreeMap::new();
+-    let mut resources = BTreeMap::new();
+-    let mut decoded_bytes = 0_u64;
+-    for file in files {
+-        let decoded = match file.encoding {
+-            josh_protocol::FileEncoding::Utf8 => file.content.as_bytes().to_vec(),
+-            josh_protocol::FileEncoding::Base64 => base64::engine::general_purpose::STANDARD
+-                .decode(&file.content)
+-                .map_err(|_| {
+-                    HostError::new(WireErrorCode::ProgramInvalid, "source data is invalid")
+-                })?,
+-        };
+-        let file_bytes = u64::try_from(decoded.len()).unwrap_or(u64::MAX);
+-        decoded_bytes = decoded_bytes.checked_add(file_bytes).ok_or_else(|| {
+-            HostError::new(WireErrorCode::ProgramInvalid, "source program is too large")
+-        })?;
+-        if decoded_bytes > max_bytes {
+-            return Err(HostError::new(
+-                WireErrorCode::ProgramInvalid,
+-                "source program is too large",
+-            ));
+-        }
+-        match file.path.as_str() {
+-            "allen.toml" => manifest = Some(file.content.as_str()),
+-            "allen.lock" => lock = Some(file.content.as_str()),
+-            path if path.starts_with("src/") && path.ends_with(".allen") => {
+-                sources.insert(path.to_owned(), file.content.clone());
+-            }
+-            path => {
+-                resources.insert(path.to_owned(), decoded);
+-            }
+-        }
+-    }
+-    let mut limits = LoadLimits::default();
+-    limits.source_bytes = limits.source_bytes.min(max_bytes);
+-    limits.manifest_bytes = limits.manifest_bytes.min(max_bytes);
+-    limits.modules = limits.modules.min(files.len());
+-    limits.filesystem_entries = limits.filesystem_entries.min(files.len());
+-    limits.path_bytes = limits.path_bytes.min(4_096);
+-    let compiled = if let Some(manifest) = manifest {
+-        assemble_root_source_package_with_resources(
+-            manifest,
+-            &sources,
+-            &resources,
+-            lock,
+-            Some(catalog),
+-            &limits,
+-        )
+-    } else if lock.is_none() && sources.len() == 1 {
+-        let source = sources.get("src/main.allen").ok_or_else(|| {
+-            HostError::new(
+-                WireErrorCode::ProgramInvalid,
+-                "loose source must be named src/main.allen",
+-            )
+-        })?;
+-        assemble_inline_source(source, catalog)
+-    } else {
+-        return Err(HostError::new(
+-            WireErrorCode::ProgramInvalid,
+-            "source manifest is missing",
+-        ));
+-    }
+-    .map_err(|_| HostError::new(WireErrorCode::ProgramInvalid, "source program is invalid"))?;
+-    encode(&compiled.artifact)
+-        .map_err(|_| HostError::new(WireErrorCode::ProgramInvalid, "source program is invalid"))
+-}
+-
+ fn validate_catalog_contracts(
+     artifact: &VerifiedArtifact,
+     catalog: &FrozenCatalog,
+@@ -996,6 +1008,7 @@ fn digest_text(digest: &[u8; 32]) -> String {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use allen_compiler::assemble_inline_source;
+ 
+     #[test]
+     fn stopped_reason_is_omitted_when_it_exceeds_the_protocol_bound() {
+@@ -1837,7 +1850,10 @@ export fn main() returns Void { () }
+         let invalid = session.load_program(&ProgramLoadParams::Bytecode {
+             artifact: base64::engine::general_purpose::STANDARD.encode(b"not-bytecode"),
+         });
+-        assert_eq!(invalid.unwrap_err().code, WireErrorCode::ProgramInvalid);
++        assert_eq!(
++            invalid.unwrap_err().error.code,
++            WireErrorCode::ProgramInvalid
++        );
+ 
+         let params = ExecutionStartParams {
+             execution_id: "exec-1".to_owned(),
+diff --git a/crates/josh-host/tests/program_load.rs b/crates/josh-host/tests/program_load.rs
+index cb5763a..290ba1a 100644
+--- a/crates/josh-host/tests/program_load.rs
++++ b/crates/josh-host/tests/program_load.rs
+@@ -22,7 +22,11 @@ fn invalid_artifacts_create_no_program_id() {
+             artifact: "bm90IGFuIGFydGlmYWN0".to_owned(),
+         })
+         .unwrap_err();
+-    assert_eq!(invalid.code, WireErrorCode::ProgramInvalid);
++    assert_eq!(invalid.error.code, WireErrorCode::ProgramInvalid);
++    assert!(
++        invalid.diagnostics.is_empty(),
++        "bytecode failures have no source diagnostics"
++    );
+     assert_eq!(
+         common::load_unit_program(&mut session).program_id,
+         "program-1"
+@@ -64,7 +68,7 @@ output = "Void"
+             ],
+         })
+         .unwrap_err();
+-    assert_eq!(error.code, WireErrorCode::ProgramInvalid);
++    assert_eq!(error.error.code, WireErrorCode::ProgramInvalid);
+ }
+ 
+ fn template_bundle(template: Option<&[u8]>, extra: bool) -> ProgramLoadParams {
+@@ -136,7 +140,7 @@ fn source_bundle_rejects_missing_tampered_extra_and_oversized_resources() {
+     ] {
+         let mut session = common::initialized_session();
+         assert_eq!(
+-            session.load_program(&bundle).unwrap_err().code,
++            session.load_program(&bundle).unwrap_err().error.code,
+             WireErrorCode::ProgramInvalid
+         );
+     }
+@@ -255,3 +259,130 @@ fn source_bundle_loads_operators_and_short_circuit_control_flow() {
+     assert_eq!(loaded.entries.len(), 1);
+     assert_eq!(loaded.entries[0].name, "main");
+ }
++
++fn loose(source: &str) -> ProgramLoadParams {
++    ProgramLoadParams::SourceBundle {
++        files: vec![josh_protocol::SourceFile {
++            path: "src/main.allen".to_owned(),
++            encoding: josh_protocol::FileEncoding::Utf8,
++            content: source.to_owned(),
++        }],
++    }
++}
++
++#[test]
++fn source_that_does_not_compile_reports_the_same_diagnostics_on_load_check_and_embedders() {
++    let source = "export fn main() returns Int {\n  let text = \"🦀\";\r\n  missing + 1\n}\n";
++    let mut session = common::initialized_session();
++    let checked = session.check_program(&loose(source)).unwrap();
++    let loaded = session.load_program(&loose(source)).unwrap_err();
++    let catalog =
++        allen_schema::FrozenCatalog::freeze(Vec::new(), &allen_schema::CatalogLimits::default())
++            .unwrap();
++    let embedded = josh_host::compile_source_bundle(
++        &[josh_protocol::SourceFile {
++            path: "src/main.allen".to_owned(),
++            encoding: josh_protocol::FileEncoding::Utf8,
++            content: source.to_owned(),
++        }],
++        &catalog,
++        1_048_576,
++    )
++    .unwrap_err();
++    assert_eq!(loaded.error.code, WireErrorCode::ProgramInvalid);
++    assert_eq!(loaded.error.message, "source program does not compile");
++    assert_eq!(checked.diagnostics, loaded.diagnostics);
++    assert_eq!(embedded.diagnostics, loaded.diagnostics);
++    assert!(checked.artifact_digest.is_none() && checked.entries.is_empty());
++    let [diagnostic] = loaded.diagnostics.as_slice() else {
++        panic!("one diagnostic: {:?}", loaded.diagnostics);
++    };
++    assert_eq!(diagnostic.source, "src/main.allen");
++    assert_eq!(
++        &source[diagnostic.start as usize..diagnostic.end as usize],
++        "missing"
++    );
++    // The CRLF on line 2 ends one line, as in rendered compiler errors.
++    assert_eq!(
++        (
++            diagnostic.line,
++            diagnostic.column,
++            diagnostic.end_line,
++            diagnostic.end_column
++        ),
++        (3, 3, 3, 10)
++    );
++    let wire = loaded.wire();
++    let data: josh_protocol::ProgramInvalidData =
++        serde_json::from_value(wire.data.clone().unwrap()).unwrap();
++    josh_protocol::Validate::validate(&data).unwrap();
++    assert_eq!(data.diagnostics, loaded.diagnostics);
++    assert_eq!(
++        allen_compiler::assemble_inline_source(source, &catalog).unwrap_err(),
++        format!(
++            "main.allen:3:3: error[{}]: {}",
++            diagnostic.code, diagnostic.message
++        )
++    );
++}
++
++#[test]
++fn boundary_and_manifest_errors_without_a_span_are_one_diagnostic_at_the_start() {
++    let mut session = common::initialized_session();
++    for (source, message) in [
++        (
++            "export fn main() returns fn(Int) returns Int { fn(x: Int) returns Int { x } }\n",
++            "manifest.entry: entry 'main' uses a non-serializable boundary type",
++        ),
++        (
++            "manifest { language: \"0.2\" entry: main capabilities: [] }\nexport fn main() returns Int { 1 }\n",
++            "inline manifest language must be exactly '0.1'",
++        ),
++    ] {
++        let error = session.load_program(&loose(source)).unwrap_err();
++        let [diagnostic] = error.diagnostics.as_slice() else {
++            panic!("one diagnostic: {:?}", error.diagnostics);
++        };
++        assert_eq!(
++            (
++                diagnostic.code.as_str(),
++                diagnostic.message.as_str(),
++                diagnostic.source.as_str(),
++                diagnostic.line,
++                diagnostic.column,
++                diagnostic.start,
++                diagnostic.end
++            ),
++            ("E3005", message, "src/main.allen", 1, 1, 0, 0)
++        );
++    }
++}
++
++#[test]
++fn check_returns_the_program_contract_without_loading() {
++    let mut session = common::initialized_session();
++    let source = "record In { name: String }\nexport fn main(input: In) returns Int {\n  mut total = 0;\n  for c in input.name { total += 1; }\n  total\n}\n";
++    let checked = session.check_program(&loose(source)).unwrap();
++    josh_protocol::Validate::validate(&checked).unwrap();
++    assert!(checked.diagnostics.is_empty());
++    let [entry] = checked.entries.as_slice() else {
++        panic!("one entry");
++    };
++    assert_eq!(entry.name, "main");
++    assert_eq!(
++        entry.input_descriptor["properties"]["name"],
++        serde_json::json!({"type":"string"})
++    );
++    assert_eq!(
++        entry.output_descriptor,
++        serde_json::json!({"type":"integer"})
++    );
++    let debug = checked.debug.as_ref().unwrap();
++    assert_eq!(debug.constructs.len(), 1);
++    assert_eq!(debug.constructs[0].line, Some(4));
++    // Checking allocates no program ID.
++    let loaded = session.load_program(&loose(source)).unwrap();
++    assert_eq!(loaded.program_id, "program-1");
++    assert_eq!(Some(loaded.artifact_digest), checked.artifact_digest);
++    assert_eq!(loaded.entries, checked.entries);
++}
+diff --git a/crates/josh-protocol/src/handshake.rs b/crates/josh-protocol/src/handshake.rs
+index ff82814..74c566e 100644
+--- a/crates/josh-protocol/src/handshake.rs
++++ b/crates/josh-protocol/src/handshake.rs
+@@ -111,7 +111,7 @@ impl Validate for InitializeParams {
+             }
+             _ => {
+                 return Err(invalid(
+-                    "josh/1.7 invoking_session_id does not match execution_mode",
++                    "josh/1.8 invoking_session_id does not match execution_mode",
+                 ));
+             }
+         }
+diff --git a/crates/josh-protocol/src/payload.rs b/crates/josh-protocol/src/payload.rs
+index cbef499..a40b6b6 100644
+--- a/crates/josh-protocol/src/payload.rs
++++ b/crates/josh-protocol/src/payload.rs
+@@ -443,6 +443,11 @@ pub struct EntryContract {
+     pub output_schema: String,
+     pub input_contract_digest: String,
+     pub output_contract_digest: String,
++    /// Strict boundary descriptors, in the format of typed-response schemas.
++    pub input_descriptor: Value,
++    pub output_descriptor: Value,
++    /// The entry function's sorted declared effects.
++    pub effects: Vec<String>,
+ }
+ 
+ impl Validate for EntryContract {
+@@ -450,6 +455,10 @@ impl Validate for EntryContract {
+         if self.name.is_empty() {
+             return Err(invalid("entry name is empty"));
+         }
++        if !self.input_descriptor.is_object() || !self.output_descriptor.is_object() {
++            return Err(invalid("entry descriptors must be objects"));
++        }
++        validate_sorted_unique(&self.effects, "entry effects")?;
+         validate_digest(&self.input_schema)?;
+         validate_digest(&self.output_schema)?;
+         validate_digest(&self.input_contract_digest)?;
+@@ -457,26 +466,18 @@ impl Validate for EntryContract {
+     }
+ }
+ 
+-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+-#[serde(deny_unknown_fields)]
+-pub struct DiagnosticSpan {
+-    pub uri: String,
+-    pub start: u64,
+-    pub end: u64,
+-}
+-
+-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+-#[serde(deny_unknown_fields)]
+-pub struct DiagnosticLabelSpan {
+-    pub start: u64,
+-    pub end: u64,
+-}
+-
++/// A secondary location that explains a compiler diagnostic.
+ #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+ #[serde(deny_unknown_fields)]
+ pub struct DiagnosticLabel {
+-    pub span: DiagnosticLabelSpan,
+     pub message: String,
++    pub source: String,
++    pub start: u32,
++    pub end: u32,
++    pub line: u32,
++    pub column: u32,
++    pub end_line: u32,
++    pub end_column: u32,
+ }
+ 
+ #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+@@ -486,18 +487,149 @@ pub enum DiagnosticSeverity {
+     Warning,
+ }
+ 
++/// One compiler diagnostic for a source program.
++///
++/// `source` is the host's source-bundle path. `start` and `end` are UTF-8
++/// byte offsets; lines and columns are 1-based, columns count Unicode scalar
++/// values, and `\n`, `\r\n`, and a lone `\r` each end a line.
+ #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+ #[serde(deny_unknown_fields)]
+ pub struct CompilerDiagnostic {
+     pub code: String,
+     pub severity: DiagnosticSeverity,
+     pub message: String,
+-    pub primary: DiagnosticSpan,
++    pub source: String,
++    pub start: u32,
++    pub end: u32,
++    pub line: u32,
++    pub column: u32,
++    pub end_line: u32,
++    pub end_column: u32,
+     pub labels: Vec<DiagnosticLabel>,
+     pub notes: Vec<String>,
+     pub help: Option<String>,
+ }
+ 
++/// Maximum number of diagnostics in one response.
++pub const MAX_DIAGNOSTICS: usize = 64;
++
++impl Validate for CompilerDiagnostic {
++    fn validate(&self) -> Result<(), ProtocolError> {
++        let position = |source: &str, start, end, line, column, end_line, end_column| {
++            !source.is_empty()
++                && source.len() <= 4_096
++                && start <= end
++                && line > 0
++                && column > 0
++                && (line, column) <= (end_line, end_column)
++        };
++        if self.code.is_empty()
++            || self.code.len() > 64
++            || self.message.len() > 1_024
++            || self.labels.len() > 16
++            || self.notes.len() > 16
++            || self.notes.iter().any(|note| note.len() > 1_024)
++            || self.help.as_ref().is_some_and(|help| help.len() > 1_024)
++            || !position(
++                &self.source,
++                self.start,
++                self.end,
++                self.line,
++                self.column,
++                self.end_line,
++                self.end_column,
++            )
++            || self.labels.iter().any(|label| {
++                label.message.len() > 1_024
++                    || !position(
++                        &label.source,
++                        label.start,
++                        label.end,
++                        label.line,
++                        label.column,
++                        label.end_line,
++                        label.end_column,
++                    )
++            })
++        {
++            return Err(invalid("compiler diagnostic is invalid"));
++        }
++        Ok(())
++    }
++}
++
++fn validate_diagnostics(diagnostics: &[CompilerDiagnostic]) -> Result<(), ProtocolError> {
++    if diagnostics.len() > MAX_DIAGNOSTICS {
++        return Err(invalid("too many compiler diagnostics"));
++    }
++    diagnostics.iter().try_for_each(Validate::validate)
++}
++
++/// The `data` of a `program.invalid` wire error for a source program that
++/// does not compile.
++#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
++#[serde(deny_unknown_fields)]
++pub struct ProgramInvalidData {
++    pub diagnostics: Vec<CompilerDiagnostic>,
++}
++
++impl Validate for ProgramInvalidData {
++    fn validate(&self) -> Result<(), ProtocolError> {
++        if self.diagnostics.is_empty() {
++            return Err(invalid("program error data needs a diagnostic"));
++        }
++        validate_diagnostics(&self.diagnostics)
++    }
++}
++
++/// Parameters of `program/check`: the same program forms as `program/load`.
++pub type ProgramCheckParams = ProgramLoadParams;
++
++/// The result of compiling and verifying a program without loading it.
++///
++/// A source program that does not compile has diagnostics and no artifact;
++/// every other field is then empty or null.
++#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
++#[serde(deny_unknown_fields)]
++pub struct ProgramCheckResult {
++    pub diagnostics: Vec<CompilerDiagnostic>,
++    pub artifact_digest: Option<String>,
++    pub entries: Vec<EntryContract>,
++    pub required_tools: Vec<String>,
++    pub exec_commands: Vec<String>,
++    pub exec_environment: Vec<String>,
++    pub debug: Option<ProgramDebugPayload>,
++}
++
++impl Validate for ProgramCheckResult {
++    fn validate(&self) -> Result<(), ProtocolError> {
++        validate_diagnostics(&self.diagnostics)?;
++        if self.diagnostics.is_empty() != self.artifact_digest.is_some() {
++            return Err(invalid(
++                "a check has either diagnostics or an artifact digest",
++            ));
++        }
++        if let Some(digest) = &self.artifact_digest {
++            validate_digest(digest)?;
++        } else if !self.entries.is_empty()
++            || !self.required_tools.is_empty()
++            || !self.exec_commands.is_empty()
++            || !self.exec_environment.is_empty()
++            || self.debug.is_some()
++        {
++            return Err(invalid("a failed check has no program contract"));
++        }
++        for entry in &self.entries {
++            entry.validate()?;
++        }
++        validate_sorted_unique(&self.required_tools, "required_tools")?;
++        if let Some(debug) = &self.debug {
++            debug.validate()?;
++        }
++        Ok(())
++    }
++}
++
+ #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+ #[serde(deny_unknown_fields)]
+ pub struct ProgramLoadResult {
+diff --git a/crates/josh-protocol/src/state.rs b/crates/josh-protocol/src/state.rs
+index b0270cd..c859988 100644
+--- a/crates/josh-protocol/src/state.rs
++++ b/crates/josh-protocol/src/state.rs
+@@ -610,9 +610,8 @@ impl ProtocolTracker {
+             (PeerRole::Host, false) | (PeerRole::Runtime, true) => PeerRole::Host,
+         };
+         let defined_sender = match method {
+-            "initialize" | "host/project" | "catalog/set" | "program/load" | "execution/start" => {
+-                PeerRole::Host
+-            }
++            "initialize" | "host/project" | "catalog/set" | "program/check" | "program/load"
++            | "execution/start" => PeerRole::Host,
+             "tool/invoke" | "agent/message" | "agent/ask" | "agent/transcript"
+             | "permission/request" | "model/request" | "user/ask" | "sub_agent/create"
+             | "sub_agent/run" | "sub_agent/message" | "sub_agent/ask" => PeerRole::Runtime,
+@@ -633,7 +632,7 @@ impl ProtocolTracker {
+             "initialize" => self.state == ConnectionState::New,
+             "host/project" => self.state == ConnectionState::Initialized,
+             "catalog/set" => self.state == ConnectionState::Projected,
+-            "program/load" => matches!(
++            "program/check" | "program/load" => matches!(
+                 self.state,
+                 ConnectionState::CatalogFrozen | ConnectionState::ProgramLoaded
+             ),
+diff --git a/crates/josh-protocol/src/version.rs b/crates/josh-protocol/src/version.rs
+index 771fe4a..6234765 100644
+--- a/crates/josh-protocol/src/version.rs
++++ b/crates/josh-protocol/src/version.rs
+@@ -1,14 +1,16 @@
+-pub const PROTOCOL_VERSION: &str = "josh/1.7";
++pub const PROTOCOL_VERSION: &str = "josh/1.8";
+ pub const LANGUAGE_VERSION: &str = "0.1.1";
+ 
+ pub const FEATURES: &[&str] = &[
+     "agent",
+     "catalog-provenance",
++    "compile-diagnostics",
+     "effect-origin",
+     "exec-run",
+     "external-fs-grants",
+     "host-projection",
+     "model",
++    "program-check",
+     "record-replay",
+     "structured-prompts",
+     "structured-transcript",
+diff --git a/crates/josh-protocol/tests/payload.rs b/crates/josh-protocol/tests/payload.rs
+index 80dfebc..ffa5cfc 100644
+--- a/crates/josh-protocol/tests/payload.rs
++++ b/crates/josh-protocol/tests/payload.rs
+@@ -330,8 +330,8 @@ fn initialize_result_features_are_exact() {
+ }
+ 
+ #[test]
+-fn exec_grants_use_the_strict_josh_1_7_start_contract() {
+-    assert_eq!(PROTOCOL_VERSION, "josh/1.7");
++fn exec_grants_use_the_strict_josh_1_8_start_contract() {
++    assert_eq!(PROTOCOL_VERSION, "josh/1.8");
+     assert!(FEATURES.contains(&"exec-run"));
+     let value = json!({
+         "execution_id":"exec-1",
+@@ -1052,3 +1052,67 @@ fn program_debug_tables_validate_identifiers_and_regions() {
+         assert!(parse(invalid.clone()).is_err(), "accepted {invalid}");
+     }
+ }
++
++#[test]
++fn compiler_diagnostics_and_program_checks_are_bounded_and_consistent() {
++    let diagnostic = json!({
++        "code":"E3007","severity":"error","message":"unknown name 'missing'",
++        "source":"src/main.allen","start":40,"end":47,"line":3,"column":3,"end_line":3,"end_column":10,
++        "labels":[{"message":"declared here","source":"src/main.allen","start":0,"end":3,"line":1,"column":1,"end_line":1,"end_column":4}],
++        "notes":[],"help":null
++    });
++    let parse = |value: serde_json::Value| {
++        serde_json::from_value::<josh_protocol::ProgramInvalidData>(value)
++            .map_err(|error| error.to_string())
++            .and_then(|data| {
++                data.validate()
++                    .map(|()| data)
++                    .map_err(|error| error.to_string())
++            })
++    };
++    let data = parse(json!({"diagnostics":[diagnostic.clone()]})).unwrap();
++    assert_eq!(data.diagnostics[0].labels.len(), 1);
++    assert!(parse(json!({"diagnostics":[]})).is_err());
++    assert!(parse(json!({"diagnostics":vec![diagnostic.clone(); 65]})).is_err());
++    for (key, value) in [
++        ("line", json!(0)),
++        ("column", json!(0)),
++        ("end_line", json!(2)),
++        ("start", json!(50)),
++        ("source", json!("")),
++        ("code", json!("")),
++        ("severity", json!("fatal")),
++        ("message", json!("x".repeat(1_025))),
++    ] {
++        let mut invalid = diagnostic.clone();
++        invalid[key] = value;
++        assert!(
++            parse(json!({"diagnostics":[invalid.clone()]})).is_err(),
++            "{invalid}"
++        );
++    }
++    let mut unknown = diagnostic.clone();
++    unknown["span"] = json!({});
++    assert!(parse(json!({"diagnostics":[unknown]})).is_err());
++
++    let check = |value: serde_json::Value| {
++        serde_json::from_value::<josh_protocol::ProgramCheckResult>(value)
++            .map_err(|error| error.to_string())
++            .and_then(|result| result.validate().map_err(|error| error.to_string()))
++    };
++    let failed = json!({"diagnostics":[diagnostic],"artifact_digest":null,"entries":[],
++        "required_tools":[],"exec_commands":[],"exec_environment":[],"debug":null});
++    check(failed.clone()).unwrap();
++    let mut both = failed.clone();
++    both["artifact_digest"] = json!(format!("sha256:{}", "a".repeat(64)));
++    assert!(check(both).is_err());
++    let mut tools_without_artifact = failed;
++    tools_without_artifact["required_tools"] = json!(["example.lookup"]);
++    assert!(check(tools_without_artifact).is_err());
++    let passed = json!({"diagnostics":[],"artifact_digest":format!("sha256:{}", "a".repeat(64)),
++        "entries":[],"required_tools":[],"exec_commands":[],"exec_environment":[],"debug":null});
++    check(passed.clone()).unwrap();
++    let mut neither = passed;
++    neither["artifact_digest"] = json!(null);
++    assert!(check(neither).is_err());
++}
+diff --git a/crates/josh-protocol/tests/state.rs b/crates/josh-protocol/tests/state.rs
+index 8765ecd..407f08f 100644
+--- a/crates/josh-protocol/tests/state.rs
++++ b/crates/josh-protocol/tests/state.rs
+@@ -723,3 +723,43 @@ fn permission_decision_event_requires_an_active_execution() {
+         ReceiveAction::NotificationAccepted
+     );
+ }
++
++#[test]
++fn program_check_is_a_host_request_valid_once_the_catalog_is_frozen() {
++    let mut runtime = ProtocolTracker::new(PeerRole::Runtime, 8);
++    runtime.receive(&request("init", "initialize")).unwrap();
++    runtime.initialize_succeeded().unwrap();
++    runtime.commit_response("init").unwrap();
++    assert_eq!(
++        runtime
++            .receive(&request("early", "program/check"))
++            .unwrap_err()
++            .code,
++        WireErrorCode::RequestInvalidState
++    );
++    runtime
++        .receive(&request("projection", "host/project"))
++        .unwrap();
++    runtime.projection_succeeded().unwrap();
++    runtime.commit_response("projection").unwrap();
++    runtime.receive(&request("catalog", "catalog/set")).unwrap();
++    runtime.catalog_succeeded().unwrap();
++    runtime.commit_response("catalog").unwrap();
++    runtime.receive(&request("check", "program/check")).unwrap();
++    runtime.commit_response("check").unwrap();
++    // A check does not load a program, so execution still cannot start.
++    assert_eq!(
++        runtime
++            .receive(&request("run", "execution/start"))
++            .unwrap_err()
++            .code,
++        WireErrorCode::RequestInvalidState
++    );
++    let mut host = ProtocolTracker::new(PeerRole::Runtime, 8);
++    assert_eq!(
++        host.register_outgoing_request("check", "program/check")
++            .unwrap_err()
++            .code,
++        WireErrorCode::RequestMethodNotFound
++    );
++}
+diff --git a/crates/josh/tests/tool_roundtrip.rs b/crates/josh/tests/tool_roundtrip.rs
+index f7e7262..bc82659 100644
+--- a/crates/josh/tests/tool_roundtrip.rs
++++ b/crates/josh/tests/tool_roundtrip.rs
+@@ -3071,3 +3071,114 @@ fn runtime_failures_report_the_failing_source_span() {
+         "10 / zero"
+     );
+ }
++
++#[test]
++#[allow(clippy::too_many_lines)]
++fn program_check_and_failed_loads_return_structured_diagnostics_over_raw_stdio() {
++    let broken = "export fn main() returns Int {\n  let value = 1;\n  value + missing\n}\n";
++    let working = "export fn main() returns Int {\n  mut total = 0;\n  for step in 0..3 { total += step; }\n  total\n}\n";
++    let bundle = |source: &str| ProgramLoadParams::SourceBundle {
++        files: vec![SourceFile {
++            path: "src/main.allen".to_owned(),
++            encoding: FileEncoding::Utf8,
++            content: source.to_owned(),
++        }],
++    };
++    let initialize = InitializeParams {
++        host: PeerInfo {
++            name: "check-host".to_owned(),
++            version: "1.0.0".to_owned(),
++        },
++        protocol_versions: vec![josh_protocol::PROTOCOL_VERSION.to_owned()],
++        language_versions: vec![">=0.1.0, <0.2.0".to_owned()],
++        execution_mode: ExecutionMode::Unattended,
++        invoking_session_id: InvokingSessionId::Null,
++        standard_capabilities: Vec::new(),
++        limits: limits(),
++        extensions: Vec::new(),
++    };
++    let catalog = json!({"schema_dialect":josh_protocol::SCHEMA_DIALECT,"metadata":{"source":"test-host","source_revision":"1","observed_at_unix_ms":1,"freshness":"current","complete":true},"tools":[]});
++    let mut child = Command::new(env!("CARGO_BIN_EXE_josh"))
++        .arg("serve")
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::piped())
++        .spawn()
++        .unwrap();
++    let mut stdin = child.stdin.take().unwrap();
++    let mut reader = FrameReader::new(
++        child.stdout.take().unwrap(),
++        josh_protocol::DEFAULT_MAX_FRAME_BYTES,
++    );
++    receive(&mut reader);
++    let mut response = |id: &str| match receive(&mut reader) {
++        WireMessage::Response {
++            id: response,
++            result,
++            error,
++        } if response == id => (result, error),
++        other => panic!("unexpected {other:?}"),
++    };
++    send(&mut stdin, "h-1", "initialize", &initialize);
++    let (initialized, _) = response("h-1");
++    let features = initialized.unwrap()["features"].clone();
++    assert!(
++        features
++            .as_array()
++            .unwrap()
++            .contains(&json!("program-check"))
++    );
++    assert!(
++        features
++            .as_array()
++            .unwrap()
++            .contains(&json!("compile-diagnostics"))
++    );
++    send(
++        &mut stdin,
++        "h-p",
++        "host/project",
++        &projection_value(&json!(initialize), &catalog),
++    );
++    response("h-p");
++    send(&mut stdin, "h-2", "catalog/set", &catalog);
++    response("h-2");
++
++    send(&mut stdin, "h-3", "program/check", &bundle(broken));
++    let (checked, error) = response("h-3");
++    assert!(error.is_none());
++    let checked = checked.unwrap();
++    assert_eq!(checked["artifact_digest"], json!(null));
++    let diagnostics = checked["diagnostics"].clone();
++    assert_eq!(diagnostics[0]["source"], "src/main.allen");
++    assert_eq!(
++        (&diagnostics[0]["line"], &diagnostics[0]["column"]),
++        (&json!(3), &json!(11))
++    );
++
++    send(&mut stdin, "h-4", "program/load", &bundle(broken));
++    let (loaded, error) = response("h-4");
++    assert!(loaded.is_none());
++    let error = error.unwrap();
++    assert_eq!(error.code, WireErrorCode::ProgramInvalid);
++    assert_eq!(error.message, "source program does not compile");
++    assert_eq!(error.data.unwrap()["diagnostics"], diagnostics);
++
++    send(&mut stdin, "h-5", "program/check", &bundle(working));
++    let (checked, _) = response("h-5");
++    let checked = checked.unwrap();
++    assert_eq!(checked["diagnostics"], json!([]));
++    assert_eq!(
++        checked["entries"][0]["output_descriptor"],
++        json!({"type":"integer"})
++    );
++    assert_eq!(checked["debug"]["constructs"][0]["kind"], "for");
++    // A check leaves no program behind: the first load gets the first ID.
++    send(&mut stdin, "h-6", "program/load", &bundle(working));
++    let (loaded, _) = response("h-6");
++    let loaded = loaded.unwrap();
++    assert_eq!(loaded["program_id"], "program-1");
++    assert_eq!(loaded["artifact_digest"], checked["artifact_digest"]);
++    drop(stdin);
++    assert!(child.wait().unwrap().success());
++}
+diff --git a/docs/agents/README.md b/docs/agents/README.md
+index 128edcc..17ca585 100644
+--- a/docs/agents/README.md
++++ b/docs/agents/README.md
+@@ -12,7 +12,7 @@ adapter merely to execute an ALLEN file.
+ Default to:
+ 
+ - language `0.1` (the current evolving early-alpha profile);
+-- protocol `josh/1.7`;
++- protocol `josh/1.8`;
+ - unattended mode when no existing invoking-agent session was supplied;
+ - attached mode only when the host supplied a real opaque invoking-session ID;
+ - one loose `.allen` file and no package manifest until the program actually
+diff --git a/docs/agents/reference/josh-protocol.md b/docs/agents/reference/josh-protocol.md
+index cf048b9..64d71d4 100644
+--- a/docs/agents/reference/josh-protocol.md
++++ b/docs/agents/reference/josh-protocol.md
+@@ -1,6 +1,6 @@
+ # JOSH protocol reference for AI agents
+ 
+-Status: Operational guide for the current `josh/1.7` protocol
++Status: Operational guide for the current `josh/1.8` protocol
+ 
+ Entry point: [`docs/agents/README.md`](../README.md). The implementation
+ specification is authoritative for runtime behavior.
+@@ -75,7 +75,7 @@ negotiated protocol version:
+   "method": "initialize",
+   "params": {
+     "host": {"name": "allen-host", "version": "0.1.0"},
+-    "protocol_versions": ["josh/1.7"],
++    "protocol_versions": ["josh/1.8"],
+     "language_versions": [">=0.1.0, <0.2.0"],
+     "execution_mode": "attached",
+     "invoking_session_id": "session-1",
+@@ -97,11 +97,12 @@ negotiated protocol version:
+ stable `invoking_session_id`; unattended mode sends it as `null`. Limits and
+ standard capability names are canonical, bounded, sorted, and unique.
+ 
+-The runtime either selects `josh/1.7` and language `0.1.1` or rejects
++The runtime either selects `josh/1.8` and language `0.1.1` or rejects
+ initialization. Its result returns the runtime identity, effective limits, and
+ these exact feature strings:
+-`agent`, `catalog-provenance`, `effect-origin`, `exec-run`, `external-fs-grants`,
+-`host-projection`, `model`, `record-replay`, `structured-prompts`,
++`agent`, `catalog-provenance`, `compile-diagnostics`, `effect-origin`,
++`exec-run`, `external-fs-grants`, `host-projection`, `model`, `program-check`,
++`record-replay`, `structured-prompts`,
+ `structured-transcript`, `sub-agents`, `typed-responses`, `typed-tools`, and
+ `user-interaction`.
+ There is no minor-version fallback or alternate feature set.
+@@ -206,7 +207,19 @@ The artifact verifier independently derives the exact required site set from
+ the exhaustive nominal record-path provenance stored for each direction.
+ It also returns sorted `exec_commands` and `exec_environment` lists from the
+ verified manifest contract. These expose names and patterns, never environment
+-values.
++values. Each entry also carries `input_descriptor` and `output_descriptor`
++(typed-response schema descriptors) and its sorted declared `effects`.
++
++A source program that does not compile fails `program/load` with
++`program.invalid` and `data.diagnostics`: each has `code`, `severity`,
++`message`, bundle-path `source`, byte `start`/`end`, 1-based `line`,
++`column`, `end_line`, `end_column`, `labels`, `notes`, and `help`. Spanless
++failures (manifest or entry boundary) are one `E3005` at 1:1 of
++`src/main.allen` (or `allen.toml`). `program/check` takes the load parameters,
++creates no program ID, and returns `diagnostics`, `artifact_digest`,
++`entries`, `required_tools`, `exec_commands`, `exec_environment`, and `debug`;
++a program that does not compile is a successful check with diagnostics. Check
++and load return identical diagnostics for the same source and catalog.
+ 
+ The result's `debug` field is `null` without artifact debug information.
+ Otherwise it holds static `constructs` (control-flow constructs with `id`,
+@@ -300,7 +313,7 @@ omit raw input, output, stderr, credentials, and temporary paths. The runner
+ never retries, calls `executor resume`, opens an approval flow, or falls back
+ to a shell, agent, model, or another provider.
+ 
+-This route uses the current `josh/1.7` `tool/invoke` contract unchanged. It
++This route uses the current `josh/1.8` `tool/invoke` contract unchanged. It
+ does not add a method, feature string, or alternate protocol version. Recording
+ stores the validated tool boundary result, and replay uses that result without
+ starting Executor.
+@@ -482,7 +495,7 @@ must not produce a second terminal response or expose internal error detail.
+ 
+ When writing or reviewing a JOSH client:
+ 
+-1. Offer only `josh/1.7`.
++1. Offer only `josh/1.8`.
+ 2. Send `initialize` exactly once.
+ 3. Use strict `Content-Length` framing and exact JSON shapes.
+ 4. Keep request IDs unique per direction while active.
+@@ -490,6 +503,7 @@ When writing or reviewing a JOSH client:
+ 6. Match catalog metadata and count to the projected tools section.
+ 7. Freeze the catalog before loading any program.
+ 8. Read exact `required_tools` from `program/load`; do not infer grants from source.
++   Show `error.data.diagnostics` when a source load fails.
+ 9. Never request authority absent from the loaded program contract.
+ 10. Preserve attached session identity on all `agent/*` calls.
+ 11. Treat opaque handles as execution-local and nonserializable.
+diff --git a/docs/conformance/host-0.1.json b/docs/conformance/host-0.1.json
+index 955fd38..1fb24db 100644
+--- a/docs/conformance/host-0.1.json
++++ b/docs/conformance/host-0.1.json
+@@ -4,7 +4,7 @@
+   "completed_on": "2026-08-30",
+   "language_versions": ["0.1.1"],
+   "bytecode_versions": [20],
+-  "protocol_versions": ["josh/1.7"],
++  "protocol_versions": ["josh/1.8"],
+   "required": {
+     "agent_and_typed_response_operations": "conforming",
+     "canary_secret_scans": "conforming",
+diff --git a/docs/implementation-spec.md b/docs/implementation-spec.md
+index e6651cf..fd15185 100644
+--- a/docs/implementation-spec.md
++++ b/docs/implementation-spec.md
+@@ -28,7 +28,7 @@ The workspace uses these crates:
+ | `allen-http-get` | Restricted HTTPS GET and destination policy |
+ | `allen-testkit` | Deterministic recording, replay, redaction, and provider test support |
+ | `allen-cli` | `check`, `build`, `inspect`, `run`, and package commands |
+-| `josh-protocol` | The current `josh/1.7` message, payload, framing, and connection-state contract |
++| `josh-protocol` | The current `josh/1.8` message, payload, framing, and connection-state contract |
+ | `josh-host` | JOSH session lifecycle, provider adapters, stdio connection, and execution supervision |
+ | `josh` | The `serve` and `run` executable entry points |
+ 
+@@ -446,7 +446,7 @@ or an output limit. It never invokes a shell or retries.
+ ## 10. Current JOSH protocol
+ 
+ JOSH uses the fixed envelope marker `josh/1` and negotiates the sole current
+-protocol version `josh/1.7`. Each frame is an ASCII header
++protocol version `josh/1.8`. Each frame is an ASCII header
+ `Content-Length: <decimal byte count>\r\n`, the exact header
+ `Content-Type: application/josh+json; charset=utf-8\r\n`, an empty `\r\n`
+ line, and exactly that many UTF-8 JSON bytes. The default frame limit is
+@@ -458,12 +458,13 @@ invalid header, ends early, or is not strict JSON closes the connection after
+ active work is cancelled; `josh serve` exits unsuccessfully and names the
+ reason on stderr.
+ 
+-The host sends `initialize` once with `protocol_versions: ["josh/1.7"]`, one
++The host sends `initialize` once with `protocol_versions: ["josh/1.8"]`, one
+ execution mode, an invoking-session identity or `null`, limits, and standard
+ capabilities.
+-The runtime selects `josh/1.7` or rejects initialization. The result contains
++The runtime selects `josh/1.8` or rejects initialization. The result contains
+ the runtime identity, effective limits, and the current feature set, including
+-`host-projection` and `effect-origin`. There is no minor-version fallback.
++`host-projection`, `effect-origin`, `compile-diagnostics`, and
++`program-check`. There is no minor-version fallback.
+ 
+ The required connection prefix is
+ `initialize -> host/project -> catalog/set`. `host/project` is a host-to-runtime
+@@ -565,7 +566,40 @@ searching source text. `execution/start` also adds sorted canonical
+ declares support for those fields. Unknown fields, malformed names or patterns,
+ duplicates, and unsorted lists are protocol errors.
+ 
+-### 10.1 Effect origins
++Each loaded entry reports its name, strict input and output schema digests,
++directional contract digests, `input_descriptor` and `output_descriptor` in
++the typed-response schema descriptor format, and the entry function's sorted
++declared `effects`.
++
++### 10.1 Compile diagnostics and program checks
++
++With the `compile-diagnostics` feature, a `source_bundle` that does not compile
++against the frozen catalog fails `program/load` with `program.invalid`, message
++`source program does not compile`, and `data: {"diagnostics": [...]}`. Other
++load failures, such as a malformed bundle or an invalid artifact, carry no
++data. Each diagnostic has `code`, `severity` (`error`), `message` (at most
++1,024 bytes), `source` (the bundle path), UTF-8 byte offsets `start` and
++`end`, 1-based `line`, `column`, `end_line`, and `end_column`, `labels` (each
++with `message` and the same position fields), `notes`, and `help`. Columns
++count Unicode scalar values, and `\n`, `\r\n`, and a lone `\r` each end one
++line, exactly as in rendered compiler errors. A failure without a source span,
++such as an invalid inline manifest or a non-serializable entry boundary, is
++one `E3005` diagnostic at offset 0 of `src/main.allen`, or of `allen.toml` for
++a package. At most 64 diagnostics are returned, and the runtime keeps only as
++many as fit in one quarter of the negotiated frame limit.
++
++With the `program-check` feature, `program/check` takes the same parameters as
++`program/load`, is valid in the same states, and compiles and verifies the
++program without creating a program ID. Its result has `diagnostics`,
++`artifact_digest`, `entries`, `required_tools`, `exec_commands`,
++`exec_environment`, and `debug`, with the meanings they have for
++`program/load`. A source program that does not compile is a successful check
++with diagnostics, a `null` digest and debug, and empty lists. A malformed
++bundle or invalid artifact fails the request as `program/load` would. Every
++path uses the same compiler entry point, so a check and a load of the same
++source against the same catalog return identical diagnostics.
++
++### 10.2 Effect origins
+ 
+ The `effect-origin` feature reports where each provider request came from.
+ Every runtime-to-host request (`tool/invoke`, `model/request`, `user/ask`,
+@@ -648,7 +682,7 @@ and `truncated`:
+ - The runtime stops adding entries before the tables exceed one quarter of the
+   negotiated frame limit and then sets `truncated: true`.
+ 
+-### 10.2 Headless Executor tool provider
++### 10.3 Headless Executor tool provider
+ 
+ `josh run --executor` enables one unattended tool provider. A repeatable
+ `--grant-tool <name>` grants only that exact canonical catalog name;
+@@ -692,7 +726,7 @@ stderr, credentials, or paths.
+ 
+ This adapter does not retry, run `executor resume`, open an approval flow, or
+ fall back to a shell, agent, model, or another provider. It uses the existing
+-`josh/1.7` `tool/invoke` request and response shapes, so it adds no protocol
++`josh/1.8` `tool/invoke` request and response shapes, so it adds no protocol
+ method, feature string, or compatibility branch. Current recording captures
+ the validated tool boundary result; replay returns that recorded result and
+ does not start Executor.
+diff --git a/docs/naming.md b/docs/naming.md
+index 4eb51a3..56dbaba 100644
+--- a/docs/naming.md
++++ b/docs/naming.md
+@@ -38,7 +38,7 @@ Public JOSH names are:
+ - `josh/1`, the protocol family
+ - `josh-*`, host and protocol Rust crates
+ 
+-Peers currently negotiate `josh/1.7`. They reject other protocol identifiers.
++Peers currently negotiate `josh/1.8`. They reject other protocol identifiers.
+ The `/1` suffix is not part of the executable name.
+ 
+ ## Dependency rule
+diff --git a/plugins/josh-allen/mcp/server.py b/plugins/josh-allen/mcp/server.py
+index ab0151f..929c553 100755
+--- a/plugins/josh-allen/mcp/server.py
++++ b/plugins/josh-allen/mcp/server.py
+@@ -29,7 +29,7 @@ JOSH_RESPONSE_TIMEOUT_SECONDS = 30
+ # MCP version used by the local stdio clients supported by this plugin.
+ MCP_PROTOCOL_VERSION = "2025-06-18"
+ JOSH_PROTOCOL = "josh/1"
+-JOSH_PROTOCOL_VERSION = "josh/1.7"
++JOSH_PROTOCOL_VERSION = "josh/1.8"
+ JOSH_LIMITS = {
+     "max_frame_bytes": MAX_FRAME_BYTES,
+     "max_active_requests": 64,
+diff --git a/roadmap/proposals/PD-10.md b/roadmap/proposals/PD-10.md
+index 28087e4..fb1ce3f 100644
+--- a/roadmap/proposals/PD-10.md
++++ b/roadmap/proposals/PD-10.md
+@@ -12,7 +12,7 @@ The shipped MVP adds an opt-in Executor CLI provider to `josh run`. The
+ provider dispatches an already typed and granted ALLEN tool through a
+ user-installed and configured `executor` command.
+ 
+-The MVP uses the current ALLEN `0.1` tool model and the current `josh/1.7`
++The MVP uses the current ALLEN `0.1` tool model and the current `josh/1.8`
+ protocol. It does not add dynamic tool lookup, automatic catalog import, or a
+ new language effect.
+ 
+@@ -403,7 +403,7 @@ and PD-7 contracts when those designs exist.
+ 8. Focused CLI and fake-executor tests cover dispatch, denial, output bounds,
+    deadline handling, shell separation, stderr redaction, and cleanup.
+ 
+-The MVP keeps the ALLEN language, artifact, replay, and `josh/1.7` wire
++The MVP keeps the ALLEN language, artifact, replay, and `josh/1.8` wire
+ contracts unchanged.
+ 
+ ## Acceptance contract

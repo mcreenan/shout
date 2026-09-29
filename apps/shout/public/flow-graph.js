@@ -2,14 +2,17 @@
 // Events become steps (flow.js); a run's steps become a control-flow tree from their `origin` (scopeTree);
 // the tree becomes rows of nodes, edges and frames (phases). The canvas lays each row out left to right
 // under the previous one, using measured card sizes.
-import { buildFlow, LOOPS, loopTitle, stepFailed, toolResult, branchLabel, sourceLine, clip } from './flow.js';
+import { buildFlow, LOOPS, loopTitle, stepFailed, toolResult, branchLabel, spanText, programShape, clip } from './flow.js';
 
 const READ_TOOL = /read|inspect|search|list|git\.run|find|guide|check/;
 const isContext = (step) => step.kind === 'tool' && READ_TOOL.test(step.label) && !/edit|apply|write|test|commit/.test(step.label);
 const isHub = (step) => step.pair === 'model' || step.pair === 'chat';
 const shown = (message) => message.role === 'user' || message.role === 'assistant';
 const taskOf = (step) => step.events.find((event) => event.type === 'model.started')?.prompt?.system?.slice(0, 120) || step.pair;
-const where = (entry) => entry.construct ?? `${entry.line}:${entry.column}`;
+// A construct compiled more than once (an arm body under an or-pattern) keeps its span: the span, not the id, is the construct.
+const where = (entry) => (Number.isInteger(entry.start) ? `${entry.start}-${entry.end}` : entry.construct ?? `${entry.line}:${entry.column}`);
+const spanOf = (entry) => ({ line: entry.line, column: entry.column, endLine: entry.end_line, endColumn: entry.end_column });
+const shortName = (name) => String(name || '').split('::').pop();
 const isLive = (status) => status === 'active' || status === 'waiting';
 const statusOf = (step) => (step.status === 'active' && step.pair === 'user' ? 'waiting' : step.status);
 // Canvas-worthy steps: calls and questions, errors and cancellations. Effect placeholders, the agent
@@ -21,11 +24,15 @@ const visible = (step) => !step.orphan && (step.pair
 /* Control flow: a run's steps as a tree of loops (one container per iteration), parallel blocks (one
    track per task) and steps. Pure; everything degrades to a flat list when steps carry no origin. */
 
-// The loops and await blocks around a step, outermost first. Keys follow the whole path (calls
-// included), so a loop entered again, as a new instance or from another call site, is a new group.
+// The loops and parallel blocks around a step, outermost first, keyed by the whole path (calls included)
+// so a loop entered again, as a new instance or from another call site, is a new group. An await block's
+// track is the task spawned directly in it, or else the task running the block; a task spawned outside
+// any await block opens a block of its own where it was spawned. `at` is the entry's scope index.
 function structure(origin) {
   const path = [];
   let prefix = '';
+  let task = 0;
+  let block = null;
   origin.scope.forEach((entry, at) => {
     if (entry.kind === 'call') prefix += `/${entry.instruction ?? where(entry)}`;
     else if (LOOPS.has(entry.kind)) {
@@ -34,9 +41,15 @@ function structure(origin) {
       path.push({ type: 'loop', key, entry, at, iteration });
       prefix = `${key}.${iteration}`;
     } else if (entry.kind === 'await_block') {
-      const key = `${prefix}/await${where(entry)}`;
-      path.push({ type: 'parallel', key, entry, at });
-      prefix = `${key}@${origin.task}`;
+      block = { type: 'parallel', key: `${prefix}/await${where(entry)}`, entry, at, track: task, owner: task, spawn: null };
+      path.push(block);
+      prefix = block.key;
+    } else if (entry.kind === 'spawn') {
+      const task_ = entry.task ?? task + 1;
+      if (block && !block.spawn && block.owner === task) Object.assign(block, { track: task_, spawn: entry });
+      else { block = { type: 'parallel', key: `${prefix}/spawned`, spawned: true, entry, at, track: task_, owner: task, spawn: entry }; path.push(block); prefix = block.key; }
+      task = task_;
+      prefix += `@${task}`;
     }
   });
   return path;
@@ -51,21 +64,22 @@ function chipFor(container, origin, to) {
   container.branches = keys;
   return taken.filter((_, i) => !before.includes(keys[i])).at(-1) || null;
 }
-function trackName(origin, at, task) {
-  const call = origin?.scope.slice(at + 1).find((entry) => entry.kind === 'call');
+// A track is named by the function its task runs: the spawn that started it, or the first call inside.
+function trackName(origin, part) {
+  const call = part.spawn || origin?.scope.slice(part.at + 1).find((entry) => entry.kind === 'call');
   const name = call?.function || origin?.site?.function;
-  return { name: name ? String(name).split('::').pop() : `task ${task}`, call };
+  return { name: name ? shortName(name) : part.track ? `task ${part.track}` : 'main', call };
 }
-// Tracks running the same function are told apart by their call as written, e.g. `summarize("src/csv.mjs")`.
+// Tracks running the same function are told apart by their call as written, e.g. `size_of("a.mjs")`.
 function trackTitles(tracks, source) {
   const names = tracks.map((track) => track.name);
   return tracks.map((track) => {
     if (names.indexOf(track.name) === names.lastIndexOf(track.name)) return track.name;
-    const text = sourceLine(source, track.call?.line).slice(Math.max(0, (track.call?.column || 1) - 1)).replace(/^(spawn|await)\s+/, '').replace(/;\s*$/, '').trim();
+    const text = (track.call ? spanText(source, spanOf(track.call)) : '').replace(/\s+/g, ' ').replace(/^(spawn|await)\s+/, '').replace(/;\s*$/, '').trim();
     return text.startsWith(track.name) ? clip(text, 48) : `${track.name} · ${track.task}`;
   });
 }
-function enter(container, part, step, task) {
+function enter(container, part, step) {
   const last = container.items.at(-1);
   if (part.type === 'loop') {
     let loop = last?.type === 'loop' && last.key === part.key ? last : null;
@@ -75,9 +89,9 @@ function enter(container, part, step, task) {
     return iteration;
   }
   let block = last?.type === 'parallel' && last.key === part.key ? last : null;
-  if (!block) container.items.push(block = { type: 'parallel', key: part.key, spawned: !!part.spawned, tracks: [], chip: chipFor(container, step.origin, part.at) });
-  let track = block.tracks.find((candidate) => candidate.task === task);
-  if (!track) block.tracks.push(track = { task, key: `${part.key}@${task}`, ...trackName(step.origin, part.at, task), items: [], at: part.at });
+  if (!block) container.items.push(block = { type: 'parallel', key: part.key, spawned: !!part.spawned, until: part.until, tracks: [], chip: chipFor(container, step.origin, part.at) });
+  let track = block.tracks.find((candidate) => candidate.task === part.track);
+  if (!track) block.tracks.push(track = { task: part.track, key: `${part.key}@${part.track}`, ...trackName(step.origin, part), items: [], at: part.at });
   return track;
 }
 // A block with one track was not parallel after all: its steps rejoin the surrounding sequence.
@@ -98,31 +112,27 @@ function settle(items) {
  * A run's steps (in order) as a control-flow tree. Items:
  *   { type: 'step', step, chip }                       chip: the if/match entry this step entered, if any
  *   { type: 'loop', key, entry, chip, iterations: [{ index, items }] }
- *   { type: 'parallel', key, chip, tracks: [{ task, key, name, items }] }
- * Steps without an origin (host approvals) stay where the step before them was.
+ *   { type: 'parallel', key, chip, tracks: [{ task, key, name, call, items }] }
+ * Steps without an origin (host approvals) stay where the step before them was. While tasks spawned
+ * outside an await block are still going, the spawner's own steps join their block as its track.
  */
 export function scopeTree(steps) {
   const root = { items: [], at: -1 };
-  const lastOf = new Map();
-  steps.forEach((step, i) => { if (step.origin) lastOf.set(step.origin.task, i); });
   let path = [];
-  let task = null;
-  let main = null;
+  const paths = steps.map((step) => (path = step.origin ? structure(step.origin) : path));
+  const until = new Map();
+  paths.forEach((parts, i) => { for (const part of parts) if (part.spawned) until.set(part.key, Math.max(until.get(part.key) ?? 0, steps[i].end ?? Infinity)); });
   steps.forEach((step, i) => {
-    if (step.origin) { path = structure(step.origin); task = step.origin.task; main ??= task; }
-    let parts = path;
-    if (task !== null && !parts.some((part) => part.type === 'parallel')) {
-      // Tasks spawned outside any await block, and the main task while they are still going,
-      // share one parallel block at the top.
-      const last = root.items.at(-1);
-      const going = last?.spawned && last.tracks.some((track) => track.task !== main && lastOf.get(track.task) > i);
-      if (task !== main || going) {
-        const key = last?.spawned ? last.key : `/tasks${i}`;
-        parts = [{ type: 'parallel', key, at: -1, spawned: true }, ...parts.map((part) => ({ ...part, key: `${key}@${task}${part.key}` }))];
-      }
-    }
     let container = root;
-    for (const part of parts) container = enter(container, part, step, task);
+    const parts = paths[i];
+    for (let depth = 0; depth <= parts.length; depth++) {
+      const part = parts[depth];
+      const last = container.items.at(-1);
+      if (last?.spawned && last.key !== part?.key && step.start < last.until && last.tracks.some((track) => track.task !== (part?.owner ?? step.origin?.task))) {
+        container = enter(container, { type: 'parallel', key: last.key, at: container.at, track: part?.owner ?? step.origin?.task ?? 0 }, step);
+      }
+      if (part) container = enter(container, { ...part, until: until.get(part.key) }, step);
+    }
     container.items.push({ type: 'step', step, chip: chipFor(container, step.origin, step.origin?.scope.length ?? 0) });
   });
   return settle(root.items);
@@ -133,53 +143,69 @@ export function leaves(items) {
 
 /* Graph */
 function stepNode(step) {
+  // A fan-out to sub-agents is one fleet card; its agents are found by `group`, the spawn's effect ID.
+  if (step.pair === 'tool' && step.label === 'agents.spawn') return { id: step.id, type: 'fleet', kind: 'agent', status: statusOf(step), step, group: step.events.find((event) => event.type === 'tool.started')?.effectId ?? null };
   const type = isHub(step) ? 'hub' : step.pair === 'user' ? 'approval' : step.kind === 'tool' ? 'tool' : 'note';
   return { id: step.id, type, kind: step.pair === 'user' ? 'user' : step.kind, status: statusOf(step), step };
 }
-function messageNode(message) {
-  return { id: message.id, type: 'msg', kind: message.role === 'user' ? 'user' : 'harness', status: 'ok', message };
+// Replies are SHOUT's, or the sub-agent's whose canvas this is (`actor`).
+function messageNode(message, actor) {
+  return { id: message.id, type: 'msg', kind: message.role === 'user' ? 'user' : actor?.kind || 'harness', status: 'ok', message };
 }
-const chipOf = (entry, source) => entry && { label: branchLabel(entry), title: clip(sourceLine(source, entry.line).trim(), 120), line: entry.line };
-// One line for a step inside a tile or row: what it is and how it came out.
-function activity(step) {
+const chipOf = (entry, ctx) => entry && { ...branchLabel(entry, ctx), line: entry.line };
+// What a step came to, in a few words: a tool's result or argument, a judgment's summary, a question's title.
+function outcomeOf(step) {
   if (!step) return '';
-  const result = step.pair === 'tool' ? toolResult(step) : '';
-  const detail = result || step.detail || '';
-  return step.pair === 'model' ? 'Model' : `${step.label}${detail ? ` · ${detail}` : ''}`;
+  if (step.pair === 'model') {
+    // Only the latest attempt's answer: a retry in progress has none yet.
+    const value = (step.attempts?.at(-1)?.events ?? step.events).findLast((event) => event.type === 'model.completed')?.value;
+    const text = [value?.summary, value?.markdown, value?.text].find((candidate) => typeof candidate === 'string' && candidate.trim());
+    return text ? clip(text.replace(/\*\*|`/g, ''), 90) : '';
+  }
+  return (step.pair === 'tool' && toolResult(step)) || step.detail || '';
 }
+// One line for a step inside a tile: what it is and how it came out.
+const activity = (step) => (step ? `${step.label}${outcomeOf(step) ? ` · ${outcomeOf(step)}` : ''}` : '');
 function pip(step) {
   const kind = stepFailed(step) ? 'x' : isHub(step) ? 'm' : step.pair === 'user' ? 'w' : 't';
   return isLive(statusOf(step)) ? `${kind} live` : kind;
 }
-// Iterations, stacks and tracks summarise their steps the same way.
-function summary(steps) {
+// Iterations, stacks and tracks summarise their steps the same way. An iteration or a task failed if any
+// of its steps did; a stack (one step per iteration) reads as failed only when its latest step did.
+function summary(steps, { any = true } = {}) {
   const start = Math.min(...steps.map((step) => step.start));
   const end = steps.every((step) => step.end !== null) ? Math.max(...steps.map((step) => step.end)) : null;
   const statuses = steps.map(statusOf);
   const failed = steps.filter(stepFailed).length;
-  const status = statuses.includes('waiting') ? 'waiting' : statuses.includes('active') ? 'active' : stepFailed(steps.at(-1)) ? 'failed' : statuses.every((value) => value === 'stale') ? 'stale' : 'ok';
+  const status = statuses.includes('waiting') ? 'waiting' : statuses.includes('active') ? 'active' : (any ? failed : stepFailed(steps.at(-1))) ? 'failed' : statuses.every((value) => value === 'stale') ? 'stale' : 'ok';
   const current = steps.find((step) => isLive(statusOf(step))) || steps.at(-1);
-  return { start, end, status, failed, activity: activity(current), pips: steps.map(pip) };
+  return { start, end, status, failed, activity: activity(current), outcome: outcomeOf(current), pips: steps.map(pip) };
 }
 
+// The prose older sessions recorded for an answer (session.mjs `answer`).
+const ECHO_PROSE = /^(?:Apply these changes(?: and run the configured tests)?\.|Decline these changes\.|Decline this command\.|Run `[\s\S]+`\.|Answered: [\s\S]+)$/;
 // Messages and run blocks in time order; your message sorts before the run it triggered, replies after.
 function timeline(session, segments, now) {
   const items = [];
   const runs = segments.filter((segment) => segment.run);
-  // Answering a question also records a user message; the approval card already shows the answer.
+  // Answering a question also records the answer in the chat as `message.echo`; the approval card
+  // already shows it. Sessions from before `echo` have only its prose, recorded just after the answer:
+  // those are hidden only when both the words and the moment match.
   const answers = segments.flatMap((segment) => segment.steps.flatMap((step) => step.events)).filter((event) => event.type === 'user.answered').map((event) => Date.parse(event.time));
-  for (const message of session.messages || []) {
+  const echo = (message, time) => !!message.echo || (!('echo' in message) && message.role === 'user' && ECHO_PROSE.test(String(message.content).trim()) && answers.some((at) => time >= at && time - at < 2000));
+  (session.messages || []).forEach((message, order) => {
     const time = Date.parse(message.time);
-    if (!shown(message) || time > now || (message.role === 'user' && answers.some((at) => Math.abs(time - at) < 2000))) continue;
+    if (!shown(message) || time > now || echo(message, time)) return;
     // Runs are drawn whole: anything said while one was going sorts after it.
     const inside = runs.find((segment) => time > segment.start && time < (segment.end ?? Infinity));
-    items.push({ time: inside?.end ?? time, rank: message.role === 'user' ? 0 : 2, message });
-  }
+    items.push({ time: inside?.end ?? time, rank: message.role === 'user' ? 0 : 2, message, order });
+  });
   for (const segment of segments) {
     if (segment.run) items.push({ time: segment.start, rank: 1, run: segment });
     else for (const step of segment.steps) if (visible(step)) items.push({ time: step.start, rank: 1, step, segment });
   }
-  return items.sort((a, b) => a.time - b.time || a.rank - b.rank);
+  // Messages stamped in the same millisecond keep the order they were said in.
+  return items.sort((a, b) => a.time - b.time || (a.message && b.message ? a.order - b.order : a.rank - b.rank));
 }
 
 /**
@@ -188,12 +214,13 @@ function timeline(session, segments, now) {
  * With it, steps follow their program: loops become stacks (one step per iteration) or groups (tiles,
  * one iteration expanded in a frame), await blocks become parallel tracks, branches become chips.
  * `ui` holds the canvas's choices: `open` (group id → iteration index, or null once closed by hand)
- * and `stacks` (ids of stacks listing their steps).
+ * and `stacks` (ids of stacks listing their steps). `actor` ({ name, kind }) says whose replies these
+ * are when the canvas shows a sub-agent. A fan-out to sub-agents (`agents.spawn`) is a fleet node alone in its row.
  * Returns { rows: [{ key, kind, ids, open, close }], nodes, edges, frames, focus, index } where rows
  * name the frames that start before / end after them and `index` maps step and message ids to
  * { step | message, segment, node } (node: the id of the card showing it).
  */
-export function phases({ session, events, now = Date.now(), live = false, ui = {} }) {
+export function phases({ session, events, now = Date.now(), live = false, ui = {}, actor = null }) {
   const choices = ui.open || new Map();
   const stacks = ui.stacks || new Set();
   const nodes = [];
@@ -231,7 +258,7 @@ export function phases({ session, events, now = Date.now(), live = false, ui = {
     const node = stepNode(step);
     if (chip) node.chip = chip;
     index.set(step.id, { step, segment, node: node.id });
-    if (!heuristic) return add(node, row('step'));
+    if (!heuristic || node.type === 'fleet') return add(node, row(node.type === 'fleet' ? 'fleet' : 'step'));
     if (isHub(step)) {
       const task = taskOf(step);
       // Another batch of the same judgment joins its siblings' row, fed by the same inputs.
@@ -255,10 +282,10 @@ export function phases({ session, events, now = Date.now(), live = false, ui = {
     // Closed unless chosen; while it runs, the live iteration shows.
     const openIndex = choice === undefined ? running?.index ?? null : iterations.some((iteration) => iteration.index === choice) ? choice : null;
     const all = iterations.flatMap((iteration) => iteration.steps);
-    const { start, end, status } = summary(all);
+    const { start, end, status } = summary(all, { any: false });
     return {
       id, type: 'group', kind: 'vm', title, loop: item.entry.kind, status: isLive(status) ? status : iterations.at(-1).status === 'failed' ? 'failed' : status === 'stale' ? 'stale' : 'ok',
-      start, end, ended: !running, failed: iterations.filter((iteration) => iteration.failed).length, open: openIndex, chip: chipOf(item.chip, ctx.source),
+      start, end, ended: !running, failed: iterations.filter((iteration) => iteration.failed).length, open: openIndex, chip: chipOf(item.chip, ctx),
       iterations: iterations.map(({ items, steps, ...rest }) => rest),
     };
   }
@@ -268,11 +295,11 @@ export function phases({ session, events, now = Date.now(), live = false, ui = {
     const labels = new Set(steps.map((step) => step.label));
     return {
       id, type: 'stack', kind: steps[0].pair === 'user' ? 'user' : steps[0].kind, title: labels.size === 1 ? steps[0].label : title, bare: labels.size === 1,
-      steps, ...summary(steps), ended: !(ctx.running && steps.includes(ctx.last)), open: stacks.has(id), chip: chipOf(item.chip, ctx.source),
+      steps, ...summary(steps, { any: false }), ended: !(ctx.running && steps.includes(ctx.last)), open: stacks.has(id), chip: chipOf(item.chip, ctx),
     };
   }
   function placeItem(item, ctx) {
-    if (item.type === 'step') return leaf(item.step, ctx.segment, chipOf(item.chip, ctx.source), false);
+    if (item.type === 'step') return leaf(item.step, ctx.segment, chipOf(item.chip, ctx), false);
     if (item.type === 'parallel') {
       const target = row('tracks');
       const titles = trackTitles(item.tracks, ctx.source);
@@ -280,7 +307,7 @@ export function phases({ session, events, now = Date.now(), live = false, ui = {
         const id = `${ctx.segment.run}${track.key}`;
         const steps = leaves(track.items);
         hide(steps, ctx, id);
-        add({ id, type: 'track', kind: 'vm', title: titles[i], steps, ...summary(steps), chip: i ? null : chipOf(item.chip, ctx.source) }, target);
+        add({ id, type: 'track', kind: 'vm', title: titles[i], steps, ...summary(steps), chip: i ? null : chipOf(item.chip, ctx) }, target);
       });
       return close();
     }
@@ -308,7 +335,7 @@ export function phases({ session, events, now = Date.now(), live = false, ui = {
 
   for (const item of timeline(session, buildFlow(events, { live, now }), now)) {
     if (item.message) {
-      const node = messageNode(item.message);
+      const node = messageNode(item.message, actor);
       index.set(node.id, { message: item.message, node: node.id });
       add(node, row('message'));
       close();
@@ -319,7 +346,7 @@ export function phases({ session, events, now = Date.now(), live = false, ui = {
       const steps = segment.steps.filter(visible);
       if (!steps.length) continue;
       const run = session.runs?.find((candidate) => candidate.id === segment.run);
-      const ctx = { segment, source: run?.source, running: segment.end === null, last: steps.at(-1) };
+      const ctx = { segment, source: run?.source, shape: programShape(segment.program), running: segment.end === null, last: steps.at(-1) };
       const label = run?.skill ? `/${run.skill}` : run?.generated ? 'program' : '';
       framed({ key: `run:${segment.run}`, kind: 'run', run: segment.run, label, state: segment.end === null ? 'active' : segment.state }, () => {
         if (steps.some((step) => step.origin)) place(scopeTree(steps), ctx);

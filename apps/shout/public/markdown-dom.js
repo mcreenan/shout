@@ -31,7 +31,7 @@ function appendInline(container, nodes, options) {
       } else if (target?.kind === 'file') {
         link = el('a', 'file-link');
         link.href = '#';
-        link.title = `Open ${target.path}`;
+        link.title = target.path;
         link.addEventListener('click', (event) => { event.preventDefault(); options.openFile?.(target.path); });
       } else link = el('span');
       appendInline(link, node.children, options);

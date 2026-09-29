@@ -8,6 +8,12 @@ const SCENARIO_ROOT = fileURLToPath(new URL('../scenarios/', import.meta.url));
 const MAX_FILES = 200;
 const MAX_FILE_BYTES = 256 * 1024;
 const MAX_CONTEXT_BYTES = 512 * 1024;
+const MAX_CHANGES = 32;
+// Opening a FIFO for reading would block a file-system worker until a writer appears; nonblocking opens
+// return at once and the descriptor is then checked to be a regular file.
+const READ_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+// A byte order mark stays part of the text, so what is read, compared and written back agree.
+const decode = buffer => new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(buffer);
 const BLOCKED = /^(?:\..*|node_modules|vendor|target|dist|build|coverage|secrets?|credentials?)(?:$)/i;
 const SECRET_FILE = /(?:^|[._-])(?:env|secrets?|credentials?|private[_-]?key)(?:[._-]|$)|\.(?:pem|key|p12|pfx)$/i;
 const TEXT_FILE = /\.(?:[cm]?[jt]sx?|json|md|txt|css|html|svg|py|rs|go|java|rb|sh|ya?ml|toml|allen|sql)$/i;
@@ -152,14 +158,15 @@ export class Workspace {
 
   async read(relative) {
     const filename = await this.resolveFile(relative);
-    const handle = await fs.open(filename, constants.O_RDONLY | constants.O_NOFOLLOW);
+    if (!(await fs.lstat(filename)).isFile()) throw new Error(`Not a bounded text file: ${relative}`);
+    const handle = await fs.open(filename, READ_FLAGS);
     try {
       const stat = await handle.stat();
       if (!stat.isFile() || stat.size > MAX_FILE_BYTES) throw new Error(`Not a bounded text file: ${relative}`);
       if (stat.nlink > 1) throw new Error(`Hardlinked files are not allowed: ${relative}`);
       const buffer = await handle.readFile();
       if (buffer.length > MAX_FILE_BYTES || buffer.includes(0)) throw new Error(`Not a bounded text file: ${relative}`);
-      return new TextDecoder('utf-8', { fatal: true }).decode(buffer);
+      return decode(buffer);
     } finally { await handle.close(); }
   }
 
@@ -182,25 +189,7 @@ export class Workspace {
   }
 
   async applyNow(changes, signal) {
-    signal?.throwIfAborted();
-    if (!Array.isArray(changes) || changes.length === 0 || changes.length > 32) throw new Error('Patch must contain 1–32 changes');
-    const seen = new Set();
-    let bytes = 0;
-    const plans = [];
-    for (const change of changes) {
-      if (!change || typeof change.before !== 'string' || typeof change.after !== 'string') throw new Error('Each change requires path, before, and after strings');
-      const filename = await this.resolveFile(change.path, { allowMissing: true });
-      if (seen.has(filename)) throw new Error(`Duplicate patch path: ${change.path}`);
-      seen.add(filename);
-      if (Buffer.byteLength(change.after) > MAX_FILE_BYTES || change.after.includes('\0')) throw new Error(`Patch is not bounded text: ${change.path}`);
-      bytes += Buffer.byteLength(change.after);
-      if (bytes > MAX_CONTEXT_BYTES) throw new Error('Patch exceeds 512 KiB');
-      let exists = true;
-      let before;
-      try { before = await this.read(change.path); } catch (error) { if (error.code !== 'ENOENT') throw error; exists = false; before = ''; }
-      if (before !== change.before) throw new Error(`Stale patch: ${change.path} no longer matches the proposed before content`);
-      plans.push({ ...change, filename, exists });
-    }
+    const plans = await this.preflight(changes, { signal });
     const changed = [];
     try {
       for (const plan of plans) {
@@ -210,14 +199,14 @@ export class Workspace {
         await fs.mkdir(path.dirname(plan.filename), { recursive: true });
         await this.resolveFile(plan.path, { allowMissing: true });
         signal?.throwIfAborted();
-        const handle = await fs.open(plan.filename, plan.exists ? constants.O_RDWR | constants.O_NOFOLLOW : constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+        const handle = await fs.open(plan.filename, plan.exists ? constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK : constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
         // Creating a new file is already a mutation, even if cancellation prevents its contents.
         if (!plan.exists) changed.push(plan.path);
         try {
           const stat = await handle.stat();
           if (!stat.isFile() || stat.size > MAX_FILE_BYTES) throw new Error(`Not a bounded text file: ${plan.path}`);
           if (stat.nlink > 1) throw new Error(`Hardlinked files are not allowed: ${plan.path}`);
-          if (plan.exists && (await handle.readFile('utf8')) !== plan.before) throw new Error(`Stale patch: ${plan.path} changed during apply`);
+          if (plan.exists && decode(await handle.readFile()) !== plan.before) throw new Error(`Stale patch: ${plan.path} changed during apply`);
           // Writes are per-file. Later failures can leave earlier approved files changed.
           signal?.throwIfAborted();
           if (plan.exists) changed.push(plan.path);
@@ -240,6 +229,34 @@ export class Workspace {
       failure.changed = changed;
       throw failure;
     }
+  }
+
+  /**
+   * Checks a change set without writing anything: 1–32 distinct allowed paths, bounded text, and each
+   * `before` equal to the file's current content. Run before asking for approval, and again by apply.
+   */
+  async preflight(changes, { signal } = {}) {
+    signal?.throwIfAborted();
+    if (!Array.isArray(changes) || changes.length === 0) throw new Error(`Patch must contain 1–${MAX_CHANGES} changes`);
+    if (changes.length > MAX_CHANGES) throw new Error(`One change can touch at most ${MAX_CHANGES} files; this one touches ${changes.length}. Split it into smaller changes.`);
+    const seen = new Set();
+    let bytes = 0;
+    const plans = [];
+    for (const change of changes) {
+      if (!change || typeof change.before !== 'string' || typeof change.after !== 'string') throw new Error('Each change requires path, before, and after strings');
+      const filename = await this.resolveFile(change.path, { allowMissing: true });
+      if (seen.has(filename)) throw new Error(`Duplicate patch path: ${change.path}`);
+      seen.add(filename);
+      if (Buffer.byteLength(change.after) > MAX_FILE_BYTES || change.after.includes('\0')) throw new Error(`Patch is not bounded text: ${change.path}`);
+      bytes += Buffer.byteLength(change.after);
+      if (bytes > MAX_CONTEXT_BYTES) throw new Error('Patch exceeds 512 KiB');
+      let exists = true;
+      let before;
+      try { before = await this.read(change.path); } catch (error) { if (error.code !== 'ENOENT') throw error; exists = false; before = ''; }
+      if (before !== change.before) throw new Error(`Stale patch: ${change.path} no longer matches the proposed before content`);
+      plans.push({ ...change, filename, exists });
+    }
+    return plans;
   }
 
   async test({ signal } = {}) {

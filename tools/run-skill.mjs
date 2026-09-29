@@ -40,7 +40,8 @@ session.on('snapshot', () => {
   const question = session.data.question;
   if (!question || question.handled) return;
   question.handled = true;
-  console.log(`\n[question:${question.kind}] ${question.title ?? question.prompt?.system ?? ''}${question.command ? `\n$ ${question.command}` : ''}`);
+  const title = question.title || question.prompt?.system || (question.kind === 'ask' ? 'Question' : question.command ? 'Run this command?' : 'Approve these changes?');
+  console.log(`\n[question:${question.kind}] ${title}${question.command ? `\n$ ${question.command}` : ''}`);
   for (const change of question.prompt?.data?.value?.changes ?? []) console.log(`  change: ${change.path} (${change.before.length} → ${change.after.length} chars)`);
   let value;
   if (question.kind === 'approval' && options.approve !== null) value = { accept: options.approve };

@@ -1,32 +1,70 @@
 import { spawn, execFileSync } from 'node:child_process';
 import { EventEmitter, once } from 'node:events';
-import { accessSync, constants, createWriteStream, readFileSync } from 'node:fs';
+import { accessSync, constants, createWriteStream, existsSync, readFileSync } from 'node:fs';
 import { delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseEnv } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 
-export const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
+const here = dirname(fileURLToPath(import.meta.url));
+export const repoRoot = resolve(here, '../../..');
 const executable = path => { try { accessSync(path, constants.X_OK); return true; } catch { return false; } };
+// A local server needs the SHOUT checkout around apps/desktop; the standalone client bundle has none.
+export const localServerAvailable = existsSync(join(repoRoot, 'tools/start-gui.sh')) && existsSync(join(repoRoot, 'apps/shout/src/server.mjs')) && resolve(repoRoot, 'apps/desktop') === resolve(here, '..');
 
 // Settings resolve like the server's own: the real environment wins over the repo .env that start-gui.sh loads.
-export function readSettings(env = process.env, root = repoRoot) {
+export function readSettings(env = process.env, root = localServerAvailable ? repoRoot : null) {
   let file = {};
-  try { file = parseEnv(readFileSync(join(root, '.env'), 'utf8')); } catch { /* .env is optional */ }
+  if (root) try { file = parseEnv(readFileSync(join(root, '.env'), 'utf8')); } catch { /* .env is optional */ }
   return name => env[name] ?? file[name];
 }
 
 // The window always talks to the server over loopback unless SHOUT is bound to one specific address.
 export const connectHost = bind => !bind || bind === '0.0.0.0' || bind === '::' ? '127.0.0.1' : bind.includes(':') ? `[${bind}]` : bind;
 
-// 'shout' when a SHOUT server answers, 'free' when nothing listens, 'busy' when something else owns the port.
-export async function probe(origin, timeout = 2000) {
-  try {
-    const response = await fetch(`${origin}/api/config`, { signal: AbortSignal.timeout(timeout), redirect: 'error' });
-    const config = await response.json().catch(() => null);
-    return response.ok && Array.isArray(config?.scenarios) && typeof config?.provider === 'object' && 'defaultWorkspace' in config ? 'shout' : 'busy';
-  } catch (error) { return error.cause?.code === 'ECONNREFUSED' ? 'free' : 'busy'; }
+// Accepts what people paste ("host", "host:4310", "http://host:4310/#session-…") and returns the http(s) origin.
+// SHOUT only serves from the root of its host, so path, query and fragment are dropped.
+export function normalizeServerUrl(input) {
+  const raw = typeof input === 'string' ? input.trim() : '';
+  if (!raw) throw new Error('Enter the address of a SHOUT server, for example http://my-computer:4310');
+  if (raw.length > 2048) throw new Error('That address is too long');
+  const schemeless = !/^[a-z][a-z0-9+.-]*:\/\//i.test(raw);
+  let url;
+  try { url = new URL(schemeless ? `http://${raw}` : raw); } catch { throw new Error(`"${raw.slice(0, 200)}" is not a valid address`); }
+  if (!['http:', 'https:'].includes(url.protocol)) throw new Error('Only http:// and https:// server addresses are supported');
+  if (url.username || url.password) throw new Error('Server addresses cannot contain a user name or password');
+  if (!url.hostname) throw new Error('The address needs a host name');
+  // A bare host name means SHOUT's default port. URL drops a scheme's own default ("host:80" has port ''), so an
+  // explicit port is read from what was typed.
+  const explicitPort = /^(?:\[[^\]]*\]|[^/?#:[\]]*):\d+(?:[/?#]|$)/.test(raw);
+  if (schemeless && !explicitPort) url.port = '4310';
+  return url.origin;
 }
+
+const reasons = {
+  ECONNREFUSED: 'Nothing is accepting connections at this address. Is SHOUT running there?',
+  ENOTFOUND: 'The host name could not be found.', EAI_AGAIN: 'The host name could not be looked up (DNS is unavailable).',
+  EHOSTUNREACH: 'The host is unreachable from this computer.', ENETUNREACH: 'The network is unreachable from this computer.',
+  ECONNRESET: 'The connection was reset.', ETIMEDOUT: 'The connection timed out.',
+};
+
+// state is 'shout' when a SHOUT server answers, 'free' when nothing listens, 'busy' when something else answers or the check fails;
+// error explains a failure in words a person can act on.
+export async function check(origin, timeout = 2000) {
+  let response;
+  try { response = await fetch(`${origin}/api/config`, { signal: AbortSignal.timeout(timeout), redirect: 'error', headers: { accept: 'application/json' } }); }
+  catch (error) {
+    const code = error.cause?.code ?? error.name;
+    const reason = reasons[code] ?? (code === 'TimeoutError' || code === 'AbortError' ? `The server did not answer within ${timeout / 1000} s.`
+      : error.cause?.message === 'bad port' ? 'Browsers block this port for safety; run SHOUT on another port.' : error.cause?.message || error.message);
+    return { state: code === 'ECONNREFUSED' ? 'free' : 'busy', error: reason };
+  }
+  const config = await response.json().catch(() => null);
+  if (response.ok && Array.isArray(config?.scenarios) && typeof config?.provider === 'object' && 'defaultWorkspace' in config) return { state: 'shout', error: '', config };
+  if (response.status === 403 && /host/i.test(config?.error ?? '')) return { state: 'busy', error: 'SHOUT refused this host name. Use an address the server accepts (its LAN or Tailscale IP or name), or add this one to SHOUT_ALLOWED_HOSTS on the server.' };
+  return { state: 'busy', error: `This address answered, but not as a SHOUT server (HTTP ${response.status}${config?.error ? `: ${String(config.error).slice(0, 200)}` : ''}).` };
+}
+export const probe = async (origin, timeout) => (await check(origin, timeout)).state;
 
 // The server spawns CLIs and SDKs that expect a real Node, never Electron's embedded one.
 export function findNode(env = process.env) {
@@ -60,6 +98,7 @@ export class OwnedServer extends EventEmitter {
     const log = this.logFile ? createWriteStream(this.logFile, { flags: 'a' }) : null;
     log?.on('error', () => {}); log?.write(`\n--- ${new Date().toISOString()} starting SHOUT on port ${this.port || 'auto'}\n`);
     const child = this.child = spawn('bash', [join(this.root, 'tools/start-gui.sh')], { cwd: this.root, env: { ...this.env, PORT: String(this.port) }, detached: true, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+    this.pgid = child.pid; // detached: the server leads its own process group, which can outlive it
     for (const [stream, echo] of [[child.stdout, process.stdout], [child.stderr, process.stderr]]) {
       let partial = '';
       stream.on('data', chunk => {
@@ -85,13 +124,21 @@ export class OwnedServer extends EventEmitter {
     });
   }
 
-  // SIGTERM lets the server close sessions; the process group catches setup steps and leftover agent processes.
+  // SIGTERM lets the server close sessions. The process group is then cleared on its own terms, because setup steps
+  // and agent CLIs can outlive the server (or ignore SIGTERM): SIGTERM, a grace period, then SIGKILL.
   async stop(timeout = 5000) {
-    const child = this.child; if (!child) return; this.stopping = true;
-    const exited = once(child, 'exit');
-    const kill = (target, signal) => { try { process.kill(target, signal); } catch { /* already gone */ } };
-    kill(this.ready ? child.pid : -child.pid, 'SIGTERM');
-    if (await Promise.race([exited.then(() => false), delay(timeout).then(() => true)])) { kill(-child.pid, 'SIGKILL'); await exited; }
-    kill(-child.pid, 'SIGTERM');
+    const child = this.child, group = this.pgid; this.stopping = true;
+    if (!group) return;
+    if (child) {
+      const exited = once(child, 'exit');
+      signal(this.ready ? child.pid : -group, 'SIGTERM');
+      if (await Promise.race([exited.then(() => false), delay(timeout).then(() => true)])) { signal(-group, 'SIGKILL'); await exited; }
+    }
+    signal(-group, 'SIGTERM');
+    for (const end = Date.now() + Math.min(timeout, 2000); groupAlive(group) && Date.now() < end;) await delay(100);
+    if (groupAlive(group)) signal(-group, 'SIGKILL');
   }
 }
+
+const signal = (target, name) => { try { process.kill(target, name); } catch { /* already gone */ } };
+const groupAlive = group => { try { process.kill(-group, 0); return true; } catch (error) { return error.code === 'EPERM'; } };

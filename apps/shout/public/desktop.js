@@ -2,7 +2,12 @@
 // in a normal browser it is null and every helper degrades to a harmless browser equivalent or no-op.
 export const desktop = globalThis.shoutDesktop ?? null;
 export const isDesktop = desktop !== null;
-export const chrome = desktop?.chrome ?? Object.freeze({ titlebar: 'none', overlayHeight: 0, overlayWidth: 0 });
+export const chrome = desktop?.chrome ?? Object.freeze({ titlebar: 'none', overlayHeight: 0, overlayWidth: 0, insetLeft: 0 });
+// Remote: the app shows a SHOUT server on another computer. Project paths live there, so the native folder chooser
+// and file manager do not apply (revealPath/openPath reject); use SHOUT's server-side directory browser instead.
+export const isRemote = desktop?.remote === true;
+export const canPickFolder = isDesktop && !isRemote;
+export const canRevealPath = isDesktop && !isRemote;
 // Commands the application menu sends through onMenuCommand.
 export const menuCommands = Object.freeze(['new-thread', 'add-project', 'export-session', 'toggle-theme', 'toggle-sidebar']);
 

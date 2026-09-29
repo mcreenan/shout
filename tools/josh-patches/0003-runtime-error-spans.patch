@@ -1,0 +1,342 @@
+SHOUT JOSH/ALLEN patch 0003-runtime-error-spans: source spans in JOSH runtime failures
+Base: mcreenan/josh-allen abb8a9782fc438d1b87e8aa2fdaea65e5db633c3 plus the earlier patches in this directory.
+Generated from branch shout/effect-origin of .worktrees/josh-allen:
+  git diff --binary --src-prefix=a/ --dst-prefix=b/ 1050d51 afb57a9
+Commits:
+  afb57a9 Report the failing source span in JOSH runtime failures
+
+diff --git a/crates/allen-cli/tests/cli.rs b/crates/allen-cli/tests/cli.rs
+index 351c89e..d22773d 100644
+--- a/crates/allen-cli/tests/cli.rs
++++ b/crates/allen-cli/tests/cli.rs
+@@ -935,7 +935,7 @@ task_event sequence=8 task_id=0 owner_id=0 kind=completed\n";
+     assert!(source_run.status.success());
+     assert_eq!(
+         String::from_utf8(source_run.stdout.clone()).unwrap(),
+-        "[\"pkg/x696e6c696e65/x302e312e30/x737263/x7461736b2d6465627567.allen::answer\",1,{\"tag\":\"Some\",\"value\":\"pkg://inline@0.1.0/src/task-debug.allen:30..38\"},0,\"ready\",42]\n"
++        "[\"pkg/x696e6c696e65/x302e312e30/x737263/x7461736b2d6465627567.allen::answer\",1,{\"tag\":\"Some\",\"value\":\"pkg://inline@0.1.0/src/task-debug.allen:34..36\"},0,\"ready\",42]\n"
+     );
+     assert_eq!(
+         String::from_utf8(source_run.stderr.clone()).unwrap(),
+diff --git a/crates/allen-compiler/src/frontend/bytecode_lowering.rs b/crates/allen-compiler/src/frontend/bytecode_lowering.rs
+index 152b82a..e952b04 100644
+--- a/crates/allen-compiler/src/frontend/bytecode_lowering.rs
++++ b/crates/allen-compiler/src/frontend/bytecode_lowering.rs
+@@ -5029,6 +5029,26 @@ impl FunctionLowering<'_, '_> {
+     pub(super) fn compile_expression(
+         &mut self,
+         expression: &LoweredExpr,
++    ) -> Result<CompiledExpr, Diagnostic> {
++        let first = self.code.len();
++        let value = self.compile_expression_inner(expression)?;
++        self.mark_unmarked_instructions(first, expression.span);
++        Ok(value)
++    }
++
++    /// Give each instruction emitted since `first` that has no span the span
++    /// of the innermost expression that emitted it. Debug locations then name
++    /// the failing expression of a runtime trap instead of the function body.
++    fn mark_unmarked_instructions(&mut self, first: usize, span: Span) {
++        for instruction in first..self.code.len() {
++            self.instruction_spans.entry(instruction).or_insert(span);
++        }
++    }
++
++    #[allow(clippy::too_many_lines)]
++    fn compile_expression_inner(
++        &mut self,
++        expression: &LoweredExpr,
+     ) -> Result<CompiledExpr, Diagnostic> {
+         match &expression.kind {
+             LoweredExprKind::Unit => {
+@@ -11736,6 +11756,19 @@ impl FunctionLowering<'_, '_> {
+         expression: &LoweredExpr,
+         expected: &ValueType,
+         label: &str,
++    ) -> Result<CompiledExpr, Diagnostic> {
++        let first = self.code.len();
++        let value = self.compile_expected_inner(expression, expected, label)?;
++        self.mark_unmarked_instructions(first, expression.span);
++        Ok(value)
++    }
++
++    #[allow(clippy::too_many_lines)]
++    fn compile_expected_inner(
++        &mut self,
++        expression: &LoweredExpr,
++        expected: &ValueType,
++        label: &str,
+     ) -> Result<CompiledExpr, Diagnostic> {
+         if let LoweredExprKind::ShortClosure { parameters, body } = &expression.kind {
+             return self.compile_short_closure(parameters, body, expected, expression.span);
+diff --git a/crates/allen-runtime/src/error.rs b/crates/allen-runtime/src/error.rs
+index 87ce025..057cd90 100644
+--- a/crates/allen-runtime/src/error.rs
++++ b/crates/allen-runtime/src/error.rs
+@@ -1,4 +1,4 @@
+-use allen_vm::VmError;
++use allen_vm::{SourceLocation, VmError};
+ 
+ use crate::ResponseAuditRecord;
+ 
+@@ -64,6 +64,9 @@ pub struct RuntimeError {
+     pub message: String,
+     /// Content-free response audit entries collected before this failure.
+     pub response_audit: Vec<ResponseAuditRecord>,
++    /// Source span of the innermost failing instruction, when a VM failure
++    /// occurred in an artifact with debug information.
++    pub location: Option<SourceLocation>,
+ }
+ 
+ impl RuntimeError {
+@@ -72,6 +75,7 @@ impl RuntimeError {
+             code,
+             message: message.into(),
+             response_audit: Vec::new(),
++            location: None,
+         }
+     }
+ 
+@@ -79,6 +83,11 @@ impl RuntimeError {
+         self.response_audit = response_audit;
+         self
+     }
++
++    pub(crate) fn with_location(mut self, location: Option<SourceLocation>) -> Self {
++        self.location = location;
++        self
++    }
+ }
+ 
+ impl std::fmt::Display for RuntimeError {
+diff --git a/crates/allen-runtime/src/lib.rs b/crates/allen-runtime/src/lib.rs
+index efcb60e..5db3302 100644
+--- a/crates/allen-runtime/src/lib.rs
++++ b/crates/allen-runtime/src/lib.rs
+@@ -2003,7 +2003,9 @@ pub fn execute_prepared_with_context(
+             VmError::ProgramFailed { reason } if !reason.is_empty() => reason.clone(),
+             _ => safe_terminal_message(code).to_owned(),
+         };
+-        RuntimeError::new(code, message).with_response_audit(response_audit.clone())
++        RuntimeError::new(code, message)
++            .with_response_audit(response_audit.clone())
++            .with_location(error.frames.first().and_then(|frame| frame.source.clone()))
+     })?;
+     let output = prepared_output;
+     Ok(RuntimeOutcome {
+diff --git a/crates/josh-host/src/origin.rs b/crates/josh-host/src/origin.rs
+index 9f3368c..226c560 100644
+--- a/crates/josh-host/src/origin.rs
++++ b/crates/josh-host/src/origin.rs
+@@ -215,6 +215,17 @@ impl ProgramDebug {
+         }
+     }
+ 
++    /// Render a span in one debug source path, with host paths and positions.
++    #[must_use]
++    pub fn source_span(&self, module_path: &str, start: u32, end: u32) -> Option<SourceSpan> {
++        let source = self
++            .debug
++            .sources
++            .iter()
++            .position(|source| source == module_path)?;
++        Some(self.span(u32::try_from(source).ok()?, start, end))
++    }
++
+     /// The source span of one instruction.
+     fn location(&self, function: FunctionId, instruction: u32) -> Option<SourceSpan> {
+         let index = self
+diff --git a/crates/josh-host/src/session.rs b/crates/josh-host/src/session.rs
+index c622143..5e41123 100644
+--- a/crates/josh-host/src/session.rs
++++ b/crates/josh-host/src/session.rs
+@@ -171,7 +171,7 @@ impl PreparedExecution {
+                 ExecutionOutcome::Stopped { reason, .. } => stopped_result(reason),
+             },
+             Err(error) => ExecutionResult::Failed {
+-                error: runtime_error(&error),
++                error: runtime_error(&error, self.program.debug.as_deref()),
+             },
+         }
+     }
+@@ -932,13 +932,34 @@ fn host_policy(params: &ExecutionStartParams, catalog: &FrozenCatalog) -> HostPo
+     }
+ }
+ 
+-fn runtime_error(error: &RuntimeError) -> josh_protocol::ProtocolRuntimeError {
++fn runtime_error(
++    error: &RuntimeError,
++    debug: Option<&ProgramDebug>,
++) -> josh_protocol::ProtocolRuntimeError {
++    // The failing instruction's span, rendered like an effect-origin site.
++    let span = error.location.as_ref().and_then(|location| {
++        let span = debug?.source_span(&location.module_path, location.start, location.end)?;
++        let mut value = serde_json::json!({
++            "source": span.source,
++            "start": span.start,
++            "end": span.end,
++        });
++        if let (Some(line), Some(column), Some(end_line), Some(end_column)) =
++            (span.line, span.column, span.end_line, span.end_column)
++        {
++            value["line"] = line.into();
++            value["column"] = column.into();
++            value["end_line"] = end_line.into();
++            value["end_column"] = end_column.into();
++        }
++        Some(value)
++    });
+     let mut result = josh_protocol::ProtocolRuntimeError {
+         code: error.code.as_str().to_owned(),
+         message: error.message.clone(),
+         category: "runtime".to_owned(),
+         retryable: false,
+-        span: None,
++        span,
+         operation_id: None,
+         metadata: BTreeMap::new(),
+         causes: Vec::new(),
+diff --git a/crates/josh/tests/tool_roundtrip.rs b/crates/josh/tests/tool_roundtrip.rs
+index 66242fe..f7e7262 100644
+--- a/crates/josh/tests/tool_roundtrip.rs
++++ b/crates/josh/tests/tool_roundtrip.rs
+@@ -2980,3 +2980,94 @@ export async fn main() returns String effects [model.request, user.ask, tool.exa
+         (&json!(20), &json!(10))
+     );
+ }
++
++#[test]
++fn runtime_failures_report_the_failing_source_span() {
++    let source =
++        "export fn main() returns Int {\n  let zero = 0;\n  let total = 10 / zero;\n  total\n}\n";
++    let initialize = InitializeParams {
++        host: PeerInfo {
++            name: "span-host".to_owned(),
++            version: "1.0.0".to_owned(),
++        },
++        protocol_versions: vec![josh_protocol::PROTOCOL_VERSION.to_owned()],
++        language_versions: vec![">=0.1.0, <0.2.0".to_owned()],
++        execution_mode: ExecutionMode::Unattended,
++        invoking_session_id: InvokingSessionId::Null,
++        standard_capabilities: Vec::new(),
++        limits: limits(),
++        extensions: Vec::new(),
++    };
++    let catalog = json!({"schema_dialect":josh_protocol::SCHEMA_DIALECT,"metadata":{"source":"test-host","source_revision":"1","observed_at_unix_ms":1,"freshness":"current","complete":true},"tools":[]});
++    let load = ProgramLoadParams::SourceBundle {
++        files: vec![SourceFile {
++            path: "src/main.allen".to_owned(),
++            encoding: FileEncoding::Utf8,
++            content: source.to_owned(),
++        }],
++    };
++    let mut child = Command::new(env!("CARGO_BIN_EXE_josh"))
++        .arg("serve")
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::piped())
++        .spawn()
++        .unwrap();
++    let mut stdin = child.stdin.take().unwrap();
++    let mut reader = FrameReader::new(
++        child.stdout.take().unwrap(),
++        josh_protocol::DEFAULT_MAX_FRAME_BYTES,
++    );
++    receive(&mut reader);
++    let mut result = |id: &str| loop {
++        match receive(&mut reader) {
++            WireMessage::Response {
++                id: response,
++                result: Some(result),
++                ..
++            } if response == id => break result,
++            WireMessage::Notification { .. } => {}
++            other => panic!("unexpected {other:?}"),
++        }
++    };
++    send(&mut stdin, "h-1", "initialize", &initialize);
++    result("h-1");
++    send(
++        &mut stdin,
++        "h-p",
++        "host/project",
++        &projection_value(&json!(initialize), &catalog),
++    );
++    result("h-p");
++    send(&mut stdin, "h-2", "catalog/set", &catalog);
++    result("h-2");
++    send(&mut stdin, "h-3", "program/load", &load);
++    let loaded = result("h-3");
++    let start = ExecutionStartParams {
++        execution_id: "exec-span".to_owned(),
++        program_id: loaded["program_id"].as_str().unwrap().to_owned(),
++        artifact_digest: loaded["artifact_digest"].as_str().unwrap().to_owned(),
++        entry: "main".to_owned(),
++        input: serde_json::Value::Null,
++        working_directory: None,
++        granted_capabilities: Vec::new(),
++        granted_tools: Vec::new(),
++        allowed_http_origins: Vec::new(),
++        granted_exec: Vec::new(),
++        granted_exec_environment: Vec::new(),
++        limits: BTreeMap::from([("wall_ms".to_owned(), 5_000)]),
++    };
++    send(&mut stdin, "h-4", "execution/start", &start);
++    let failed = result("h-4");
++    drop(stdin);
++    assert!(child.wait().unwrap().success());
++    assert_eq!(failed["outcome"], "failed");
++    let span = &failed["error"]["span"];
++    assert_eq!(span["source"], "src/main.allen");
++    assert_eq!((&span["line"], &span["column"]), (&json!(3), &json!(15)));
++    assert_eq!(
++        &source[usize::try_from(span["start"].as_u64().unwrap()).unwrap()
++            ..usize::try_from(span["end"].as_u64().unwrap()).unwrap()],
++        "10 / zero"
++    );
++}
+diff --git a/docs/agents/reference/josh-protocol.md b/docs/agents/reference/josh-protocol.md
+index a1abb82..282a109 100644
+--- a/docs/agents/reference/josh-protocol.md
++++ b/docs/agents/reference/josh-protocol.md
+@@ -331,6 +331,11 @@ The runtime sends the final lifecycle event before the terminal response.
+ Provider detail, credentials, paths, prompts, transcript content, tool data,
+ and hidden reasoning never appear in public error messages.
+ 
++A `failed` error's `span` is `null` without artifact debug information.
++Otherwise it names the failing instruction's source span: `source`, UTF-8 byte
++`start` and `end`, and for source loads 1-based `line`, `column`, `end_line`,
++and `end_column`.
++
+ Source `fail(reason)` uses `failed` with code `program.failed`, never `stopped`.
+ The runtime cancels and joins owned work before reporting it. Empty text is
+ `program failed`; nonempty text is bounded to 2,048 UTF-8 bytes and passes
+diff --git a/docs/implementation-spec.md b/docs/implementation-spec.md
+index 136572e..6a0b6ec 100644
+--- a/docs/implementation-spec.md
++++ b/docs/implementation-spec.md
+@@ -179,9 +179,10 @@ unique IDs, bounded sizes, and no trailing data.
+ 
+ The debug section never changes executable meaning; omitting it leaves a valid
+ artifact. It stores the sorted normalized source paths, one location per
+-instruction as a UTF-8 byte span, and a control-flow construct table. Effect,
+-await, spawn, and call instructions carry the span of the expression that
+-emits them. Each construct records its function, nearest enclosing construct,
++instruction as a UTF-8 byte span, and a control-flow construct table. Each
++instruction carries the span of the innermost expression that emits it; in
++particular effect, await, spawn, and call instructions carry their own
++expression's span. Each construct records its function, nearest enclosing construct,
+ kind (`for`, `while`, `loop`, `if`, `match`, or `await_block`), source span, and
+ the contiguous instruction range it emitted, including nested constructs. A
+ loop range starts at the loop header, so a `for` iterable is evaluated outside
+@@ -752,6 +753,10 @@ and fuzz targets. Golden data represents only the current implementation.
+ 
+ Compiler and preflight failures are structured diagnostics before execution.
+ Runtime terminal failures use bounded registered codes and sanitized messages.
++When the artifact has debug information, a JOSH runtime failure's `span` is
++the failing instruction's source span as an object with `source`, UTF-8 byte
++`start` and `end`, and for source loads 1-based `line`, `column`, `end_line`,
++and `end_column`, as in effect origins; otherwise it is `null`.
+ `runtime.panic` is a safe host boundary for an implementation invariant breach;
+ a Rust panic must not escape the supervisor.
+ 

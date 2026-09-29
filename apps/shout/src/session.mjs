@@ -42,7 +42,7 @@ const agentTools = [
   { name: 'list_files', description: 'List the text files in the workspace: relative paths, sorted.', inputSchema: object({}) },
   { name: 'read_file', description: 'Read one workspace text file.', inputSchema: object({ path: string('Path relative to the workspace') }) },
   { name: 'search_files', description: 'Literal, case-sensitive search of workspace text files. Returns path:line: text, one match per line.', inputSchema: object({ query: string('Exact text to find') }) },
-  { name: 'git', description: 'Run a read-only git subcommand in the workspace: status, diff, log, show, branch, ls-files, blame, grep, rev-parse, shortlog or describe.', inputSchema: object({ args: { type: 'array', items: { type: 'string' }, description: 'Arguments, starting with the subcommand' } }) },
+  { name: 'git', description: 'Run a read-only git subcommand in the workspace: status, diff, log, show, branch (listing only), ls-files, blame, grep, rev-parse, shortlog or describe. Spell options in full and give a long option its value in the same argument (--author=Ann, --max-count=5, --format=%h %s); short options may take theirs as the next argument (-n 5).', inputSchema: object({ args: { type: 'array', items: { type: 'string' }, description: 'Arguments, one per element, starting with the subcommand' } }) },
   { name: 'list_skills', description: "List SHOUT's skills that compile: name, argument hint and description.", inputSchema: object({}) },
   { name: 'allen_guide', description: 'Return the ALLEN authoring guide (syntax, manifest, effects, the host tool catalog and entry input) and two example programs.', inputSchema: object({}) },
   { name: 'run_program', description: "Compile an ALLEN program and run it in SHOUT's VM. If it doesn't compile, nothing runs and the call fails with the compiler's diagnostics. Otherwise returns the program's result, which the user also sees.", inputSchema: object({ program: string('Complete ALLEN source in the skill file format'), args: string('Value for the entry input field args: usually the user\'s request') }) },
@@ -75,6 +75,8 @@ const noUsage = () => ({ input_tokens: 0, cached_input_tokens: 0, output_tokens:
 const usageRecord = usage => ({ input_tokens: usage.inputTokens ?? 0, cached_input_tokens: usage.cachedInputTokens ?? 0, output_tokens: usage.outputTokens ?? 0 });
 const failure = outcome => outcome.result?.error?.message ?? outcome.result?.error ?? outcome.result?.reason ?? JSON.stringify(outcome.result);
 const clip = text => (text.length > RESULT_CHARS ? `${text.slice(0, RESULT_CHARS)}\n[truncated at ${RESULT_CHARS} characters]` : text);
+// An answer's value in its chat echo: as given, or cut to 500 characters of text (its JSON unless it is a string).
+const echoValue = value => { const json = JSON.stringify(value); return json.length <= 500 ? { value } : { value: `${(typeof value === 'string' ? value : json).slice(0, 499)}…`, truncated: true }; };
 const active = status => ['thinking', 'running', 'waiting_user'].includes(status);
 const approvalSchema = record({ accept: { type: 'boolean' } });
 const isApprovalSchema = schema => schema?.type === 'object' && JSON.stringify(Object.keys(schema.properties ?? {})) === '["accept"]' && schema.properties.accept.type === 'boolean';
@@ -123,12 +125,12 @@ export class CodingSession extends EventEmitter {
   // Sleeping only files the session under the sidebar's Sleeping section; sending a message wakes it.
   setSleeping(sleeping) {
     if (typeof sleeping !== 'boolean') throw new Error('sleeping must be a boolean');
-    if (sleeping && (active(this.data.status) || this.data.question)) throw new Error('Cancel or finish the active task before putting the session to sleep');
+    if (sleeping && (active(this.data.status) || this.data.question)) throw new Error('Session is busy');
     if (this.data.sleeping !== sleeping) { this.data.sleeping = sleeping; this.changed(); }
     return this.snapshot();
   }
   setTimeBudgets(enabled) {
-    if (active(this.data.status)) throw new Error('Cancel or finish the active task before changing time budgets');
+    if (active(this.data.status)) throw new Error('Session is busy');
     if (typeof enabled !== 'boolean') throw new Error('enabled must be a boolean');
     this.data.timeBudgetsEnabled = enabled;
     if (ownProvider(this.provider)) this.provider.timeoutMs = enabled ? 10 * 60 * 1000 : null;
@@ -160,8 +162,8 @@ export class CodingSession extends EventEmitter {
     if (agent.events.length > MAX_AGENT_EVENTS) agent.events.shift();
     this.changed(); return event;
   }
-  messageRecord(role, content) {
-    this.data.messages.push({ id: randomUUID(), role, content, time: new Date().toISOString() });
+  messageRecord(role, content, extra = {}) {
+    this.data.messages.push({ id: randomUUID(), role, content, ...extra, time: new Date().toISOString() });
     if (this.data.messages.length > 200) this.data.messages.shift();
     this.changed();
   }
@@ -205,7 +207,7 @@ export class CodingSession extends EventEmitter {
     } catch (error) {
       if (!current()) return;
       this.data.status = 'failed'; this.data.question = null;
-      this.event('session.error', { message: error.message }); this.messageRecord('assistant', `The task stopped: ${error.message}`);
+      this.event('session.error', { message: error.message }); this.messageRecord('assistant', `Stopped: ${error.message}`);
     } finally {
       if (this.controller === controller) this.controller = null;
       try { await this.persist(); } catch (error) { this.emit('storageError', error); }
@@ -229,34 +231,62 @@ export class CodingSession extends EventEmitter {
         // A session saved before it had a thread brings its recent conversation along once.
         ...(this.data.messages.length > 1 ? [`Earlier conversation in this session:\n${this.data.messages.slice(-13, -1).map(m => `${m.role}: ${m.content}`).join('\n').slice(-12000)}`] : [])].join('\n');
       this.event('chat.started', { label: 'Start the agent thread' });
-      // Kept with the session: an agent that takes the system prompt on every turn (Claude) needs the same context each time.
-      this.data.threadContext = context;
-      this.data.threadId = await this.agent.startThread({ cwd: this.data.workspace, instructions: agentInstructions(this.providerId), context, tools: agentTools });
+      const threadId = await this.agent.startThread({ cwd: this.data.workspace, instructions: agentInstructions(this.providerId), context, tools: agentTools });
+      // A thread started for a cancelled task is dropped: the task after it may have started its own.
       if (!current()) return;
-      this.event('chat.completed', { thread: this.data.threadId });
+      // The context is kept with the session: an agent that takes the system prompt on every turn (Claude) needs the same context each time.
+      Object.assign(this.data, { threadId, threadContext: context });
+      this.event('chat.completed', { thread: threadId });
     }
-    // Model time between tool calls is one chat step each, so the flow shows thinking and acting in turn.
-    let thinking = false; let calls = 0; let over = false;
-    const think = () => { if (!thinking && current()) { thinking = true; this.event('chat.started', { label: 'SHOUT agent' }); } };
+    // Model time between tool calls is one chat step each, so the flow shows thinking and acting in turn. The
+    // model can call tools in parallel; it thinks again once none is left open.
+    let thinking = false; let calls = 0; let over = false; let programs = Promise.resolve();
+    const live = () => current() && !over;
+    const open = new Set();
+    const think = () => { if (!thinking && live()) { thinking = true; this.event('chat.started', { label: 'SHOUT agent' }); } };
     const pause = detail => { if (thinking && current()) { thinking = false; this.event('chat.completed', detail); } };
+    // Programs change the workspace and ask the user, and the session has one run, one question and one status for
+    // them, so the turn's programs run one at a time, in the order they were called. Other tools run beside them.
+    const exclusive = work => {
+      const next = programs.then(() => { if (!live()) throw new Error('The task was cancelled'); return work(); });
+      programs = next.catch(() => {}); return next;
+    };
     think();
     const thread = { cwd: this.data.workspace, instructions: agentInstructions(this.providerId), context: this.data.threadContext ?? '', tools: agentTools };
-    // A tool call can outlive the turn (a provider's call timeout, a failed turn). It must not reopen the
-    // turn's steps afterwards, and any sub-agents it started are stopped.
-    const result = await this.agent.turn(this.data.threadId, text, { signal: controller.signal, model: this.data.model, effort: this.data.effort, thread,
-      onEvent: event => {
-        if (!current()) return;
-        if (event.type === 'message') this.messageRecord('assistant', event.text);
-        else if (event.type === 'usage' && event.usage) this.event('chat.worker', { provider: workerNames[this.providerId], usage: usageRecord(event.usage) });
-      },
-      onToolCall: async ({ tool, input }) => {
-        if (!current() || over) throw new Error('The task was cancelled');
-        pause({ tool });
-        try {
-          if (++calls > MAX_AGENT_TOOL_CALLS) throw new Error(`Tool budget exhausted (${MAX_AGENT_TOOL_CALLS} calls per message). Reply with what you have.`);
-          return clip(await this.agentTool(tool, input, text, controller, current));
-        } finally { if (current() && !over) { this.data.status = 'thinking'; think(); } }
-      } }).finally(() => { over = true; for (const stop of this.spawns ?? []) stop.abort(new Error('SHOUT\'s turn ended before this agent finished')); });
+    let result; let failed = null;
+    try {
+      result = await this.agent.turn(this.data.threadId, text, { signal: controller.signal, model: this.data.model, effort: this.data.effort, thread,
+        onEvent: event => {
+          if (!current()) return;
+          if (event.type === 'message') this.messageRecord('assistant', event.text);
+          else if (event.type === 'usage' && event.usage) this.event('chat.worker', { provider: workerNames[this.providerId], usage: usageRecord(event.usage) });
+        },
+        onToolCall: async ({ tool, input }) => {
+          if (!live()) throw new Error('The task was cancelled');
+          pause({ tool });
+          const work = () => this.agentTool(tool, input, text, controller, current);
+          const call = ++calls > MAX_AGENT_TOOL_CALLS ? Promise.reject(new Error(`Tool budget exhausted (${MAX_AGENT_TOOL_CALLS} calls per message). Reply with what you have.`))
+            : tool === 'run_program' || tool === 'run_skill' ? exclusive(work) : work();
+          open.add(call);
+          try { return clip(await call); }
+          finally {
+            open.delete(call);
+            // A pending question outlasts the calls that finish beside it.
+            if (live() && !open.size) { this.data.status = 'thinking'; think(); }
+            else if (live() && !this.data.question) this.data.status = 'running';
+          }
+        } });
+    } catch (error) { failed = error; }
+    over = true;
+    for (const stop of this.spawns ?? []) stop.abort(new Error('SHOUT\'s turn ended before this agent finished'));
+    // Calls still open when the turn ends (it failed, or the provider stopped waiting for them) belong to a turn that
+    // is over. Their program is cancelled and the session waits for them, so it never settles with work still going.
+    // (A cancel has already stopped everything, and needs no wait.)
+    if (open.size && !controller.signal.aborted) {
+      this.run?.cancel();
+      await Promise.race([Promise.allSettled([...open]), new Promise(resolveAbort => controller.signal.addEventListener('abort', resolveAbort, { once: true }))]);
+    }
+    if (failed) throw failed;
     pause({});
     if (!current()) return;
     if (result?.threadId) this.data.threadId = result.threadId;
@@ -324,7 +354,7 @@ export class CodingSession extends EventEmitter {
       startedAt: null, endedAt: null, calls: 0, activity: '', usage: noUsage(), report: '', error: '', sequence: 0,
       messages: [{ id: randomUUID(), role: 'user', content: brief.trim(), time }], events: [] }));
     agents.push(...records);
-    this.data.status = 'running';
+    if (!this.data.question) this.data.status = 'running'; // A program's question beside it stays answerable.
     this.event('tool.started', { id: group, tool: 'agents.spawn', input: { purpose: String(input.purpose ?? '').slice(0, 200), agents: records.map(({ id, name }) => ({ id, name })) } });
     // Cancelling the task stops every agent; so does the end of the model turn that called this (see converse).
     const stop = new AbortController(); const spawns = this.spawns ??= new Set(); spawns.add(stop);
@@ -407,9 +437,9 @@ export class CodingSession extends EventEmitter {
       emit('session.error', { message: error.message });
       Object.assign(agent, { status: 'failed', error: error.message });
     } finally {
-      // cancel() has already marked the agent unless a newer task started while it was stopping.
+      // cancel() has already marked and ended the agent, unless a newer task started while it was stopping.
       if (agent.status === 'running') agent.status = 'cancelled';
-      Object.assign(agent, { activity: '', endedAt: agent.endedAt ?? new Date().toISOString() }); this.changed();
+      if (!agent.endedAt) { Object.assign(agent, { activity: '', endedAt: new Date().toISOString() }); this.changed(); }
     }
   }
   /** Compiles a model-written program and runs it like a skill. A compile failure goes back to the model as diagnostics. */
@@ -439,10 +469,10 @@ export class CodingSession extends EventEmitter {
     if (name === 'skills' || name === 'help') {
       const skills = await this.skills.list(this.data.workspace);
       if (!current()) return;
-      const line = skill => `- \`/${skill.name}${skill.args ? ` ${skill.args}` : ''}\`${skill.description ? ` ${skill.description}` : ''}${skill.ok === false ? ' (has errors; open it in the Skills panel)' : ''}`;
+      const line = skill => `- \`/${skill.name}${skill.args ? ` ${skill.args}` : ''}\`${skill.description ? ` ${skill.description}` : ''}${skill.ok === false ? ' (has errors)' : ''}`;
       const groups = [['workspace', 'Workspace skills'], ['user', 'Your skills'], ['builtin', 'Built-in skills']].map(([scope, title]) => [title, skills.filter(skill => skill.scope === scope)]).filter(([, items]) => items.length);
       let text = groups.map(([title, items]) => `**${title}**\n${items.map(line).join('\n')}`).join('\n\n');
-      if (name === 'help') text = `Type \`/name arguments\` to run a skill: an ALLEN program that runs in SHOUT and asks a model only for judgments. Anything else goes to SHOUT's agent, which can read the workspace, run skills, and write and run ALLEN programs for the request.\n\n${text}\n\n**Commands**\n${commands.map(line).join('\n')}\n\nA skill is one \`.allen\` file. Put it in \`.shout/skills/\` in this workspace or in \`~/.config/shout/skills/\`; the file name is the command. Its leading \`//\` comment is the description, and an \`// args: …\` line gives the argument hint. \`/new-skill what it should do\` drafts one for you.`;
+      if (name === 'help') text = `\`/name arguments\` runs a skill. Anything else goes to SHOUT's agent, which can read the workspace, run skills, write and run ALLEN programs, and fan work out to read-only sub-agents.\n\n${text}\n\n**Commands**\n${commands.map(line).join('\n')}\n\nA skill is one \`.allen\` file in this workspace's \`.shout/skills/\` or in \`~/.config/shout/skills/\`; the file name is the command and its leading \`//\` comment the description. \`/new-skill what it should do\` drafts one.`;
       this.messageRecord('assistant', text); this.data.status = 'idle'; this.changed(); return;
     }
     const skill = await this.skills.find(this.data.workspace, name);
@@ -481,15 +511,23 @@ export class CodingSession extends EventEmitter {
       Object.assign(item, run.snapshot());
       if (event.type === 'user.question') {
         this.data.status = 'waiting_user';
-        this.data.question = { id: event.id, kind: isApprovalSchema(event.schema) ? 'approval' : 'ask', prompt: event.prompt, schema: event.schema };
+        // A typed question JOSH asks again (the last answer failed its validation) carries its attempt and the issues found.
+        this.data.question = { id: event.id, kind: isApprovalSchema(event.schema) ? 'approval' : 'ask', prompt: event.prompt, schema: event.schema,
+          ...(typeof event.interaction === 'string' ? { interaction: event.interaction } : {}), ...(Number.isInteger(event.attempt) ? { attempt: event.attempt } : {}),
+          ...(Array.isArray(event.issues) ? { issues: event.issues } : {}) };
         this.data.changes = event.prompt?.data?.value?.changes ?? [];
       } else if (event.type === 'user.answered') {
+        this.data.question = null; this.data.status = 'running';
+      } else if (event.type === 'effect.cancelled' && this.data.question?.id === event.id && this.pendingApproval?.id !== event.id) {
+        // The runtime withdrew the program's question (a sibling task stopped the program, say), so it can no longer be answered.
         this.data.question = null; this.data.status = 'running';
       }
       this.event(event.type, event);
     });
     void run.start();
     const outcome = await run.done;
+    // `this.run` is the program running now (they run one at a time), so answers and cancels reach only it.
+    if (this.run === run) this.run = null;
     if (!current()) return;
     Object.assign(item, outcome);
     this.data.question = null; this.data.status = after ?? outcome.state;
@@ -515,7 +553,7 @@ export class CodingSession extends EventEmitter {
       const abort = () => { if (this.pendingApproval?.id !== id) return; this.pendingApproval = null; if (this.data.question?.id === id) this.data.question = null; reject(signal.reason ?? new Error('Approval cancelled')); };
       this.pendingApproval = { id, resolve: accept => { signal?.removeEventListener('abort', abort); resolveApproval(accept); } };
       signal?.addEventListener('abort', abort, { once: true });
-      const system = command ? 'Approving runs this command in the workspace with your user permissions.' : 'Approving applies these exact file changes to the workspace.';
+      const system = command ? 'Runs with your user permissions.' : '';
       this.data.status = 'waiting_user';
       this.data.question = { id, kind: 'approval', title, ...(command ? { command } : {}), schema: approvalSchema,
         prompt: { system, data: { tag: 'Some', value: { summary, changes } } } };
@@ -527,24 +565,31 @@ export class CodingSession extends EventEmitter {
     const question = this.data.question;
     if (this.data.status !== 'waiting_user' || question?.id !== id) throw new Error('This question is no longer pending');
     validate(question.schema, value);
-    const describe = question.kind === 'ask' ? `Answered: ${JSON.stringify(value).slice(0, 500)}`
+    // The chat records the answer as `echo` (drawn as a chip) with plain prose beside it for exports, history and older clients.
+    const approval = question.kind === 'approval';
+    const describe = !approval ? `Answered: ${JSON.stringify(value).slice(0, 500)}`
       : question.command ? (value.accept ? `Run \`${question.command}\`.` : 'Decline this command.')
         : value.accept ? 'Apply these changes.' : 'Decline these changes.';
+    const echo = approval ? { kind: 'approval', accept: value.accept, ...(question.command ? { command: question.command } : {}), origin } : { kind: 'answer', ...echoValue(value), origin };
+    const record = () => this.messageRecord(origin === 'user' ? 'user' : 'system', (origin === 'user' ? '' : `[${origin}] `) + describe, { echo });
     if (this.pendingApproval?.id === id) {
       const pending = this.pendingApproval; this.pendingApproval = null;
       this.data.question = null; this.data.status = 'running';
+      // Accepted file changes get written from here on, so cancelling this task says they stay.
+      if (value.accept && !question.command) this.wroteIn = this.generation;
       this.event('user.answered', { id, run: this.run?.id, origin, value });
-      this.messageRecord(origin === 'user' ? 'user' : 'system', (origin === 'user' ? '' : `[${origin}] `) + describe);
+      record();
       pending.resolve(value.accept);
       return this.snapshot();
     }
     if (!this.run) throw new Error('This question is no longer pending');
     this.run.answer(id, value, origin);
-    this.messageRecord(origin === 'user' ? 'user' : 'system', (origin === 'user' ? '' : `[${origin}] `) + describe);
+    record();
     return this.snapshot();
   }
   cancel() {
     if (!active(this.data.status)) return this.snapshot();
+    const wrote = this.wroteIn === this.generation;
     // Let the run's own terminal event through before invalidating late workers.
     this.run?.cancel(); this.controller?.abort(); this.generation++;
     this.data.status = 'cancelled'; this.data.question = null; this.pendingApproval = null;
@@ -553,7 +598,7 @@ export class CodingSession extends EventEmitter {
     const time = new Date().toISOString();
     for (const agent of this.data.agents ?? []) if (agent.status === 'queued' || agent.status === 'running') Object.assign(agent, { status: 'cancelled', activity: '', endedAt: time });
     this.event('session.cancelled', { run: this.run?.id });
-    this.messageRecord('assistant', 'Task cancelled. Changes already written remain in the workspace.');
+    this.messageRecord('assistant', wrote ? 'Cancelled. Changes already written remain in the workspace.' : 'Cancelled.');
     return this.snapshot();
   }
   async close() {
@@ -609,7 +654,7 @@ export class SessionStore extends EventEmitter {
         if (active(data.status)) {
           data.status = 'interrupted'; data.question = null;
           for (const run of data.runs) if (['starting', 'running', 'waiting_user'].includes(run.state)) run.state = 'interrupted';
-          data.messages.push({ id: randomUUID(), role: 'system', content: 'The app restarted. The previous task was interrupted; it cannot resume. You can start a new task.', time: new Date().toISOString() });
+          data.messages.push({ id: randomUUID(), role: 'system', content: 'Interrupted by restart.', time: new Date().toISOString() });
         }
         for (const agent of data.agents ?? []) if (agent.status === 'queued' || agent.status === 'running') Object.assign(agent, { status: 'interrupted', activity: '', endedAt: agent.endedAt ?? new Date().toISOString() });
         restored.push(await this.attach(data));

@@ -1,12 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, readFile, rename, writeFile, stat } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, readFile, rename, writeFile, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { SessionStore } from '../src/session.mjs';
 import { startServer } from '../src/server.mjs';
 import { CodexProvider } from '../../../prototypes/owned/src/provider.mjs';
 import { ClaudeProvider } from '../src/claude-provider.mjs';
+import { CodexAgent } from '../src/agent.mjs';
 import { ScriptedAgent, codeAgent, scenarioProvider } from './doubles.mjs';
 
 async function waitFor(fn, timeout = 10000) {
@@ -41,6 +42,9 @@ test('chat drives real ALLEN, waits for approval, changes actual files, tests an
   assert.notEqual(await readFile(resolve(session.data.workspace, 'pricing.mjs'), 'utf8'), original);
   assert.throws(() => session.answer(id, { accept: true }), /no longer pending/);
   for (const type of ['chat.started', 'command.routed', 'program.loaded', 'model.started', 'user.question', 'workspace.changed', 'tool.completed', 'run.terminal']) assert.ok(session.data.events.some(e => e.type === type), type);
+  const judgments = session.data.events.filter(e => e.type === 'model.started').map(e => e.effectId);
+  assert.ok(judgments.length && judgments.every(Boolean));
+  assert.deepEqual(session.data.events.filter(e => e.type === 'model.worker').map(e => e.effectId), judgments, 'worker events name their judgment');
   const saved = JSON.parse(await readFile(resolve(dir, 'sessions', `${session.data.id}.json`), 'utf8'));
   assert.equal(saved.status, 'idle'); assert.ok(saved.runs[0].source.includes('model.request'));
   const restored = await new SessionStore({ stateRoot: dir, agent: new ScriptedAgent() }).init();
@@ -62,6 +66,7 @@ test('declining and cancelling leave workspace unchanged; other workspace sessio
   store.send(session.data.id, session.data.suggestedPrompt); await waitFor(() => session.data.question);
   const id = session.data.question.id; session.cancel(); await session.task;
   assert.equal(session.data.status, 'cancelled'); assert.equal(session.data.question, null);
+  assert.equal(session.data.messages.at(-1).content, 'Cancelled.', 'nothing was written, so nothing is said to remain');
   assert.throws(() => session.answer(id, { accept: true }), /no longer pending/);
   assert.equal(await session.workspace.read('slug.mjs'), before);
 });
@@ -144,6 +149,7 @@ test('restart invalidates waiting questions instead of pretending the VM resumed
   const copy = restored.get(session.data.id);
   assert.equal(copy.data.status, 'interrupted'); assert.equal(copy.data.question, null);
   assert.equal(copy.data.runs[0].state, 'interrupted');
+  assert.deepEqual([copy.data.messages.at(-1).role, copy.data.messages.at(-1).content], ['system', 'Interrupted by restart.']);
   await restored.close();
 });
 
@@ -190,6 +196,7 @@ test('cancelled late tool completion cannot change a newer task and retains work
   store.send(session.data.id, session.data.suggestedPrompt); await waitFor(() => session.data.question);
   session.answer(session.data.question.id, { accept: true }); await waitFor(() => applied);
   session.cancel(); await session.task;
+  assert.equal(session.data.messages.at(-1).content, 'Cancelled. Changes already written remain in the workspace.');
   assert.throws(() => store.send(session.data.id, 'hello'), /still stopping/);
   const other = await store.create({ workspace: session.data.workspace });
   assert.throws(() => store.send(other.data.id, 'hello'), /Another session/);
@@ -206,7 +213,7 @@ test('time budgets are persisted per session, cannot change during work, and can
   session.setTimeBudgets(false);
   assert.equal(session.data.timeBudgetsEnabled, false);
   store.send(session.data.id, session.data.suggestedPrompt);
-  assert.throws(() => session.setTimeBudgets(true), /finish the active task/);
+  assert.throws(() => session.setTimeBudgets(true), { message: 'Session is busy' });
   session.cancel(); await session.task; await session.persist();
   const saved = JSON.parse(await readFile(resolve(dir, 'sessions', `${session.data.id}.json`), 'utf8'));
   assert.equal(saved.timeBudgetsEnabled, false);
@@ -224,7 +231,7 @@ test('sleeping persists, is refused during work, and a new message wakes the ses
   assert.throws(() => session.setSleeping('yes'), /must be a boolean/);
   store.send(session.data.id, session.data.suggestedPrompt);
   assert.equal(session.data.sleeping, false);
-  assert.throws(() => session.setSleeping(true), /finish the active task/);
+  assert.throws(() => session.setSleeping(true), { message: 'Session is busy' });
   session.cancel(); await session.task;
 });
 
@@ -354,4 +361,213 @@ test('HTTP config reports each provider; sessions start on an available one and 
   const locked = await post(`/sessions/${created.id}/model`, { model: 'claude-opus-5-5', effort: 'medium' });
   assert.equal(locked.status, 400); assert.match((await locked.json()).error, /locked/);
   assert.equal((await (await post(`/sessions/${created.id}/model`, { model: 'claude-fable-5-1', effort: 'max' })).json()).effort, 'max');
+});
+
+// Lifecycle: tool calls that overlap, turns that end under them, and cancels that race the next message.
+const isChild = thread => !thread.tools.some(tool => tool.name === 'spawn_agents');
+
+test('an approval stays answerable while reads and sub-agents finish beside the program that asked', async t => {
+  const seen = {}; let session;
+  const agent = new ScriptedAgent(async ({ text, call, say, thread }) => {
+    if (isChild(thread)) return say('child report');
+    const program = call('run_skill', { name: 'code', args: text }).then(() => 'ok', error => error.message);
+    await waitFor(() => session.data.question);
+    seen.read = await call('read_file', { path: 'pricing.mjs' });
+    seen.spawn = await call('spawn_agents', { purpose: 'beside', agents: [{ name: 'look', brief: 'Look.' }] });
+    seen.status = session.data.status;
+    seen.program = await program;
+    say('done');
+  });
+  const { store } = await setup(t, { agent });
+  session = await store.create({ scenario: 'pricing' });
+  store.send(session.data.id, session.data.suggestedPrompt);
+  await waitFor(() => seen.status);
+  assert.equal(seen.status, 'waiting_user', 'finishing reads and sub-agents leave the question pending');
+  assert.equal(session.data.status, 'waiting_user');
+  session.answer(session.data.question.id, { accept: true });
+  await session.task;
+  assert.deepEqual([seen.program, session.data.status, session.data.runs.at(-1).state], ['ok', 'idle', 'completed']);
+  assert.match(seen.spawn, /## look \(completed\)\nchild report/);
+});
+
+test('the model\'s programs run one at a time, and cancelling stops the running one and the ones waiting', async t => {
+  const seen = {};
+  const agent = new ScriptedAgent(async ({ text, call }) => {
+    seen.results = await Promise.all([1, 2, 3].map(() => call('run_skill', { name: 'code', args: text }).then(() => 'ok', error => error.message)));
+  });
+  const { store } = await setup(t, { agent });
+  const session = await store.create({ scenario: 'pricing' });
+  store.send(session.data.id, session.data.suggestedPrompt);
+  await waitFor(() => session.data.question);
+  await new Promise(r => setTimeout(r, 100));
+  assert.equal(session.data.runs.length, 1, 'the other programs wait for the first');
+  const first = session.data.runs[0].id;
+  assert.equal(session.data.events.find(event => event.type === 'user.question').run, first, 'the question belongs to the running program');
+  session.cancel(); await session.task;
+  await waitFor(() => seen.results && session.pendingTools.size === 0, 3000);
+  assert.deepEqual(session.data.runs.map(run => run.state), ['cancelled']);
+  assert.deepEqual(seen.results, ['The task was cancelled', 'The task was cancelled', 'The task was cancelled']);
+  store.send(session.data.id, 'again');
+  await waitFor(() => session.data.question);
+  assert.deepEqual(session.data.runs.map(run => run.state), ['cancelled', 'running'], 'the next task runs its own programs');
+  assert.equal(session.data.events.findLast(event => event.type === 'user.question').run, session.data.runs[1].id);
+  session.cancel(); await session.task;
+});
+
+test('a turn that ends under a running program stops the program and waits for it before the session settles', async t => {
+  let session; const settled = [];
+  const agent = new ScriptedAgent(async ({ text, call, say }) => {
+    void call('run_skill', { name: 'code', args: text }).catch(() => {});
+    await waitFor(() => session.data.question);
+    if (text === 'fail') throw new Error('The app-server exited');
+    say('I stopped waiting for the program.');
+  });
+  const { store } = await setup(t, { agent });
+  session = await store.create({ scenario: 'pricing' });
+  const before = await session.workspace.read('pricing.mjs');
+  session.on('snapshot', snapshot => { if (!['thinking', 'running', 'waiting_user'].includes(snapshot.status)) settled.push(snapshot.runs.map(run => run.state)); });
+  for (const [text, status] of [['fail', 'failed'], ['complete', 'idle']]) {
+    store.send(session.data.id, text); await session.task;
+    assert.equal(session.data.status, status, text);
+    assert.equal(session.data.runs.at(-1).state, 'cancelled', `${text}: the program is stopped`);
+    assert.deepEqual([session.data.question, session.pendingTools.size], [null, 0], text);
+    const events = session.data.events.length;
+    await new Promise(r => setTimeout(r, 100));
+    assert.equal(session.data.events.length, events, `${text}: nothing happens after the session settles`);
+    assert.equal(session.data.status, status);
+  }
+  assert.ok(settled.every(states => states.every(state => state !== 'running' && state !== 'waiting_user' && state !== 'starting')), JSON.stringify(settled));
+  assert.equal(await session.workspace.read('pricing.mjs'), before);
+});
+
+test('a thread started for a cancelled task never replaces the thread of the task after it', async t => {
+  let release; const gate = new Promise(r => { release = r; });
+  const agent = new ScriptedAgent(async ({ threadId, say }) => say(`on ${threadId}`));
+  const startThread = agent.startThread.bind(agent);
+  agent.startThread = async options => { const id = await startThread(options); if (id === 'thread-1') await gate; return id; };
+  const { store, dir } = await setup(t, { agent });
+  const session = await store.create({ workspace: dir });
+  store.send(session.data.id, 'first'); const first = session.task;
+  await waitFor(() => agent.threads.length === 1);
+  session.cancel();
+  store.send(session.data.id, 'second'); await session.task;
+  assert.equal(session.data.threadId, 'thread-2');
+  release(); await first;
+  assert.equal(session.data.threadId, 'thread-2', 'the late thread is dropped');
+  store.send(session.data.id, 'third'); await session.task;
+  assert.deepEqual(agent.turns.map(turn => turn.threadId), ['thread-2', 'thread-2']);
+});
+
+test('CodexAgent queues a turn behind a cancelled one until Codex confirms the interrupt', async () => {
+  const agent = new CodexAgent({ home: '/nonexistent' });
+  const requests = []; let turns = 0; let confirm;
+  agent.ensure = async () => {}; agent.loaded.add('t');
+  const completed = status => agent.receive(JSON.stringify({ method: 'turn/completed', params: { threadId: 't', turn: { status } } }));
+  agent.request = async (method, params) => {
+    requests.push(method);
+    if (method === 'turn/start') return { turn: { id: `turn-${++turns}` } };
+    if (method === 'turn/interrupt') confirm = () => completed('interrupted');
+    return {};
+  };
+  const controller = new AbortController();
+  const first = agent.turn('t', 'one', { onToolCall: async () => '', signal: controller.signal });
+  await new Promise(r => setImmediate(r));
+  controller.abort();
+  const second = agent.turn('t', 'two', { onToolCall: async () => '' });
+  await new Promise(r => setTimeout(r, 30));
+  assert.deepEqual(requests, ['turn/start', 'turn/interrupt'], 'the next turn waits for the interrupt to be confirmed');
+  confirm();
+  assert.deepEqual(await first, { status: 'interrupted' });
+  await new Promise(r => setImmediate(r));
+  assert.deepEqual(requests, ['turn/start', 'turn/interrupt', 'turn/start']);
+  completed('completed');
+  assert.deepEqual(await second, { status: 'completed' });
+  const busy = agent.turn('t', 'three', { onToolCall: async () => '' });
+  await new Promise(r => setImmediate(r));
+  await assert.rejects(agent.turn('t', 'four', { onToolCall: async () => '' }), /already has a turn in progress/);
+  completed('completed'); await busy;
+});
+
+test('a user question JOSH asks again carries its attempt and the issues with the last answer; a first ask carries no issues', async t => {
+  const skill = `// Ask for a count.
+manifest { language: "0.1" entry: main capabilities: [user.ask] }
+record Count { count: Int }
+export async fn main(args: String) returns String effects [user.ask] {
+  match await user.ask<Count>(prompt { system: "How many?" output: Count policy: { max_attempts: 2 } }) {
+    Ok(answer) => to_string(answer.count)
+    Err(error) => error.code
+  }
+}
+`;
+  const { store, dir } = await setup(t, { agent: new ScriptedAgent() });
+  const previousHome = process.env.SHOUT_HOME; process.env.SHOUT_HOME = resolve(dir, 'home');
+  t.after(() => { if (previousHome === undefined) delete process.env.SHOUT_HOME; else process.env.SHOUT_HOME = previousHome; });
+  const workspace = resolve(dir, 'project');
+  await mkdir(resolve(workspace, '.shout', 'skills'), { recursive: true });
+  await writeFile(resolve(workspace, '.shout', 'skills', 'count.allen'), skill);
+  const session = await store.create({ workspace });
+  store.send(session.data.id, '/count');
+  const first = await waitFor(() => session.data.question);
+  assert.deepEqual([first.kind, typeof first.interaction, first.attempt, 'issues' in first], ['ask', 'string', 1, false]);
+  // Within the JSON schema (an integer), outside JOSH's Int: JOSH rejects it and asks again.
+  session.answer(first.id, { count: 1e20 });
+  const again = await waitFor(() => session.data.question?.id !== first.id && session.data.question);
+  assert.deepEqual([again.kind, again.interaction, again.attempt, again.issues], ['ask', first.interaction, 2, [{ path: '/count', code: 'range' }]]);
+  assert.deepEqual(session.snapshot().question.issues, [{ path: '/count', code: 'range' }], 'snapshots carry them');
+  assert.deepEqual(Object.keys(again).slice(0, 4), ['id', 'kind', 'prompt', 'schema'], 'the existing fields are unchanged');
+  session.answer(again.id, { count: 3 }); await session.task;
+  assert.deepEqual([session.data.messages.at(-1).content, session.data.status, session.data.question], ['3', 'completed', null]);
+});
+
+test('a question the runtime cancels is cleared at once, the session goes back to running, and a late answer is refused', async t => {
+  // The kernel test's program: the second task's stop cancels the first task's pending question.
+  const skill = `// Ask, then stop from a sibling task.
+manifest { language: "0.1" entry: main capabilities: [user.ask, model.request] }
+record Answer { answer: Bool }
+async fn ask() returns Bool effects [user.ask] {
+  match await user.ask<Bool>(prompt { system: "Continue?" output: Bool }) { Ok(v) => v Err(_) => false }
+}
+async fn quit() returns Bool effects [model.request] {
+  let r = match await model.request<Answer>(prompt { system: "Judge" output: Answer }) { Ok(v) => v.answer Err(_) => false };
+  stop("enough")
+}
+export async fn main() returns Bool effects [task.spawn, user.ask, model.request] {
+  await {
+    let a = spawn ask();
+    let b = spawn quit();
+    let x = await a;
+    let z = await b;
+    x
+  }
+}
+`;
+  let session; const seen = {};
+  // The judgment waits for the question, so the stop always lands on a pending one.
+  const provider = { judge: async () => { await waitFor(() => seen.asked); return { answer: true }; } };
+  const dir = await mkdtemp(resolve(tmpdir(), 'shout-session-'));
+  const store = await new SessionStore({ stateRoot: dir, agent: new ScriptedAgent(), providerFactory: () => provider }).init();
+  const previousHome = process.env.SHOUT_HOME; process.env.SHOUT_HOME = resolve(dir, 'home');
+  t.after(async () => { await store.close(); if (previousHome === undefined) delete process.env.SHOUT_HOME; else process.env.SHOUT_HOME = previousHome; await rm(dir, { recursive: true, force: true }); });
+  const workspace = resolve(dir, 'project');
+  await mkdir(resolve(workspace, '.shout', 'skills'), { recursive: true });
+  await writeFile(resolve(workspace, '.shout', 'skills', 'ask-stop.allen'), skill);
+  session = await store.create({ workspace });
+  const record = session.event.bind(session);
+  session.event = (type, detail) => {
+    const event = record(type, detail);
+    if (type === 'user.question') seen.asked = session.data.question;
+    // The state as the session records the cancel, before the run's end settles everything else.
+    if (type === 'effect.cancelled') {
+      seen.cancelled = { id: detail.id, question: session.data.question, status: session.data.status, attention: store.list().find(item => item.id === session.data.id).attention };
+      try { session.answer(seen.asked.id, true); seen.late = 'accepted'; } catch (error) { seen.late = error.message; }
+    }
+    return event;
+  };
+  store.send(session.data.id, '/ask-stop'); await session.task;
+  assert.equal(seen.asked?.kind, 'ask');
+  assert.equal(seen.cancelled?.id, seen.asked.id, 'the runtime cancelled the pending question');
+  assert.deepEqual([seen.cancelled.question, seen.cancelled.status, seen.cancelled.attention], [null, 'running', null]);
+  assert.equal(seen.late, 'This question is no longer pending');
+  assert.deepEqual([session.data.runs.at(-1).state, session.data.question], ['stopped', null]);
+  assert.ok(!session.data.events.some(event => event.type === 'user.answered'), 'no answer was recorded');
 });

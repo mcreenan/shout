@@ -10,3 +10,5 @@ magick -size 1024x1024 xc:none -fill '#0038a8' -draw 'roundrectangle 32,32 991,9
   \( "$work/mark.png" -resize 936x \) -gravity center -composite "$work/icon.png"
 mkdir -p "$here/icons"
 for size in 32 48 64 128 256 512; do magick "$work/icon.png" -resize "${size}x${size}" -strip "$here/icons/$size.png"; done
+# The connection screen ships inside apps/desktop (the standalone client has no apps/shout), at 3x its 220 px display width.
+for variant in '' '-dark'; do magick "$here/../../shout/public/shout-wordmark$variant.png" -resize 660x -strip "$here/wordmark$variant.png"; done

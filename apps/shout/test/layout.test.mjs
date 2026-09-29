@@ -90,3 +90,14 @@ test('layouts round-trip and malformed input falls back safely', () => {
   assert.equal(repaired.root.active, CHAT);
   assert.equal(repaired.focus, 'g');
 });
+
+test('a sub-agent tab round-trips with its agent; one without an agent is dropped', () => {
+  const layout = createLayout();
+  addTab(layout, { id: 'agent-1', kind: 'agent', agent: 'agent-7c1e' });
+  splitWith(layout, 'agent-1', layout.root.id, 'right');
+  const restored = restore(serialize(layout));
+  assert.deepEqual(groups(restored.root).map((group) => group.tabs), [[CHAT], ['agent-1']]);
+  assert.deepEqual(restored.tabs['agent-1'], { id: 'agent-1', kind: 'agent', agent: 'agent-7c1e' });
+  const broken = restore(JSON.stringify({ root: { type: 'group', id: 'g', tabs: [CHAT, 'a'], active: 'a' }, tabs: { [CHAT]: { id: CHAT, kind: 'chat' }, a: { id: 'a', kind: 'agent', agent: 3 } }, focus: 'g' }));
+  assert.deepEqual(broken.root.tabs, [CHAT]);
+});

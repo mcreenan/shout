@@ -102,10 +102,13 @@ export class CodexProvider {
         });
       } finally { if (timer) clearTimeout(timer); signal?.removeEventListener('abort', abort); }
       signal?.throwIfAborted();
-      const value = JSON.parse(await readFile(resultPath, 'utf8')).value;
-      validate(schema, value);
       onEvent({ provider: 'codex-exec', version, usage: usage ?? null, acceptedToolEvents: 0, profile: 'restricted-no-tools-v1' });
-      return value;
+      // An answer that is not JSON, or does not match the schema, is still the model's answer: the
+      // kernel sends it to JOSH, which validates typed responses and asks again under the prompt policy.
+      let value;
+      try { value = JSON.parse(await readFile(resultPath, 'utf8')).value; }
+      catch { throw Object.assign(new Error('The model worker did not return a JSON answer'), { code: 'invalid_answer' }); }
+      return validate(schema, value);
     } finally { await rm(directory, { recursive: true, force: true }); }
   }
 }

@@ -51,7 +51,7 @@ export class JoshTransport {
             const pending = this.pending.get(frame.id);
             if (!pending) throw new Error('Unknown JOSH response');
             this.pending.delete(frame.id);
-            if (frame.error) pending.reject(new Error(JSON.stringify(frame.error)));
+            if (frame.error) pending.reject(Object.assign(new Error(JSON.stringify(frame.error)), { wire: frame.error }));
             else pending.resolve(frame.result);
           } else if (frame.kind === 'request') {
             Promise.resolve(onRequest(frame)).catch(this.fail);
@@ -63,12 +63,19 @@ export class JoshTransport {
       } catch (error) { this.fail(error); }
     });
   }
-  send(message) {
+  // encode() throws, without writing anything, for a closed connection or a message too
+  // large for one frame, so a caller can keep its state until the frame is known to be sendable.
+  encode(message) {
     if (this.closed) throw new Error('JOSH connection closed');
     const body = Buffer.from(JSON.stringify({ protocol: 'josh/1', ...message }));
-    if (body.length > 1048576) throw new Error('JOSH request exceeds frame limit');
-    this.child.stdin.write(Buffer.concat([Buffer.from(`Content-Length: ${body.length}\r\nContent-Type: application/josh+json; charset=utf-8\r\n\r\n`), body]));
+    if (body.length > 1048576) throw new Error(`JOSH frame exceeds limit (${body.length} bytes; limit 1048576)`);
+    return Buffer.concat([Buffer.from(`Content-Length: ${body.length}\r\nContent-Type: application/josh+json; charset=utf-8\r\n\r\n`), body]);
   }
+  write(frame) {
+    if (this.closed) throw new Error('JOSH connection closed');
+    this.child.stdin.write(frame);
+  }
+  send(message) { this.write(this.encode(message)); }
   request(method, params) {
     const id = `host-${++this.nextId}`;
     return new Promise((resolve, reject) => {

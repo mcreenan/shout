@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { query as sdkQuery, tool, createSdkMcpServer, getSessionInfo } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
+import { settlesWithin } from './agent.mjs';
 
 const require = createRequire(import.meta.url);
 const SERVER = 'shout';
@@ -76,8 +77,9 @@ export async function drain(stream, onMessage = () => {}) {
  * process.
  */
 export class ClaudeAgent {
-  constructor({ query = sdkQuery, sessionInfo = getSessionInfo, binary = claudeBinary() } = {}) {
-    this.query = query; this.sessionInfo = sessionInfo; this.binary = binary; this.threads = new Map();
+  /** `stopWaitMs`: how long a new turn waits for a cancelled turn's Claude Code process on the same thread to stop. */
+  constructor({ query = sdkQuery, sessionInfo = getSessionInfo, binary = claudeBinary(), stopWaitMs = 10_000 } = {}) {
+    this.query = query; this.sessionInfo = sessionInfo; this.binary = binary; this.stopWaitMs = stopWaitMs; this.threads = new Map();
   }
   /** The thread ID is the Claude Code session ID; the session itself is created by the first turn. */
   async startThread() { return randomUUID(); }
@@ -89,14 +91,18 @@ export class ClaudeAgent {
   async turn(threadId, text, { onToolCall, onEvent = () => {}, signal, model, effort, thread }) {
     if (!thread) throw new Error('A Claude turn needs its thread options');
     const previous = this.threads.get(threadId);
-    if (previous?.active) throw new Error('This thread already has a turn in progress');
+    // A cancelled turn counts as stopping from the moment its signal fires, even before its own caller has seen it end.
+    if (previous?.active && !previous.controller.signal.aborted) throw new Error('This thread already has a turn in progress');
     signal?.throwIfAborted();
     const controller = new AbortController(); const state = { active: true, controller };
     this.threads.set(threadId, state);
     const stop = () => controller.abort();
     signal?.addEventListener('abort', stop, { once: true });
-    // An interrupted turn resolves at once; its Claude Code process may take a moment to stop, and the next turn waits for it.
-    const done = (async () => { await previous?.done; return this.run(threadId, text, { onToolCall, onEvent, model, effort, thread, controller }); })();
+    // An interrupted turn resolves at once; its Claude Code process may take a moment to stop, and the next turn waits for it (up to `stopWaitMs`).
+    const done = (async () => {
+      if (previous && !(await settlesWithin(previous.done, this.stopWaitMs))) throw new Error('The previous turn is still stopping; try again shortly');
+      return this.run(threadId, text, { onToolCall, onEvent, model, effort, thread, controller });
+    })();
     state.done = done.then(() => {}, () => {}).finally(() => { if (this.threads.get(threadId) === state) this.threads.delete(threadId); });
     const interrupted = new Promise(resolveTurn => signal?.addEventListener('abort', () => resolveTurn({ status: 'interrupted' }), { once: true }));
     try { return await Promise.race([done, interrupted]); }

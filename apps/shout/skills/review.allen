@@ -21,10 +21,12 @@ record Finding {
 record Review { summary: String findings: List<Finding> }
 record Unit { path: String text: String }
 record NewFiles { units: List<Unit> skipped: List<String> }
+record Tracked { units: List<Unit> overflow: List<String> }
 
 fn max_batch_chars() returns Int { 50000 }
 fn max_file_chars() returns Int { 40000 }
 fn max_batches() returns Int { 12 }
+fn max_file_diffs() returns Int { 100 }
 
 async fn git(args: List<String>) returns tools.git.run.Output effects [tool.git.run@1] {
   match await tools.git.run.call({ args: args }) {
@@ -72,15 +74,17 @@ fn file_diffs(diff: String) returns List<Unit> {
   })
 }
 
-// When the whole diff is too large for one git.run result, fetch it file by file (at most 100 files).
-async fn per_file_diffs(names: String) returns List<Unit> effects [tool.git.run@1] {
+// When the whole diff is too large for one git.run result, fetch it file by file: at most 100 files, and
+// the paths beyond that come back as `overflow` so the report can list them as not reviewed.
+async fn per_file_diffs(names: String) returns Tracked effects [tool.git.run@1] {
   let paths = lines_of(names);
+  let none: List<String> = [];
   mut units: List<Unit> = [];
-  for path in paths[0..100] ?? paths {
+  for path in paths[0..max_file_diffs()] ?? paths {
     let one = await git(["diff", "HEAD", "--", path]);
     units = [..units, ..file_diffs(one.output)];
   }
-  units
+  Tracked { units: units, overflow: paths[max_file_diffs()..length(paths)] ?? none }
 }
 
 // Greedy packing in order: a new batch starts when the next unit would overflow.
@@ -210,9 +214,15 @@ export async fn main(args: String) returns String
     return "There are no uncommitted changes to review.";
   }
   let added = await new_files(new_paths);
-  let tracked = if (diff.truncated) { await per_file_diffs((await git(["diff", "HEAD", "--name-only"])).output) } else { file_diffs(diff.output) };
-  let units = [..tracked, ..added.units];
-  let paths = list.map(units, fn(unit: Unit) returns String { unit.path });
+  let no_paths: List<String> = [];
+  let tracked = if (diff.truncated) {
+    await per_file_diffs((await git(["diff", "HEAD", "--name-only"])).output)
+  } else {
+    Tracked { units: file_diffs(diff.output), overflow: no_paths }
+  };
+  let units = [..tracked.units, ..added.units];
+  let paths = [..list.map(units, fn(unit: Unit) returns String { unit.path }), ..tracked.overflow];
+  let not_fetched = list.map(tracked.overflow, fn(path: String) returns String { `${path} (over the ${to_string(max_file_diffs())}-file limit)` });
   let all_batches = batches(units);
   let chosen = all_batches[0..max_batches()] ?? all_batches;
   let no_batches: List<List<Unit>> = [];
@@ -220,7 +230,7 @@ export async fn main(args: String) returns String
   let over_limit = list.flat_map(dropped, fn(batch: List<Unit>) returns List<String> {
     list.map(batch, fn(unit: Unit) returns String { `${unit.path} (over the ${to_string(max_batches())}-batch limit)` })
   });
-  let skipped = [..added.skipped, ..over_limit];
+  let skipped = [..added.skipped, ..not_fetched, ..over_limit];
   mut summaries: List<String> = [];
   mut findings: List<Finding> = [];
   mut reviewed = 0;

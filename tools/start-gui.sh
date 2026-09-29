@@ -12,4 +12,5 @@ export JOSH_BIN="${JOSH_BIN:-$("$repo_root/tools/setup-josh.sh")}"
 watch=()
 # SHOUT_WATCH=1 restarts the server when its source or imported modules change.
 if [ "${SHOUT_WATCH:-}" = 1 ]; then watch=(--watch --watch-preserve-output); fi
-exec node "${watch[@]}" --env-file-if-exists="$repo_root/.env" "$repo_root/apps/shout/src/server.mjs" "$@"
+# The ${x+...} forms keep macOS's bash 3.2 from treating an empty array or argument list as unset under set -u.
+exec node ${watch[@]+"${watch[@]}"} --env-file-if-exists="$repo_root/.env" "$repo_root/apps/shout/src/server.mjs" ${1+"$@"}

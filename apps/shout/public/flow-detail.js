@@ -2,7 +2,7 @@
 // The canvas decides what is selected; this view only renders it and offers the way back to the raw
 // events and the program source. It takes over its host (the side panel) until it is closed.
 import { renderMarkdown } from './markdown-dom.js';
-import { formatDuration, modelTask, modelOutput, toolResult, stepFailed, tokens, scopePath, sourceLine, branchLabel } from './flow.js';
+import { formatDuration, modelTask, modelOutput, toolResult, stepFailed, tokens, scopePath, sourceLine, branchLabel, programShape, issueLabel } from './flow.js';
 
 function el(tag, className, text) {
   const node = document.createElement(tag);
@@ -18,7 +18,8 @@ function iconButton(label, path, onClick) {
   button.addEventListener('click', onClick);
   return button;
 }
-const eventOf = (step, type) => step.events.find((event) => event.type === type);
+// The latest matching event: after a retry, the last attempt's.
+const eventOf = (step, type) => (step.attempts?.at(-1)?.events ?? step.events).findLast((event) => event.type === type);
 const clock = (ms) => (Number.isFinite(ms) ? new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '');
 function pre(text, lines = 400) {
   const all = String(text).split('\n');
@@ -59,15 +60,16 @@ export function createFlowDetail(host, { openEvent, openSource, openFile, onClos
   function chips(values) {
     const row = el('div', 'fd-chips');
     for (const value of values.filter(Boolean)) row.append(el('span', 'fd-chip', value));
-    return row.children.length ? row : null;
+    return row.children.length ? row : document.createDocumentFragment();
   }
   const markdown = (text) => { const body = el('div', 'fd-md'); renderMarkdown(body, text, { openFile }); return body; };
 
   // Where the step came from: the breadcrumb through calls, loops and branches, and the exact source line.
-  function origin(step, run) {
+  function origin(step, run, segment) {
     const out = [];
     const source = run?.source;
-    const path = scopePath(step.origin, source);
+    const shape = programShape(segment?.program);
+    const path = scopePath(step.origin, source, shape);
     if (path.length > 1) {
       const crumbs = el('nav', 'fd-path');
       crumbs.setAttribute('aria-label', 'Scope');
@@ -80,10 +82,11 @@ export function createFlowDetail(host, { openEvent, openSource, openFile, onClos
       out.push(crumbs);
     }
     // The conditions behind each branch taken, as written.
-    const conditions = (step.origin?.scope || []).filter((entry) => (entry.kind === 'if' || entry.kind === 'match') && sourceLine(source, entry.line).trim());
-    for (const entry of conditions) {
+    for (const entry of (step.origin?.scope || []).filter((item) => item.kind === 'if' || item.kind === 'match')) {
+      const branch = branchLabel(entry, { shape, source });
+      if (!branch.title) continue;
       const row = el('div', 'fd-condition');
-      row.append(el('span', 'fd-chip branch', branchLabel(entry)), el('code', '', sourceLine(source, entry.line).trim().replace(/\s*\{\s*$/, '')));
+      row.append(el('span', 'fd-chip branch', branch.label), el('code', '', branch.title.replace(/\s*\{\s*$/, '')));
       out.push(row);
     }
     const line = step.origin?.site?.line;
@@ -165,6 +168,37 @@ export function createFlowDetail(host, { openEvent, openSource, openFile, onClos
     if (done?.text) body.append(markdown(done.text));
     body.append(chips([done?.tool && done.tool.replace(/_/g, ' ')]));
   }
+  // Every attempt of a retried request: how long it took, why it was rejected, and what it answered.
+  function attemptList(step) {
+    const list = el('ol', 'fd-attempts');
+    for (const attempt of step.attempts) {
+      const item = el('li', `fd-attempt ${attempt.status}`);
+      const top = el('div', 'fd-attempt-head');
+      const mark = el('i', `fd-mark ${attempt.status}`);
+      mark.title = attempt.status;
+      top.append(mark, el('strong', '', `#${attempt.attempt}`), el('span', 'fd-meta', attempt.end !== null && attempt.end > attempt.start ? formatDuration(attempt.end - attempt.start) : ''));
+      item.append(top);
+      if (attempt.issues?.length) {
+        const issues = el('ul', 'fd-issues');
+        for (const issue of attempt.issues) {
+          // A JSON Pointer into the answer as given, and what was wrong there (the raw code is in the events).
+          const line = el('li');
+          line.append(el('code', '', String(issue?.path || '/')), el('span', '', issueLabel(issue)));
+          issues.append(line);
+        }
+        item.append(issues);
+      }
+      const answer = attempt.events.findLast((event) => event.type === 'model.completed' || event.type === 'user.answered')?.value;
+      if (answer !== undefined && attempt !== step.attempts.at(-1)) {
+        const details = el('details', 'fd-details');
+        const text = modelOutput(answer).text;
+        details.append(el('summary', '', 'Output'), text ? markdown(text) : json(answer));
+        item.append(details);
+      }
+      list.append(item);
+    }
+    return section('Attempts', list);
+  }
   // The raw events behind the step, each opening in the Events view.
   function eventList(step, runId) {
     const list = el('ol', 'fd-events');
@@ -198,20 +232,22 @@ export function createFlowDetail(host, { openEvent, openSource, openFile, onClos
     const usage = step?.events.filter((event) => event.usage).reduce((sum, event) => ({ input_tokens: sum.input_tokens + (event.usage.input_tokens || 0), output_tokens: sum.output_tokens + (event.usage.output_tokens || 0) }), { input_tokens: 0, output_tokens: 0 });
     const meta = [clock(start), step && step.end !== null && step.end > step.start ? formatDuration(step.end - step.start) : '', step?.status === 'active' ? 'running' : '', tokens(usage)].filter(Boolean);
     body.append(el('div', 'fd-meta', meta.join(' · ')));
-    if (step) body.append(...origin(step, run));
+    if (step) body.append(...origin(step, run, selection.segment));
     if (message) body.append(message.role === 'user' ? el('p', 'fd-text', message.content) : markdown(message.content));
     else if (step.pair === 'tool') renderTool(body, step);
     else if (step.pair === 'model') renderModel(body, step);
     else if (step.pair === 'user') renderApproval(body, step);
     else if (step.pair === 'chat') renderAgent(body, step);
     else if (step.detail) body.append(el('p', step.status === 'failed' ? 'fd-error' : 'fd-text', step.events[0]?.message || step.detail));
+    if (step?.attempts?.length > 1) body.append(attemptList(step));
     if (step) body.append(eventList(step, step.run));
     return [head, body];
   }
 
   function show(selection) {
     if (!selection) return hide();
-    if (host.hidden) { opened = true; reveal?.(true); }
+    // A new selection opens the panel if it was closed; updates to the same one never reopen it.
+    if (host.hidden && selection.id !== shownId) { opened = true; reveal?.(true); }
     const scroller = view.querySelector('.fd-body');
     const keep = selection.id === shownId ? scroller?.scrollTop || 0 : 0;
     const hadFocus = view.contains(document.activeElement);

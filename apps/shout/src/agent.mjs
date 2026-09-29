@@ -10,6 +10,11 @@ const VERSION = 'codex-cli 0.157.1';
 // Codex features that would give the model tools of its own. SHOUT's agent only gets SHOUT's tools.
 const DISABLED = ['shell_tool', 'unified_exec', 'apps', 'plugins', 'multi_agent', 'multi_agent_v2', 'browser_use', 'computer_use',
   'image_generation', 'view_image', 'hooks', 'code_mode', 'code_mode_host', 'goals', 'memories'];
+/** Resolves true once `promise` settles, or false after `ms`. */
+export const settlesWithin = (promise, ms) => {
+  let timer;
+  return Promise.race([promise.then(() => true, () => true), new Promise(resolveLate => { timer = setTimeout(resolveLate, ms, false); })]).finally(() => clearTimeout(timer));
+};
 
 /**
  * SHOUT's conversational agent: one persistent `codex app-server` thread per session. The
@@ -20,8 +25,9 @@ const DISABLED = ['shell_tool', 'unified_exec', 'apps', 'plugins', 'multi_agent'
  * config, AGENTS.md, MCP servers and plugins never reach the thread. Only the login is shared.
  */
 export class CodexAgent {
-  constructor({ home, binary = process.env.CODEX_BIN || 'codex' }) {
-    this.home = home; this.binary = binary;
+  /** `stopWaitMs`: how long a new turn waits for Codex to confirm that a cancelled turn on its thread has stopped. */
+  constructor({ home, binary = process.env.CODEX_BIN || 'codex', stopWaitMs = 10_000 }) {
+    this.home = home; this.binary = binary; this.stopWaitMs = stopWaitMs;
     this.child = null; this.ready = null; this.nextId = 0;
     this.pending = new Map(); this.turns = new Map(); this.loaded = new Set();
   }
@@ -123,18 +129,22 @@ export class CodexAgent {
    * to `onToolCall({ tool, input })`, which returns the result text (a thrown error is a failed call).
    * `model` and `effort` override the thread's model for this turn and the turns after it. The `thread`
    * option (the startThread arguments, which ClaudeAgent needs on every turn) is ignored: Codex keeps them with the thread.
+   * A cancelled turn stays on its thread until Codex confirms the interrupt; a new turn waits for that (up to `stopWaitMs`).
    */
   async turn(threadId, text, { onToolCall, onEvent = () => {}, signal, model, effort }) {
     await this.ensure();
     // After an app or app-server restart the thread (history and tools) is reloaded from disk.
     if (!this.loaded.has(threadId)) { await this.request('thread/resume', { threadId, excludeTurns: true }); this.loaded.add(threadId); }
+    const previous = this.turns.get(threadId);
+    if (previous?.stopping) await settlesWithin(previous.ended, this.stopWaitMs);
     signal?.throwIfAborted();
-    if (this.turns.has(threadId)) throw new Error('This thread already has a turn in progress');
+    if (this.turns.has(threadId)) throw new Error(this.turns.get(threadId).stopping ? 'The previous turn is still stopping; try again shortly' : 'This thread already has a turn in progress');
     return new Promise((resolveTurn, reject) => {
-      const turn = { onToolCall, onEvent, id: null, error: null,
-        resolve: value => { signal?.removeEventListener('abort', abort); resolveTurn(value); },
-        reject: error => { signal?.removeEventListener('abort', abort); reject(error); } };
-      const abort = () => { if (turn.id) void this.request('turn/interrupt', { threadId, turnId: turn.id }).catch(() => {}); };
+      let ended;
+      const turn = { onToolCall, onEvent, id: null, error: null, stopping: false, ended: new Promise(resolveEnded => { ended = resolveEnded; }),
+        resolve: value => { signal?.removeEventListener('abort', abort); ended(); resolveTurn(value); },
+        reject: error => { signal?.removeEventListener('abort', abort); ended(); reject(error); } };
+      const abort = () => { turn.stopping = true; if (turn.id) void this.request('turn/interrupt', { threadId, turnId: turn.id }).catch(() => {}); };
       signal?.addEventListener('abort', abort, { once: true });
       this.turns.set(threadId, turn);
       this.request('turn/start', { threadId, input: [{ type: 'text', text, text_elements: [] }], ...(model ? { model } : {}), ...(effort ? { effort } : {}) })

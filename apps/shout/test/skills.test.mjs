@@ -88,7 +88,11 @@ test('workspace skills shadow built-ins, compile errors block the run, unknown c
   store.send(session.data.id, '/missing'); await session.task;
   assert.match(session.data.messages.at(-1).content, /no `\/missing` skill/);
   store.send(session.data.id, '/skills'); await session.task;
-  assert.match(session.data.messages.at(-1).content, /Workspace skills[\s\S]*`\/broken`.*has errors/);
+  assert.match(session.data.messages.at(-1).content, /Workspace skills[\s\S]*`\/broken` Broken \(has errors\)$/m);
+  store.send(session.data.id, '/help'); await session.task;
+  const help = session.data.messages.at(-1).content;
+  assert.match(help, /read-only sub-agents\.\n\n\*\*Workspace skills\*\*[\s\S]*\*\*Built-in skills\*\*[\s\S]*\*\*Commands\*\*\n- `\/skills` List available skills\n- `\/help` /);
+  assert.doesNotMatch(help, /panel/i);
 });
 
 test('unsupported entry input fields are reported before running', async t => {
@@ -123,9 +127,35 @@ test('cancelling during a host approval stops the run and writes nothing', async
   const { id } = await waitFor(() => session.data.question);
   session.cancel(); await session.task;
   assert.equal(session.data.status, 'cancelled'); assert.equal(session.data.question, null);
+  assert.equal(session.data.messages.at(-1).content, 'Cancelled.');
   assert.throws(() => session.answer(id, { accept: true }), /no longer pending/);
   await waitFor(() => session.pendingTools.size === 0);
   assert.equal(await readFile(join(workspace, 'notes.txt'), 'utf8'), 'start\nend\n');
+});
+
+test('cancelling after accepted file changes says they remain; an accepted command alone does not', async t => {
+  const twoStep = `${manifest(['workspace.edit', 'shell.run'])}
+export async fn main(args: String) returns String effects [tool.workspace.edit@1, tool.shell.run@1] {
+  let edited = match await tools.workspace.edit.call({ summary: "Add a note", edits: [{ path: "notes.txt", find: "end", replace: "more\\nend" }] }) { Ok(result) => result.accepted Err(_) => false };
+  let first = match await tools.shell.run.call({ command: "echo one", reason: "First" }) { Ok(result) => result.output Err(_) => "failed" };
+  let second = match await tools.shell.run.call({ command: "echo two", reason: "Second" }) { Ok(result) => result.output Err(_) => "failed" };
+  string.join([if (edited) { "edited" } else { "kept" }, first, second], "|")
+}
+`;
+  const { store, session, workspace } = await setup(t, { two: twoStep });
+  const next = async previous => waitFor(() => session.data.question?.id !== previous?.id && session.data.question);
+  store.send(session.data.id, '/two');
+  let question = await next(); session.answer(question.id, { accept: false });
+  question = await next(question); session.answer(question.id, { accept: true });
+  await next(question); session.cancel(); await session.task;
+  assert.equal(session.data.messages.at(-1).content, 'Cancelled.');
+  await waitFor(() => session.pendingTools.size === 0);
+  store.send(session.data.id, '/two');
+  question = await next(); session.answer(question.id, { accept: true });
+  await next(question); session.cancel(); await session.task;
+  assert.equal(session.data.messages.at(-1).content, 'Cancelled. Changes already written remain in the workspace.');
+  await waitFor(() => session.pendingTools.size === 0);
+  assert.equal(await readFile(join(workspace, 'notes.txt'), 'utf8'), 'start\nmore\nend\n');
 });
 
 test('typed user.ask questions get a schema and record-shaped entry input', async t => {
@@ -139,6 +169,37 @@ test('typed user.ask questions get a schema and record-shaped entry input', asyn
   assert.equal(session.data.messages.at(-1).content, 'hello Ada !');
   assert.match(session.data.messages.at(-2).content, /Answered/);
   assert.ok(workspace);
+});
+
+test('approvals and answers are recorded as structured echoes beside plain prose', async t => {
+  const shell = `${manifest(['shell.run'])}
+export async fn main(args: String) returns String effects [tool.shell.run@1] {
+  match await tools.shell.run.call({ command: args, reason: "Test" }) { Ok(result) => result.output Err(_) => "failed" }
+}
+`;
+  const { store, session } = await setup(t, { note: editSkill, sh: shell, greet: askSkill });
+  const answer = async (text, value, origin) => {
+    store.send(session.data.id, text);
+    const question = await waitFor(() => session.data.question);
+    session.answer(question.id, value, origin); await session.task;
+    return question;
+  };
+  assert.equal((await answer('/note one', { accept: true })).prompt.system, '', 'the title already says what approving does');
+  await answer('/note two', { accept: false });
+  assert.equal((await answer('/sh echo hi', { accept: true })).prompt.system, 'Runs with your user permissions.');
+  await answer('/sh echo no', { accept: false }, 'auto-review');
+  await answer('/greet hi', { name: 'Ada', loud: false });
+  const long = { name: 'x'.repeat(600), loud: true };
+  await answer('/greet hi', long, 'auto-review');
+  assert.deepEqual(session.data.messages.filter(message => message.echo).map(({ role, content, echo }) => ({ role, content, echo })), [
+    { role: 'user', content: 'Apply these changes.', echo: { kind: 'approval', accept: true, origin: 'user' } },
+    { role: 'user', content: 'Decline these changes.', echo: { kind: 'approval', accept: false, origin: 'user' } },
+    { role: 'user', content: 'Run `echo hi`.', echo: { kind: 'approval', accept: true, command: 'echo hi', origin: 'user' } },
+    { role: 'system', content: '[auto-review] Decline this command.', echo: { kind: 'approval', accept: false, command: 'echo no', origin: 'auto-review' } },
+    { role: 'user', content: 'Answered: {"name":"Ada","loud":false}', echo: { kind: 'answer', value: { name: 'Ada', loud: false }, origin: 'user' } },
+    { role: 'system', content: `[auto-review] Answered: ${JSON.stringify(long).slice(0, 500)}`, echo: { kind: 'answer', value: `${JSON.stringify(long).slice(0, 499)}…`, truncated: true, origin: 'auto-review' } },
+  ]);
+  assert.match(session.history(40), /^user: Run `echo hi`\.$/m, 'skills still read the echoes as conversation');
 });
 
 test('git.run is read-only; declared tool errors reach the program instead of failing the run', async t => {

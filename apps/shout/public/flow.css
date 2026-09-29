@@ -1,0 +1,229 @@
+/* Flow: the chat pane's canvas of cards (flow-canvas.js) and the selected step's detail (flow-detail.js).
+   Built on the tokens in style.css. Cards come in two widths: a step, and a wide card for messages and structure. */
+.flow-stage{--fl-step:360px;--fl-wide:640px;position:relative;flex:1;min-height:0;overflow:hidden;cursor:grab;touch-action:none;
+  background-color:var(--bg-subtle);background-image:radial-gradient(circle,color-mix(in srgb,var(--text-3) 32%,transparent) 1px,transparent 1.2px);background-size:22px 22px}
+.flow-stage:active{cursor:grabbing}
+.fl-world{position:absolute;left:0;top:0;transform-origin:0 0;will-change:transform}
+.fl-edges{position:absolute;left:0;top:0;width:1px;height:1px;overflow:visible}
+.le{fill:none;stroke:color-mix(in srgb,var(--text-3) 50%,transparent);stroke-width:1.5}
+.le.hot{stroke:var(--accent);stroke-width:2;stroke-dasharray:6 6;animation:le-flow .8s linear infinite}
+.le.hot.model{stroke:var(--model)}.le.hot.tool{stroke:var(--tool)}.le.hot.vm{stroke:var(--vm)}.le.hot.waiting{stroke:var(--warn)}
+@keyframes le-flow{to{stroke-dashoffset:-12}}
+.le-knot{fill:var(--bg-subtle);stroke:color-mix(in srgb,var(--text-3) 60%,transparent);stroke-width:1.5}
+
+/* Frames. A run: dashed, its colour says live or finished. A loop that has run once, and an open loop
+   group: a quiet solid box in the ALLEN colour. */
+.fl-frame{position:absolute;left:0;top:0;border:1.5px dashed color-mix(in srgb,var(--text-3) 35%,transparent);border-radius:18px;pointer-events:none;transition:border-color .4s,background-color .4s}
+.fl-frame.active{border-color:color-mix(in srgb,var(--accent) 55%,transparent);background:color-mix(in srgb,var(--accent) 4%,transparent)}
+.fl-frame.failed,.fl-frame.interrupted{border-color:color-mix(in srgb,var(--danger) 45%,transparent)}
+.fl-frame.loop,.fl-frame.group{border:1px solid color-mix(in srgb,var(--vm) 26%,transparent);background:color-mix(in srgb,var(--vm) 4%,transparent);border-radius:16px}
+.fl-frame.loop.active,.fl-frame.group.active{border-color:color-mix(in srgb,var(--vm) 55%,transparent)}
+.fl-frame-label{position:absolute;left:12px;top:7px;display:flex;align-items:center;gap:8px;max-width:calc(100% - 24px);padding:1px 4px;border-radius:var(--radius-xs);background:var(--bg-subtle);font:600 var(--fs-sm) var(--mono);color:var(--text-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fl-frame.active .fl-frame-label{background:color-mix(in srgb,var(--accent) 4%,var(--bg-subtle))}
+.fl-frame.loop .fl-frame-label{color:color-mix(in srgb,var(--vm) 70%,var(--text-2));background:color-mix(in srgb,var(--vm) 5%,var(--bg-subtle))}
+
+/* Cards */
+.fl-card{--c:var(--harness);position:absolute;left:0;top:0;width:var(--fl-step);max-width:var(--row-width,980px);box-sizing:border-box;padding:10px 14px 11px;border:1px solid var(--border);border-radius:var(--radius-lg);background:var(--surface);box-shadow:var(--shadow-md);
+  font-size:var(--fs);line-height:1.5;cursor:default;transition:opacity .35s ease,translate .35s ease,border-color .2s,box-shadow .3s;will-change:transform}
+.fl-card.enter{opacity:0;translate:0 10px}
+.fl-card.user{--c:var(--user)}.fl-card.model{--c:var(--model)}.fl-card.vm{--c:var(--vm)}.fl-card.tool{--c:var(--tool)}
+.fl-card.msg,.fl-card.group,.fl-card.stack{width:var(--fl-wide)}
+.fl-card.msg.final{width:860px;padding:16px 22px 18px}
+.fl-card.hub{border-color:color-mix(in srgb,var(--c) 35%,var(--border));background:color-mix(in srgb,var(--c) 6%,var(--surface))}
+.fl-card.msg.user{background:var(--bg-sunken);box-shadow:var(--shadow-sm)}
+.fl-card.msg.harness{border-color:color-mix(in srgb,var(--harness) 30%,var(--border))}
+.fl-card.selectable{cursor:pointer}
+.fl-card.selectable:hover{border-color:var(--border-strong)}
+.fl-card.hub.selectable:hover{border-color:color-mix(in srgb,var(--c) 60%,var(--border))}
+.fl-card.msg.harness,.fl-card.msg.harness .fl-md *{cursor:text}
+.fl-card.selected,.fl-card.selected:hover{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent),0 0 0 5px var(--ring),var(--shadow-md)}
+.fl-card:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+.fl-card.stale{opacity:.55;border-style:dashed}
+.fl-card.fail,.fl-card.failed{border-color:color-mix(in srgb,var(--danger) 50%,var(--border))}
+/* The card doing work glows; a card waiting on you glows amber. The dot becomes a spinner. */
+.fl-card.active,.fl-card.waiting{border-color:var(--c);box-shadow:0 0 0 4px color-mix(in srgb,var(--c) 18%,transparent),0 14px 36px color-mix(in srgb,var(--c) 24%,transparent)}
+.fl-card.waiting{--c:var(--warn)}
+.fl-card.active>.fl-head .fl-dot{background:transparent;border:2px solid color-mix(in srgb,var(--c) 30%,transparent);border-top-color:var(--c);animation:spin .8s linear infinite}
+.fl-card.waiting>.fl-head .fl-dot{animation:fl-ping 1.4s ease-out infinite}
+.fl-card.active>.fl-head .fl-time,.fl-card.waiting>.fl-head .fl-time{color:color-mix(in srgb,var(--c) 85%,var(--text));font-weight:600}
+
+.fl-head{display:flex;align-items:center;gap:8px;white-space:nowrap;min-height:20px;min-width:0}
+.fl-title{flex:0 1 auto;font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis}
+.fl-dot{width:9px;height:9px;border-radius:50%;background:var(--c);flex-shrink:0;box-sizing:border-box}
+/* Durations under a second wait for hover or focus; the element stays for the layout and for tests. */
+.fl-time{margin-left:auto;padding-left:6px;font:var(--fs-xs) var(--mono);color:var(--text-3);font-variant-numeric:tabular-nums;transition:opacity .15s}
+.fl-time.short{opacity:0}
+.fl-card:hover .fl-time.short,.fl-card:focus-within .fl-time.short,.fl-card.selected .fl-time.short,.fl-rows .fl-time.short{opacity:1}
+.fl-icon{display:grid;place-items:center;width:18px;height:18px;border-radius:50%;flex-shrink:0}
+.fl-icon svg,.fl-state svg,.fl-fails svg,.fl-step svg,.fl-chevron svg{width:12px;height:12px;stroke:currentColor;stroke-width:3;fill:none;stroke-linecap:round;stroke-linejoin:round}
+.fl-card.pass .fl-icon{background:color-mix(in srgb,var(--ok) 18%,transparent);color:var(--ok)}
+.fl-card.fail .fl-icon{background:color-mix(in srgb,var(--danger) 18%,transparent);color:var(--danger)}
+.fl-card.declined .fl-icon{background:var(--bg-sunken);color:var(--text-2)}
+.fl-chip{flex:0 100 auto;min-width:0;padding:0 6px;border:1px solid var(--border);border-radius:var(--radius-xs);background:var(--bg-sunken);color:var(--text-2);font:var(--fs-xs)/18px var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fl-chip.retry{flex-shrink:0;border-color:var(--warn-border);background:var(--warn-soft);color:color-mix(in srgb,var(--warn) 80%,var(--text))}
+.fl-chip.strong{color:color-mix(in srgb,var(--c) 80%,var(--text));border-color:color-mix(in srgb,var(--c) 40%,var(--border))}
+.fl-text{margin-top:4px;color:var(--text);overflow-wrap:anywhere;white-space:pre-line}
+.fl-text.muted{color:var(--text-2)}
+.fl-text.clamp1,.fl-text.clamp2{display:-webkit-box;-webkit-box-orient:vertical;overflow:hidden}
+.fl-text.clamp1{-webkit-line-clamp:1}.fl-text.clamp2{-webkit-line-clamp:2}
+.fl-text.error{color:var(--danger)}
+.fl-code{margin-top:4px;font:var(--fs-sm)/1.5 var(--mono);color:var(--text-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fl-md{font-size:var(--fs-md);line-height:1.6;overflow-wrap:anywhere}
+.fl-md>:last-child{margin-bottom:0}
+.fl-md.clamped{max-height:10em;overflow:hidden;-webkit-mask-image:linear-gradient(to bottom,#000 62%,transparent)}
+.fl-card.final .fl-md{font-size:var(--fs-md)}
+.fl-card.msg.user .fl-text{margin-top:0}
+/* The branch taken to reach a card sits on its top edge, where the incoming edge arrives. */
+.fl-branch{position:absolute;top:0;left:50%;transform:translate(-50%,-55%);padding:0 7px;border:1px solid color-mix(in srgb,var(--vm) 45%,var(--border));border-radius:9px;background:var(--surface);color:color-mix(in srgb,var(--vm) 80%,var(--text));font:600 var(--fs-xs)/16px var(--mono);white-space:nowrap;cursor:help}
+
+/* Structure: loop groups (tiles), stacks (a count, a strip, rows) and parallel tracks (rows). */
+.fl-card.group>.fl-head,.fl-card.stack>.fl-head{cursor:pointer}
+.fl-toggle{display:flex;align-items:center;gap:8px;min-width:0;text-align:left;border-radius:var(--radius-sm)}
+.fl-title.code{font:600 var(--fs-sm) var(--mono)}
+.fl-count{flex-shrink:0;padding:0 6px;border-radius:9px;background:color-mix(in srgb,var(--c) 14%,var(--surface));color:color-mix(in srgb,var(--c) 80%,var(--text));font:600 var(--fs-xs)/18px var(--mono)}
+.fl-fails{display:inline-flex;align-items:center;gap:4px;flex-shrink:0;color:var(--danger);font:600 var(--fs-xs) var(--mono)}
+.fl-chevron{display:grid;place-items:center;width:16px;height:16px;margin-left:2px;flex-shrink:0;color:var(--text-3);transition:transform .15s}
+.fl-card.expanded .fl-chevron{transform:rotate(90deg)}
+.fl-stepper{display:inline-flex;align-items:center;gap:2px;flex-shrink:0;margin-left:6px;font:600 var(--fs-xs) var(--mono);color:var(--text-2)}
+.fl-step{width:22px;height:22px;display:grid;place-items:center;border-radius:var(--radius-sm);color:var(--text-2)}
+.fl-step span{display:grid}
+.fl-step:hover:not(:disabled){background:var(--surface-hover);color:var(--text)}
+.fl-step.next svg{transform:scaleX(-1)}
+.fl-tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(148px,1fr));gap:8px;margin-top:10px}
+.fl-tile{display:flex;flex-direction:column;gap:2px;min-width:0;padding:7px 10px 8px;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);text-align:left}
+.fl-tile:hover{border-color:var(--border-strong)}
+.fl-tile.active{border-color:color-mix(in srgb,var(--vm) 55%,var(--border))}
+.fl-tile.waiting{border-color:var(--warn-border);background:var(--warn-soft)}
+.fl-tile.failed{border-color:color-mix(in srgb,var(--danger) 40%,var(--border))}
+.fl-tile.open,.fl-tile.open:hover{border-color:var(--accent);background:var(--accent-soft)}
+.fl-tile-top{display:flex;align-items:center;gap:7px;font:600 var(--fs-sm) var(--mono)}
+.fl-tile-top .fl-time{font-size:var(--fs-xs)}
+.fl-tile-now{font-size:var(--fs-sm);color:var(--text-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fl-tiles.compact{grid-template-columns:repeat(auto-fill,minmax(34px,1fr));gap:4px}
+.fl-tiles.compact .fl-tile{align-items:center;padding:2px 0;font:600 var(--fs-xs)/18px var(--mono);color:var(--text-2)}
+.fl-tiles.compact .fl-tile.failed{color:var(--danger)}
+.fl-state{display:grid;place-items:center;width:14px;height:14px;border-radius:50%;flex-shrink:0;box-sizing:border-box}
+.fl-state span{display:grid}
+.fl-state svg{width:9px;height:9px;stroke-width:3.4}
+.fl-state.ok{background:color-mix(in srgb,var(--ok) 18%,transparent);color:var(--ok)}
+.fl-state.failed{background:color-mix(in srgb,var(--danger) 18%,transparent);color:var(--danger)}
+.fl-state.active{border:2px solid color-mix(in srgb,var(--vm) 30%,transparent);border-top-color:var(--vm);animation:spin .8s linear infinite}
+.fl-state.waiting{--c:var(--warn);width:9px;height:9px;margin:0 2.5px;background:var(--warn);animation:fl-ping 1.4s ease-out infinite}
+.fl-state.stale{border:1.5px dashed var(--text-3)}
+.fl-pips{display:flex;gap:2px;height:4px;margin-top:6px}
+.fl-pips i{flex:1;min-width:2px;border-radius:2px;background:var(--bg-sunken)}
+.fl-card.stack .fl-pips i{max-width:16px}
+.fl-pips i.m{background:var(--model)}.fl-pips i.t{background:var(--tool)}.fl-pips i.w{background:var(--warn)}.fl-pips i.x{background:var(--danger)}
+.fl-pips i.live{animation:pulse 1.2s infinite}
+.fl-rows{list-style:none;display:grid;gap:1px;margin:8px -6px 0;padding:0}
+.fl-card.stack .fl-rows{display:block;columns:2 260px;column-gap:8px}
+.fl-card.stack .fl-rows li{break-inside:avoid}
+.fl-rows.bare .fl-row{grid-template-columns:minmax(0,1fr) auto auto 14px}
+.fl-rows.bare .fl-row-dot{display:none}
+.fl-row{display:grid;grid-template-columns:6px minmax(0,1fr) auto auto 14px;align-items:center;gap:8px;width:100%;padding:3px 6px;border-radius:var(--radius-sm);text-align:left;font-size:var(--fs-sm)}
+.fl-row:hover{background:var(--surface-hover)}
+.fl-row.selected,.fl-row.selected:hover{background:var(--accent-soft);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--accent) 45%,transparent)}
+.fl-row-dot{--c:var(--harness);width:6px;height:6px;border-radius:50%;background:var(--c)}
+.fl-row-dot.model{--c:var(--model)}.fl-row-dot.tool{--c:var(--tool)}.fl-row-dot.user{--c:var(--warn)}.fl-row-dot.vm{--c:var(--vm)}
+.fl-row-arg{min-width:0;font:var(--fs-sm) var(--mono);color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fl-row.fail .fl-row-arg{color:var(--danger)}
+.fl-row.stale .fl-row-arg{color:var(--text-3)}
+.fl-row-result{font:var(--fs-xs) var(--mono);color:var(--text-3);white-space:nowrap}
+.fl-row .fl-time{padding:0;font-size:var(--fs-xs)}
+.fl-row .fl-state.ok{background:none;color:color-mix(in srgb,var(--ok) 65%,var(--text-3))}
+.fl-row .fl-state.active{width:12px;height:12px}
+
+/* Flow mode: the canvas fills the pane and the composer floats over its bottom edge. */
+.conversation.flow-mode .composer-area{position:absolute;left:0;right:0;bottom:0;z-index:4;padding-top:28px;background:linear-gradient(to top,var(--bg-subtle) 55%,transparent);pointer-events:none}
+.conversation.flow-mode .composer-area>*{pointer-events:auto}
+.fl-follow{position:absolute;right:16px;bottom:16px;width:36px;height:36px;display:grid;place-items:center;border-radius:50%;background:var(--accent);color:var(--accent-fg);box-shadow:var(--shadow-md)}
+.fl-follow svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes fl-ping{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--c) 60%,transparent)}100%{box-shadow:0 0 0 8px transparent}}
+@media (prefers-reduced-motion:reduce){.fl-card,.le,.fl-state,.fl-pips i{animation:none!important;transition:none!important}}
+
+/* Step detail: takes over the side panel while a card is selected. */
+.side-panel.showing-step>:not(.flow-detail){display:none!important}
+.flow-detail{display:flex;flex-direction:column;flex:1;min-height:0;outline:none}
+.fd-head{--c:var(--harness);display:flex;align-items:center;gap:8px;height:48px;padding:0 8px 0 14px;border-bottom:1px solid var(--border);flex-shrink:0;min-width:0}
+.fd-head[data-kind=model]{--c:var(--model)}.fd-head[data-kind=tool]{--c:var(--tool)}.fd-head[data-kind=user]{--c:var(--user)}.fd-head[data-kind=vm]{--c:var(--vm)}
+.fd-dot{width:9px;height:9px;border-radius:50%;background:var(--c);flex-shrink:0}
+.fd-title{font-size:var(--fs-md);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fd-state{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.fd-state.active{background:var(--accent);animation:pulse 1.2s infinite}
+.fd-state.failed{background:var(--danger)}
+.fd-spacer{flex:1}
+.fd-body{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:10px;padding:12px 14px 28px;font-size:var(--fs);line-height:1.55}
+.fd-meta{font:var(--fs-sm) var(--mono);color:var(--text-3)}
+.fd-path{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;font:var(--fs-sm) var(--mono);color:var(--text-2)}
+.fd-sep{color:var(--text-3)}
+.fd-crumb.loop{color:color-mix(in srgb,var(--vm) 80%,var(--text))}
+.fd-crumb.branch,.fd-chip.branch{padding:0 6px;border:1px solid color-mix(in srgb,var(--vm) 45%,var(--border));border-radius:9px;background:var(--surface);color:color-mix(in srgb,var(--vm) 80%,var(--text));font:600 var(--fs-xs)/16px var(--mono)}
+.fd-crumb[title]{cursor:help}
+.fd-condition{display:flex;align-items:baseline;gap:8px;min-width:0}
+.fd-condition code{min-width:0;font:var(--fs-sm) var(--mono);color:var(--text-2);overflow-wrap:anywhere}
+.fd-source{display:grid;gap:2px;width:100%;padding:7px 10px;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);text-align:left}
+.fd-source:hover{border-color:var(--border-strong)}
+.fd-source-at{font:600 var(--fs-xs) var(--mono);color:var(--accent-text)}
+.fd-source code{font:var(--fs-sm)/1.5 var(--mono);color:var(--text);white-space:pre-wrap;overflow-wrap:anywhere}
+.fd-section{display:grid;gap:6px;min-width:0}
+.fd-label{margin:4px 0 0;font-size:var(--fs-sm);font-weight:600;color:var(--text-3)}
+.fd-pre{margin:0;max-height:420px;overflow:auto;padding:8px 10px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg-sunken);color:var(--text-2);font:var(--fs-xs)/1.55 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere}
+.fd-chips,.fd-files{display:flex;flex-wrap:wrap;gap:4px}
+.fd-chip{padding:0 7px;border:1px solid var(--border);border-radius:var(--radius-xs);background:var(--bg-sunken);color:var(--text-2);font:var(--fs-xs)/19px var(--mono)}
+.fd-file{max-width:100%;padding:0 7px;border:1px solid var(--border);border-radius:var(--radius-xs);background:var(--surface);color:var(--accent-text);font:var(--fs-xs)/20px var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fd-file:hover{border-color:var(--border-strong)}
+.fd-error{margin:0;color:var(--danger);overflow-wrap:anywhere}
+.fd-role,.fd-muted{margin:0;color:var(--text-2)}
+.fd-task,.fd-text{margin:0;overflow-wrap:anywhere}
+.fd-text{white-space:pre-wrap}
+.fd-md{overflow-wrap:anywhere}
+.fd-items{list-style:none;display:grid;gap:6px;margin:0;padding:0}
+.fd-item{display:grid;gap:1px;padding:7px 10px;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface)}
+.fd-item.high,.fd-item.critical{border-color:var(--danger-border)}.fd-item.medium{border-color:var(--warn-border)}
+.fd-item-meta{font:var(--fs-xs) var(--mono);color:var(--text-3)}
+.fd-item p{margin:2px 0 0;color:var(--text-2);font-size:var(--fs-sm)}
+.fd-details summary{width:max-content;font-size:var(--fs-sm);font-weight:600;color:var(--text-3);cursor:pointer}
+.fd-details summary:hover{color:var(--text-2)}
+.fd-details .fd-pre{margin-top:6px}
+.fd-events{list-style:none;margin:0 -6px;padding:0}
+.fd-event{display:flex;gap:8px;width:100%;padding:2px 6px;border-radius:var(--radius-sm);color:var(--text-2);font:var(--fs-sm)/1.6 var(--mono);text-align:left}
+.fd-event:hover{background:var(--surface-hover);color:var(--text)}
+.fd-seq{min-width:4ch;color:var(--text-3);text-align:right}
+
+/* Sub-agents: the fleet card (one tile per agent, the loop tiles' family) and a sub-agent's tab. */
+:root{--agent:light-dark(#c2267e,#f472b6)}
+.fl-card.agent{--c:var(--agent)}
+.fl-card.fleet{width:var(--fl-wide);border-color:color-mix(in srgb,var(--c) 35%,var(--border));background:color-mix(in srgb,var(--c) 5%,var(--surface))}
+.fl-card.fleet .fl-role{min-width:0;color:var(--text-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fl-card.fleet.active{box-shadow:0 0 0 4px color-mix(in srgb,var(--c) 14%,transparent),0 14px 36px color-mix(in srgb,var(--c) 18%,transparent)}
+.fl-tiles.fleet{grid-template-columns:repeat(auto-fill,minmax(148px,1fr))}
+.fleet-tile .fl-tile-n{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fleet-tile .fl-tile-top .fl-time{margin-left:auto}
+.fleet-tile.active{border-color:color-mix(in srgb,var(--agent) 55%,var(--border))}
+.fleet-tile .fl-state.active{border-color:color-mix(in srgb,var(--agent) 30%,transparent);border-top-color:var(--agent)}
+.fleet-tile.queued .fl-tile-n,.fleet-tile.stale .fl-tile-n{color:var(--text-2)}
+.fleet-tile.failed .fl-tile-now{color:var(--danger)}
+.fl-state.queued{border:1.5px dashed var(--text-3)}
+.fl-pips i.empty{background:var(--bg-sunken)}
+.fl-card.msg.agent{border-color:color-mix(in srgb,var(--agent) 30%,var(--border))}
+.le.hot.agent{stroke:var(--agent)}
+.agent-pane{display:flex;flex-direction:column;min-height:0;min-width:0}
+.agent-header{display:flex;align-items:center;gap:8px;height:34px;padding:0 12px 0 14px;border-bottom:1px solid var(--border);flex-shrink:0;min-width:0}
+.agent-name{font:600 var(--fs-sm) var(--mono);color:color-mix(in srgb,var(--agent) 75%,var(--text));white-space:nowrap}
+.agent-meta{margin-left:auto;font:var(--fs-xs) var(--mono);color:var(--text-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.agent-brief{display:block;flex-shrink:0;width:100%;padding:7px 14px;border-bottom:1px solid var(--border);background:var(--bg-subtle);color:var(--text-2);font-size:var(--fs-sm);line-height:1.5;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.agent-brief:hover{color:var(--text)}
+.agent-brief[aria-expanded=true]{white-space:pre-wrap;max-height:40vh;overflow:auto}
+.agent-error{flex-shrink:0;margin:0;padding:6px 14px;border-bottom:1px solid var(--danger-border);background:var(--danger-soft);color:var(--danger);font-size:var(--fs-sm)}
+.agent-stage{flex:1}
+.fd-attempts{list-style:none;display:grid;gap:6px;margin:0;padding:0}
+.fd-attempt{display:grid;gap:4px;padding:7px 10px;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface)}
+.fd-attempt.rejected,.fd-attempt.failed{border-color:var(--warn-border)}
+.fd-attempt-head{display:flex;align-items:center;gap:8px;font:var(--fs-sm) var(--mono)}
+.fd-mark{width:8px;height:8px;border-radius:50%;background:var(--text-3);flex-shrink:0}
+.fd-mark.ok{background:var(--ok)}.fd-mark.rejected{background:var(--warn)}.fd-mark.failed{background:var(--danger)}.fd-mark.active{background:var(--accent);animation:pulse 1.2s infinite}
+.fd-issues{list-style:none;display:grid;gap:2px;margin:0;padding:0;font-size:var(--fs-sm);color:var(--text-2)}
+.fd-issues li{display:flex;flex-wrap:wrap;gap:6px;align-items:baseline;overflow-wrap:anywhere}
+.fd-issues code{font:var(--fs-xs) var(--mono);color:var(--text)}
+

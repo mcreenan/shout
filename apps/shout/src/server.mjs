@@ -36,6 +36,24 @@ async function claudeStatus() {
 async function modelStatus() { const [codex, claude] = await Promise.all([codexStatus(), claudeStatus()]); return { codex, claude }; }
 const json = (response, status, body) => { response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); response.end(JSON.stringify(body)); };
 const eventStream = response => response.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
+/**
+ * Writes one server-sent event stream. Every event carries the whole state (a snapshot, the sidebar list), so
+ * while a client is not reading only the latest is kept, rendered and sent once it drains; memory stays at
+ * one event per client. A client that stays behind for `stallMs` is disconnected.
+ */
+function eventWriter(response, stallMs) {
+  let latest = null; let stall = null;
+  const open = () => !response.writableEnded && !response.destroyed;
+  // Writing past the buffer starts the clock; the client has until it drains.
+  const write = text => { if (!response.write(text)) stall ??= setTimeout(() => response.destroy(), stallMs); };
+  const send = render => {
+    if (!open()) return;
+    if (response.writableNeedDrain) latest = render; else write(render());
+  };
+  response.on('drain', () => { clearTimeout(stall); stall = null; const render = latest; latest = null; if (render) send(render); });
+  response.on('close', () => { clearTimeout(stall); latest = null; });
+  return { send, beat: () => { if (open() && !response.writableNeedDrain) write(': heartbeat\n\n'); } };
+}
 async function body(request) {
   if (!request.headers['content-type']?.startsWith('application/json')) throw new Error('Expected application/json');
   const chunks = []; let length = 0;
@@ -45,7 +63,7 @@ async function body(request) {
   return value;
 }
 
-export async function startServer({ port = Number(process.env.PORT || 4310), host = process.env.SHOUT_HOST || '0.0.0.0', allowedHosts, stateRoot = process.env.SHOUT_STATE_DIR, defaultWorkspace = process.env.SHOUT_WORKSPACE || process.cwd(), providerFactory, agent, checkProvider = modelStatus } = {}) {
+export async function startServer({ port = Number(process.env.PORT || 4310), host = process.env.SHOUT_HOST || '0.0.0.0', allowedHosts, stateRoot = process.env.SHOUT_STATE_DIR, defaultWorkspace = process.env.SHOUT_WORKSPACE || process.cwd(), providerFactory, agent, checkProvider = modelStatus, streamStallMs = 60_000 } = {}) {
   const hosts = allowedHosts ?? await networkHosts();
   // Per provider ({ codex, claude }); a single status applies to every provider.
   const checked = await checkProvider();
@@ -65,9 +83,9 @@ export async function startServer({ port = Number(process.env.PORT || 4310), hos
   const streams = new Set();
   // The sidebar's stream (/api/stream): projects and thread summaries on connect, then after changes at most
   // every 100 ms, to each client only when they differ from what it last got.
-  const lists = new Map(); let listTimer = null;
+  const lists = new Map(); let listTimer = null; let closing = false;
   const listState = () => JSON.stringify({ projects: store.projectList(), sessions: store.list() });
-  const sendState = (response, state) => { if (lists.get(response) !== state && !response.writableEnded) { lists.set(response, state); response.write(`event: state\ndata: ${state}\n\n`); } };
+  const sendState = (response, state) => { const list = lists.get(response); if (list && list.state !== state) { list.state = state; list.stream.send(() => `event: state\ndata: ${state}\n\n`); } };
   store.on('change', () => {
     if (lists.size) listTimer ??= setTimeout(() => { listTimer = null; const state = listState(); for (const response of lists.keys()) sendState(response, state); }, 100);
   });
@@ -75,15 +93,18 @@ export async function startServer({ port = Number(process.env.PORT || 4310), hos
     response.setHeader('X-Content-Type-Options', 'nosniff');
     response.setHeader('Referrer-Policy', 'no-referrer');
     response.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
+    // A kept-alive connection can still send a request while the server stops.
+    if (closing) { response.setHeader('Connection', 'close'); return json(response, 503, { error: 'SHOUT is stopping' }); }
     try {
       let url;
       try { url = requestUrl(request, hosts, server.address().port); }
       catch (error) { return json(response, 403, { error: error.message }); }
       if (request.method !== 'GET' && request.method !== 'HEAD' && request.headers['x-shout-client'] !== '1') return json(response, 403, { error: 'Missing SHOUT client header' });
-      if (url.pathname === '/api/config' && request.method === 'GET') return json(response, 200, { cwd: process.cwd(), home: homedir(), defaultWorkspace: store.defaultWorkspace, provider, providers: status, scenarios, workflows, models, efforts, defaultModel: sessionDefault });
+      if (url.pathname === '/api/config' && request.method === 'GET') return json(response, 200, { cwd: process.cwd(), home: homedir(), stateDir: store.stateRoot, defaultWorkspace: store.defaultWorkspace, provider, providers: status, scenarios, workflows, models, efforts, defaultModel: sessionDefault });
       if (url.pathname === '/api/stream' && request.method === 'GET') {
-        eventStream(response); lists.set(response, null); sendState(response, listState());
-        const heartbeat = setInterval(() => response.write(': heartbeat\n\n'), 15000);
+        eventStream(response); const stream = eventWriter(response, streamStallMs);
+        lists.set(response, { state: null, stream }); sendState(response, listState());
+        const heartbeat = setInterval(stream.beat, 15000);
         response.on('close', () => { clearInterval(heartbeat); lists.delete(response); });
         return;
       }
@@ -129,9 +150,9 @@ export async function startServer({ port = Number(process.env.PORT || 4310), hos
           if (action === 'files') return json(response, 200, { files: session.data.unavailable ? [] : await session.workspace.list() });
           if (action === 'file') { const path = url.searchParams.get('path'); return json(response, 200, { path, content: await session.workspace.read(path) }); }
           if (action === 'events') {
-            eventStream(response);
-            const send = snapshot => { if (!response.destroyed) response.write(`event: snapshot\ndata: ${JSON.stringify(snapshot)}\n\n`); };
-            const heartbeat = setInterval(() => response.write(': heartbeat\n\n'), 15000);
+            eventStream(response); const stream = eventWriter(response, streamStallMs);
+            const send = snapshot => stream.send(() => `event: snapshot\ndata: ${JSON.stringify(snapshot)}\n\n`);
+            const heartbeat = setInterval(stream.beat, 15000);
             const stop = () => { clearInterval(heartbeat); session.off('snapshot', send); session.off('deleted', deleted); streams.delete(response); };
             // A deleted thread's stream says so and ends, so the client doesn't reconnect.
             const deleted = ({ id }) => { stop(); response.end(`event: deleted\ndata: ${JSON.stringify({ id })}\n\n`); };
@@ -142,7 +163,8 @@ export async function startServer({ port = Number(process.env.PORT || 4310), hos
         }
         if (request.method === 'POST') {
           const input = await body(request);
-          if (action === 'messages') { requireProvider(session.data.model); return json(response, 202, store.send(session.data.id, input.text)); }
+          // A thread whose folder is gone reports that (from send) before any provider problem.
+          if (action === 'messages') { if (!session.data.unavailable) requireProvider(session.data.model); return json(response, 202, store.send(session.data.id, input.text)); }
           if (action === 'answer') return json(response, 200, session.answer(input.id, input.value));
           if (action === 'cancel') return json(response, 200, session.cancel());
           if (action === 'budget') return json(response, 200, session.setTimeBudgets(input.enabled));
@@ -168,7 +190,15 @@ export async function startServer({ port = Number(process.env.PORT || 4310), hos
   });
   await new Promise((resolveReady, reject) => { server.once('error', reject); server.listen(port, host, resolveReady); });
   const url = `http://127.0.0.1:${server.address().port}`;
-  return { server, store, url, urls: accessUrls(hosts, server.address().port, host), async close() { for (const stream of [...streams, ...lists.keys()]) stream.end(); lists.clear(); clearTimeout(listTimer); await store.close(); await new Promise(resolveClosed => server.close(resolveClosed)); } };
+  const endStreams = () => { for (const stream of [...streams, ...lists.keys()]) stream.end(); streams.clear(); lists.clear(); clearTimeout(listTimer); };
+  // Stopping: no new connections or requests, open streams end, sessions close, then any connection left is closed.
+  const close = async () => {
+    closing = true;
+    const stopped = new Promise(resolveClosed => server.close(resolveClosed));
+    endStreams(); await store.close(); endStreams(); server.closeAllConnections();
+    await stopped;
+  };
+  return { server, store, url, urls: accessUrls(hosts, server.address().port, host), close };
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

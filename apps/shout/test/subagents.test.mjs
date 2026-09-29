@@ -205,12 +205,12 @@ test('a restart marks unfinished agents interrupted', async t => {
   await waitFor(() => count(session, 'completed') === 1 && count(session, 'running') === 4);
   await session.persist();
   const restored = await new SessionStore({ stateRoot, agent: new ScriptedAgent() }).init();
-  t.after(() => restored.close());
   const copy = restored.get(session.data.id);
   assert.equal(copy.data.status, 'interrupted');
   assert.deepEqual(statuses(copy), ['completed', 'interrupted', 'interrupted', 'interrupted', 'interrupted']);
   for (const item of copy.data.agents.slice(1)) assert.deepEqual([Boolean(item.endedAt), item.activity], [true, '']);
   assert.equal(copy.data.agents[0].report, 'quick report');
+  await restored.close();
 });
 
 test('child events stay on the agent records and never reach session.events', async t => {

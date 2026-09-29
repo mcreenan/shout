@@ -1,19 +1,29 @@
 //! Catalog-aware ALLEN source checker for SHOUT skills.
 //!
-//! `allen check` compiles against an empty tool catalog, and JOSH `program/load`
-//! reports only a sanitized failure. SHOUT needs the compiler's real diagnostics
-//! for a skill that calls SHOUT's frozen host tools, plus the entry boundary type
-//! so it can build the entry input. This uses the same compiler path as JOSH.
+//! `allen check` compiles against an empty tool catalog. SHOUT lists and
+//! validates skills against its frozen host tools without starting JOSH, and
+//! needs the entry's source-level boundary type to build the entry input.
 //!
 //! Usage: `shout-allen-check <catalog.json>` with ALLEN source on stdin.
 //! Prints one JSON object on stdout and exits 0 unless its own inputs are invalid.
+//!
+//! Compiler diagnostics come from `josh_host::compile_source_bundle`, the path
+//! JOSH's `program/load` and `program/check` use, with the source loaded as
+//! `src/main.allen`, so both report identical diagnostics. A successful check
+//! also returns `debug`: the static control-flow construct and effect-site
+//! tables that `program/load` returns, so construct and site IDs match the
+//! `origin` of the program's provider requests.
 
 use allen_bytecode::ValueType;
-use allen_compiler::{Diagnostic, assemble_inline_source, compile_inline_manifest_source_with_catalog};
-use josh_protocol::{CatalogSetParams, Validate as _};
+use allen_compiler::compile_inline_manifest_source_with_catalog;
+use josh_host::{ProgramDebug, compile_source_bundle};
+use josh_protocol::{CatalogSetParams, FileEncoding, SourceFile, Validate as _};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::process::ExitCode;
+
+const LIMIT: usize = 1024 * 1024;
 
 fn main() -> ExitCode {
     let Some(catalog_path) = std::env::args().nth(1) else {
@@ -28,7 +38,6 @@ fn main() -> ExitCode {
         }
     };
     let mut source = String::new();
-    const LIMIT: usize = 1024 * 1024;
     if std::io::stdin().take(LIMIT as u64 + 1).read_to_string(&mut source).is_err() {
         eprintln!("source must be UTF-8");
         return ExitCode::from(2);
@@ -42,17 +51,12 @@ fn main() -> ExitCode {
 }
 
 fn check(source: &str, catalog: &allen_schema::FrozenCatalog) -> Value {
-    let (manifest, compilation, _) = match compile_inline_manifest_source_with_catalog(source, catalog) {
-        Ok(compiled) => compiled,
-        Err(diagnostics) => {
-            return json!({ "ok": false, "diagnostics": diagnostics.iter().map(|d| diagnostic(source, d)).collect::<Vec<_>>() });
-        }
-    };
-    let Some(manifest) = manifest else {
-        return json!({ "ok": false, "diagnostics": [{ "line": 1, "column": 1, "code": "SHOUT001",
-            "message": "a skill must begin with an inline manifest { ... } block" }] });
-    };
-    let entry = compilation.exported_functions.iter().find(|function| function.function == manifest.entry);
+    // The front end gives the manifest and the entry's source-level signature.
+    let front = compile_inline_manifest_source_with_catalog(source, catalog).ok();
+    let entry = front.as_ref().and_then(|(manifest, compilation, _)| {
+        let name = manifest.as_ref().map_or("main", |manifest| manifest.entry.as_str());
+        compilation.exported_functions.iter().find(|function| function.function == name)
+    });
     let entry = entry.map(|function| json!({
         "name": function.function,
         "input": function.parameter_types.first().map_or(json!({ "type": "void" }), describe),
@@ -61,18 +65,44 @@ fn check(source: &str, catalog: &allen_schema::FrozenCatalog) -> Value {
         "output_spelling": function.return_spelling,
         "effects": function.effects,
     }));
-    // Final assembly applies boundary rules the front end does not, such as the
-    // one-parameter entry limit and non-serializable boundary types.
-    if let Err(message) = assemble_inline_source(source, catalog) {
-        return json!({ "ok": false, "entry": entry, "diagnostics": [{ "line": 1, "column": 1, "code": "SHOUT002", "message": message }] });
-    }
+    // Compile exactly as JOSH loads the skill, so diagnostics match program/load.
+    let files = [SourceFile { path: "src/main.allen".to_owned(), encoding: FileEncoding::Utf8, content: source.to_owned() }];
+    let package = match compile_source_bundle(&files, catalog, LIMIT as u64) {
+        Ok(package) => package,
+        Err(error) => {
+            let diagnostics = if error.diagnostics.is_empty() {
+                vec![json!({ "line": 1, "column": 1, "code": "SHOUT002", "message": error.error.message })]
+            } else {
+                error.diagnostics.iter().map(|diagnostic| json!(diagnostic)).collect()
+            };
+            return json!({ "ok": false, "entry": entry, "diagnostics": diagnostics });
+        }
+    };
+    let Some((Some(manifest), _, _)) = front else {
+        return json!({ "ok": false, "diagnostics": [{ "line": 1, "column": 1, "code": "SHOUT001",
+            "message": "a skill must begin with an inline manifest { ... } block" }] });
+    };
     json!({
         "ok": true,
         "diagnostics": [],
         "entry": entry,
         "capabilities": manifest.capabilities,
         "tools": manifest.tools.iter().map(|tool| tool.name.as_str().to_owned()).collect::<Vec<_>>(),
+        "debug": debug_tables(source, &package.artifact),
     })
+}
+
+/// The `program/load` debug tables for this source loaded as `src/main.allen`.
+fn debug_tables(source: &str, artifact: &allen_bytecode::Artifact) -> Value {
+    let Some(debug) = &artifact.debug else {
+        return Value::Null;
+    };
+    let tool_names = artifact.manifest.as_ref().map_or_else(Vec::new, |manifest| {
+        manifest.required_tools.iter().map(|tool| tool.name.clone()).collect()
+    });
+    let texts = BTreeMap::from([("src/main.allen".to_owned(), source.to_owned())]);
+    let tables = ProgramDebug::new(&artifact.module, debug, &tool_names, &texts).tables(usize::MAX);
+    serde_json::to_value(tables).unwrap_or(Value::Null)
 }
 
 fn describe(value_type: &ValueType) -> Value {
@@ -91,19 +121,6 @@ fn describe(value_type: &ValueType) -> Value {
         ValueType::Map(key, value) => json!({ "type": "map", "key": describe(key), "value": describe(value) }),
         _ => json!({ "type": "other" }),
     }
-}
-
-fn diagnostic(source: &str, diagnostic: &Diagnostic) -> Value {
-    let offset = diagnostic.span.start.min(source.len());
-    let (mut line, mut line_start) = (1, 0);
-    for (index, byte) in source.as_bytes()[..offset].iter().enumerate() {
-        if *byte == b'\n' {
-            line += 1;
-            line_start = index + 1;
-        }
-    }
-    let column = source.get(line_start..offset).map_or(1, |text| text.chars().count() + 1);
-    json!({ "line": line, "column": column, "code": diagnostic.code, "message": diagnostic.message })
 }
 
 fn read_catalog(path: &str) -> Result<allen_schema::FrozenCatalog, String> {

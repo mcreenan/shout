@@ -1,0 +1,113 @@
+SHOUT JOSH/ALLEN patch 0005-constants-with-catalog-tools: top-level constants in programs that call catalog tools
+Base: mcreenan/josh-allen abb8a9782fc438d1b87e8aa2fdaea65e5db633c3 plus the earlier patches in this directory.
+Generated from branch shout/effect-origin of .worktrees/josh-allen:
+  git diff --binary --src-prefix=a/ --dst-prefix=b/ cc34a2e 0f36431
+Commits:
+  0f36431 Evaluate top-level constants in programs that call catalog tools
+
+diff --git a/crates/allen-compiler/src/frontend.rs b/crates/allen-compiler/src/frontend.rs
+index e6d020e..a02ee40 100644
+--- a/crates/allen-compiler/src/frontend.rs
++++ b/crates/allen-compiler/src/frontend.rs
+@@ -1423,12 +1423,21 @@ fn evaluate_constants(
+         concurrent_effects: 0,
+         cleanup_instructions: 0,
+     };
++    // Runtime functions in the same module may call catalog tools. Constants
++    // never do, but the whole preliminary module must verify, so it is checked
++    // against the same frozen tool contracts that the compiler bound.
++    let tool_contracts = bundle_tool_contracts(bundle);
+     let mut values = BTreeMap::new();
+     for symbol in order {
+         let info = &bundle.functions[symbol as usize];
+         let mut module = raw_module.clone();
+         module.entry = info.bytecode.expect("constant bytecode");
+-        let verified = allen_bytecode::verify(module).map_err(|error| {
++        let verified = if tool_contracts.is_empty() {
++            allen_bytecode::verify(module)
++        } else {
++            allen_bytecode::verify_with_frozen_tool_catalog(module, &tool_contracts)
++        }
++        .map_err(|error| {
+             Diagnostic::new(
+                 "E3005",
+                 format!(
+@@ -1456,6 +1465,22 @@ fn evaluate_constants(
+     Ok(values)
+ }
+ 
++/// Verification contracts for the catalog tools bound in one bundle, in
++/// contract order, with types in the bundle's enum numbering.
++fn bundle_tool_contracts(bundle: &ResolvedBundle) -> Vec<allen_bytecode::ToolVerificationContract> {
++    let mut bindings = bundle.tools.values().collect::<Vec<_>>();
++    bindings.sort_by_key(|binding| binding.contract);
++    bindings
++        .into_iter()
++        .map(|binding| allen_bytecode::ToolVerificationContract {
++            tool_name: binding.source_path.join("."),
++            input: binding.input.clone(),
++            output: binding.output.clone(),
++            declared_error: binding.declared_error.clone(),
++        })
++        .collect()
++}
++
+ fn is_constant_expression(expression: &LoweredExpr) -> bool {
+     match &expression.kind {
+         LoweredExprKind::Unit
+diff --git a/crates/allen-compiler/src/frontend/tests.rs b/crates/allen-compiler/src/frontend/tests.rs
+index fd62bc9..4ac8ddf 100644
+--- a/crates/allen-compiler/src/frontend/tests.rs
++++ b/crates/allen-compiler/src/frontend/tests.rs
+@@ -8707,3 +8707,51 @@ fn loops_whose_body_ends_in_branches_that_all_leave_through_loop_control_compile
+         );
+     }
+ }
++
++#[test]
++fn top_level_constants_evaluate_in_programs_that_call_catalog_tools() {
++    let definition = allen_schema::ToolDefinition::parse(
++        "example.lookup",
++        "1.0.0",
++        r#"{"type":"object","properties":{"value":{"type":"string"}},"required":["value"],"additionalProperties":false}"#,
++        r#"{"oneOf":[{"type":"object","properties":{"tag":{"type":"string","enum":["found"]},"value":{"type":"string"}},"required":["tag","value"],"additionalProperties":false},{"type":"object","properties":{"tag":{"type":"string","enum":["missing"]}},"required":["tag"],"additionalProperties":false}]}"#,
++        r#"{"type":"object","properties":{"message":{"type":"string"}},"required":["message"],"additionalProperties":false}"#,
++        Vec::new(),
++        allen_schema::Idempotency::Idempotent,
++        &allen_schema::SchemaLimits::default(),
++    )
++    .unwrap();
++    let catalog = allen_schema::FrozenCatalog::freeze(
++        vec![definition],
++        &allen_schema::CatalogLimits::default(),
++    )
++    .unwrap();
++    let source = r#"manifest {
++  language: "0.1"
++  entry: main
++  capabilities: []
++  tools: { required: [{ name: "example.lookup", version: ">=1.0.0, <2.0.0" }] }
++}
++const GREETING: String = "hello";
++const WORDS: List<String> = [GREETING, "world"];
++export async fn main() returns String effects [tool.example.lookup@1] {
++  match await tools.example.lookup.call({ value: GREETING }) {
++    Ok(_) => string.join(WORDS, " ")
++    Err(_) => "failed"
++  }
++}
++"#;
++    let (_, compilation, _) = compile_inline_manifest_source_with_catalog(source, &catalog)
++        .expect("constants compile beside catalog tool calls");
++    assert!(
++        compilation
++            .module
++            .functions
++            .iter()
++            .any(|function| function
++                .code
++                .iter()
++                .any(|instruction| matches!(instruction, Instruction::ToolInvoke { .. })))
++    );
++    crate::assemble_inline_source(source, &catalog).expect("the program assembles and verifies");
++}

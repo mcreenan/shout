@@ -2,9 +2,17 @@ import { CHAT, uid, createLayout, groups, findGroup, groupOfTab, focusedGroup, a
 import { languageFor, languageLabel, highlightLines, renderTokens } from './highlight.js';
 import { codeBlock, renderMarkdown } from './markdown-dom.js';
 import { createFlowCanvas } from './flow-canvas.js';
+import { createFlowDetail } from './flow-detail.js';
+import { createAgentPane } from './flow-agent.js';
+import { programActivity } from './flow.js';
+import { popover, renderModels, renderEfforts, renderMenu } from './model-picker.js';
+import { askForm, kindOf } from './ask-form.js';
+import * as shell from './desktop.js';
+import { initSidebar, renderSidebar, renderWelcome, renderProviders, setLists, startLive, upsert, handleShortcut, newThread } from './sidebar.js';
+import { summarize } from './sidebar-logic.js';
 
 const $ = (id) => document.getElementById(id);
-const state = { sleepingOpen: localStorage.getItem('shout.sleepingOpen') === '1', sleepingShown: 10, chatMode: localStorage.getItem('shout.chatMode') === 'flow' ? 'flow' : 'chat', config: null, sessions: [], session: null, stream: null, selectedScenario: null, messageSignature: '', questionSignature: '', busy: false, drafts: new Map(), selection: 0, layout: createLayout(), side: 'summary', files: null, filesError: '', expanded: new Set(), lastStatus: null, skills: { sessionId: null, list: null, error: '', at: 0, pending: null } };
+const state = { chatMode: localStorage.getItem('shout.chatMode') === 'flow' ? 'flow' : 'chat', config: null, sessions: [], session: null, stream: null, messageSignature: '', questionSignature: '', busy: false, drafts: new Map(), selection: 0, opening: null, layout: createLayout(), side: 'summary', files: null, filesError: '', expanded: new Set(), lastStatus: null, skills: { sessionId: null, list: null, error: '', at: 0, pending: null } };
 const terminal = new Set(['completed', 'failed', 'cancelled', 'canceled', 'interrupted', 'idle', 'ready']);
 const VIEWS = { trace: { label: 'Events', icon: 'i-list' }, changes: { label: 'Changes', icon: 'i-diff' } };
 const PROGRAM = { label: 'Program', icon: 'i-code' };
@@ -66,44 +74,6 @@ function isActive(session = state.session) {
   return !!session && !terminal.has(session.status) && !!session.status;
 }
 const basename = (path) => path.split('/').pop();
-function scenarioCard(scenario, index, onClick) {
-  const card = el('button', 'scenario-card');
-  card.type = 'button';
-  card.append(el('span', 'scenario-number', String(index + 1).padStart(2, '0')));
-  const copy = el('div');
-  copy.append(el('h3', '', scenario.title));
-  if (scenario.description) copy.append(el('p', '', scenario.description));
-  card.append(copy);
-  card.addEventListener('click', onClick);
-  return card;
-}
-function renderWelcome() {
-  const wrapper = el('div', 'welcome');
-  if (state.session) {
-    wrapper.append(el('h2', '', 'No messages yet'), el('p', '', 'Describe the change you want, or type / to run a skill. Proposed edits wait for your approval before they are applied.'));
-    return wrapper;
-  }
-  const logoFrame = el('div', 'welcome-wordmark wordmark');
-  const logo = el('img', 'wordmark-light');
-  logo.src = '/shout-wordmark.png';
-  logo.alt = 'SHOUT!';
-  logo.width = 1983;
-  logo.height = 793;
-  const darkLogo = el('img', 'wordmark-dark');
-  darkLogo.src = '/shout-wordmark-dark.png';
-  darkLogo.alt = '';
-  darkLogo.width = 1983;
-  darkLogo.height = 793;
-  logoFrame.append(logo, darkLogo);
-  wrapper.append(logoFrame, el('h2', '', 'Start a session'), el('p', '', 'Open a sample workspace, or point SHOUT at your own project.'));
-  const grid = el('div', 'scenario-grid');
-  (state.config?.scenarios || []).forEach((scenario, i) => grid.append(scenarioCard(scenario, i, () => openNewDialog(scenario.id))));
-  wrapper.append(grid);
-  const button = el('button', 'primary-button', 'Open a project');
-  button.addEventListener('click', () => openNewDialog());
-  wrapper.append(button);
-  return wrapper;
-}
 function appendContent(container, text) {
   // Fenced code only. Everything is textContent; model output cannot become HTML.
   const chunks = String(text).split(/```([^\n`]*)\n([\s\S]*?)```/g);
@@ -128,28 +98,97 @@ function runSteps(run) {
   return (state.session?.events || []).filter((event) => event.run === run.id && ['tool.started', 'model.started', 'user.question'].includes(event.type))
     .map((event) => ({ event, label: event.type === 'tool.started' ? event.tool : event.type === 'model.started' ? 'model.request' : 'user.ask', kind: classify(event).kind }));
 }
+const stateText = (value) => (value || 'unknown').replace(/_/g, ' ');
+// A dot for a run or session state; the words are its tooltip and accessible name.
+function stateDot(kind, label) {
+  const dot = el('span', `state-dot ${kind}`);
+  dot.setAttribute('role', 'img');
+  dot.setAttribute('aria-label', label);
+  dot.title = label;
+  return dot;
+}
+const runDot = (run) => stateDot(run.state === 'waiting_user' ? 'question' : runStateKind(run.state), `Run ${state.session.runs.indexOf(run) + 1} · ${stateText(run.state)}`);
+const openRuns = new Set();
+// Icon, name and status dot, then the latest steps in one muted line; expanded, every step.
 function runCard(run) {
-  const runs = state.session.runs;
-  const card = el('div', 'run-card');
+  const card = el('div', `run-card${openRuns.has(run.id) ? ' expanded' : ''}`);
   card.dataset.run = run.id;
-  const head = el('div', 'run-card-head');
   const title = el('span', 'run-card-title');
-  title.append(icon(run.skill ? 'i-skill' : 'i-code'), el('strong', '', runName(run)), el('span', 'run-card-index', `Run ${runs.indexOf(run) + 1}`));
-  head.append(title, el('span', `status-pill ${runStateKind(run.state)}`, (run.state || 'unknown').replace(/_/g, ' ')));
-  const steps = el('ol', 'run-steps');
+  // A skill's name opens its source in a tab; a program the agent wrote has no skill to open.
+  let name = el('strong', '', runName(run));
+  if (run.skill) {
+    const open = el('button', 'run-skill');
+    open.type = 'button';
+    open.setAttribute('aria-label', `Open skill /${run.skill}`);
+    open.append(name);
+    open.addEventListener('click', () => openSkill(run.skill));
+    name = open;
+  }
+  title.append(icon(run.skill ? 'i-skill' : 'i-code'), name, runDot(run));
+  card.append(title);
+  if (['failed', 'interrupted', 'cancelled'].includes(run.state)) card.append(el('span', 'run-state', stateText(run.state)));
   const all = runSteps(run);
-  for (const step of all.slice(0, 14)) steps.append(el('li', `run-step ${step.kind}`, step.label));
-  if (all.length > 14) steps.append(el('li', 'run-step more', `+${all.length - 14}`));
   const actions = el('div', 'run-card-actions');
-  const program = el('button', 'text-button', 'View program');
-  program.addEventListener('click', () => openProgram(run.id, { beside: true }));
-  const flow = el('button', 'text-button', 'Flow');
-  flow.addEventListener('click', () => showFlowChat(run.id));
-  actions.append(program, flow);
-  card.append(head);
-  if (all.length) card.append(steps);
+  if (all.length) {
+    const steps = el('ol', `run-steps${all.length > 6 ? ' long' : ''}`);
+    if (all.length > 60) steps.append(el('li', 'run-step more', `+${all.length - 60}`));
+    for (const step of all.slice(-60)) steps.append(el('li', `run-step ${step.kind}`, step.label));
+    card.append(steps);
+    const toggle = iconButton('i-chevron', 'Steps', () => {
+      const open = !openRuns.delete(run.id);
+      if (open) openRuns.add(run.id);
+      card.classList.toggle('expanded', open);
+      toggle.setAttribute('aria-expanded', String(open));
+    }, 'icon-button small steps-toggle');
+    toggle.setAttribute('aria-expanded', String(openRuns.has(run.id)));
+    actions.append(toggle);
+  }
+  actions.append(iconButton('i-code', 'View program', () => openProgram(run.id, { beside: true }), 'icon-button small'), iconButton('i-flow', 'Flow', () => showFlowChat(run.id), 'icon-button small'));
   card.append(actions);
   return card;
+}
+const answerText = (value) => (typeof value === 'string' ? value : typeof value === 'boolean' ? (value ? 'Yes' : 'No') : JSON.stringify(value));
+// Approvals and answers the session records for you: `message.echo`, or in messages saved before it
+// the prose ("Apply these changes.", "Run `npm test`.", "Answered: …").
+function echoOf(message) {
+  if (message.role !== 'user' && message.role !== 'system') return null;
+  const echo = message.echo;
+  if (echo?.kind === 'approval') return echo.accept ? { kind: 'approved', label: 'Approved', detail: echo.command } : { kind: 'declined', label: 'Declined' };
+  if (echo?.kind === 'answer') return { kind: 'answered', label: 'Answered', detail: answerText(echo.value) };
+  const text = String(message.content).replace(/^\[[\w-]+\] /, '');
+  const command = /^Run `([\s\S]+)`\.$/.exec(text);
+  const answer = /^Answered: ([\s\S]*)$/.exec(text);
+  if (text === 'Apply these changes.' || command) return { kind: 'approved', label: 'Approved', detail: command?.[1] };
+  if (text === 'Decline these changes.' || text === 'Decline this command.') return { kind: 'declined', label: 'Declined' };
+  if (!answer) return null;
+  let detail = answer[1];
+  try { detail = answerText(JSON.parse(detail)); } catch {}
+  return { kind: 'answered', label: 'Answered', detail };
+}
+function messageItem(message) {
+  const role = ['user', 'assistant', 'system', 'tool'].includes(message.role) ? message.role : 'system';
+  const echo = echoOf(message);
+  const item = el('article', `message ${role}${echo ? ' echo' : ''}`);
+  item.dataset.messageId = message.id;
+  const stamp = el('time', 'message-time', time(message.time));
+  if (echo) {
+    const chip = el('span', `echo-chip ${echo.kind}`);
+    chip.append(icon(echo.kind === 'approved' ? 'i-check' : echo.kind === 'declined' ? 'i-x' : 'i-chat'), echo.label);
+    if (echo.detail) {
+      const detail = el('span', 'echo-detail', echo.detail);
+      if (echo.detail.length > 48) detail.title = echo.detail;
+      chip.append(detail);
+    }
+    item.append(chip, stamp);
+    return item;
+  }
+  const body = el('div', 'message-body');
+  if (role === 'system' || role === 'tool') body.append(el('div', 'message-label', role === 'tool' ? 'Tool' : 'System'));
+  const content = el('div', 'message-text');
+  if (role === 'assistant') appendMarkdown(content, message.content); else appendContent(content, message.content);
+  body.append(content);
+  item.append(body, stamp);
+  return item;
 }
 function renderMessages() {
   const messages = state.session?.messages || [];
@@ -174,39 +213,66 @@ function renderMessages() {
   };
   for (const message of messages) {
     flushRuns(message.time);
-    const role = ['user', 'assistant', 'system', 'tool'].includes(message.role) ? message.role : 'system';
-    const item = el('article', `message ${role}`);
-    item.dataset.messageId = message.id;
-    const body = el('div', 'message-body');
-    const header = el('div', 'message-header', role === 'assistant' ? 'SHOUT' : role === 'user' ? 'You' : role === 'tool' ? 'Tool result' : 'System');
-    header.append(el('time', '', time(message.time)));
-    const content = el('div', 'message-text');
-    if (role === 'assistant') appendMarkdown(content, message.content); else appendContent(content, message.content);
-    body.append(header, content);
-    item.append(body);
-    list.append(item);
+    list.append(messageItem(message));
   }
   flushRuns();
   if (nearBottom || messages.length <= 1) list.scrollTop = list.scrollHeight;
 }
 /* Flow mode: the chat pane shows the session as a canvas of phases, the composer stays underneath. */
 let flowCanvas = null;
+let flowDetail = null;
+let detailCanvas = null; // the canvas whose selection the detail shows
 function flowSource() {
   const session = state.session;
   return session?.messages?.length ? { session, events: session.events || [], now: Date.now(), live: isActive(session) } : null;
 }
+// Hook: a selected card's detail (flow-detail.js) takes over the side panel, opening it if it was closed.
+// One detail serves every canvas (the chat's and each sub-agent tab's); a new selection clears the other's.
+function flowSelect(canvas) {
+  flowDetail ??= createFlowDetail($('side-panel'), {
+    openFile: (path) => openFile(path, { split: 'right' }),
+    openEvent: (run, id) => openViz('trace', { beside: true, apply: (tab) => Object.assign(tab, { runFilter: run || '', eventFilter: '', selectedEvent: id }) }),
+    openSource: showProgramLine,
+    onClose: () => detailCanvas?.select(null),
+    reveal: (open) => { $('side-panel').hidden = !open; renderSide(); },
+  });
+  return (selection) => {
+    if (!selection) { if (detailCanvas === canvas()) { detailCanvas = null; flowDetail.hide(); } return; }
+    const previous = detailCanvas;
+    detailCanvas = canvas();
+    if (previous && previous !== detailCanvas) previous.select(null);
+    flowDetail.show(selection);
+  };
+}
 function syncFlowCanvas() {
   if (!flowCanvas) {
     // The composer floats over the canvas; the followed card sits just above it, whatever its height.
-    flowCanvas = createFlowCanvas($('flow-stage'), { anchor: () => $('composer-area').offsetHeight + 20, openFile: (path) => openFile(path, { split: 'right' }) });
+    flowCanvas = createFlowCanvas($('flow-stage'), { anchor: () => $('composer-area').offsetHeight + 20, openFile: (path) => openFile(path, { split: 'right' }), onSelect: flowSelect(() => flowCanvas), openAgent });
     flowCanvas.start(flowSource);
   }
   if (flowCanvas.sessionId !== state.session?.id) { flowCanvas.reset(); flowCanvas.sessionId = state.session?.id; }
+}
+/* Sub-agents: a fleet tile opens the agent's Flow in a tab beside the chat, or focuses it. */
+function openAgent(id) {
+  const existing = Object.values(state.layout.tabs).find((tab) => tab.kind === 'agent' && tab.agent === id);
+  if (existing) activate(state.layout, existing.id);
+  else place({ id: uid('agent'), kind: 'agent', agent: id }, { beside: true });
+  commitLayout();
+}
+const agentOfTab = (tab) => state.session?.agents?.find((agent) => agent.id === tab.agent);
+function agentPane(tab) {
+  let pane = null;
+  pane = createAgentPane(tab, { session: () => state.session, modelLabel: (id) => state.config?.models?.find((model) => model.id === id)?.label || id, openFile: (path) => openFile(path, { split: 'right' }), onSelect: flowSelect(() => pane.canvas) });
+  return pane;
+}
+function renderAgentPanes() {
+  for (const tab of Object.values(state.layout.tabs)) if (tab.kind === 'agent') panes.get(tab.id)?.refresh();
 }
 function setChatMode(mode) {
   state.chatMode = mode === 'flow' ? 'flow' : 'chat';
   localStorage.setItem('shout.chatMode', state.chatMode);
   for (const button of $('chat-mode').children) button.setAttribute('aria-checked', String(button.dataset.mode === state.chatMode));
+  if (state.chatMode === 'chat') flowCanvas?.select(null);
   state.messageSignature = '';
   renderMessages();
   if (state.chatMode === 'chat') $('messages').scrollTop = $('messages').scrollHeight;
@@ -223,152 +289,11 @@ function optionValue(value) {
   if (value && typeof value === 'object' && (value.tag === 'Some' || value.tag === 'None') && Object.keys(value).every((key) => key === 'tag' || key === 'value')) return value.value;
   return value;
 }
-function humanize(name) {
-  const text = String(name).replace(/([a-z\d])([A-Z])/g, '$1 $2').replace(/[_-]+/g, ' ').trim().toLowerCase();
-  return text.charAt(0).toUpperCase() + text.slice(1);
-}
-function schemaType(schema) {
-  return Array.isArray(schema?.type) ? schema.type.find((type) => type !== 'null') : schema?.type;
-}
-class FieldError extends Error {
-  constructor(message, input) { super(message); this.input = input; }
-}
-function growTextarea(input) {
-  input.addEventListener('input', () => { input.style.height = 'auto'; input.style.height = `${Math.min(240, input.scrollHeight + 2)}px`; });
-}
-// Form controls for the JSON Schema subset skills use. read() returns a value that matches the schema exactly,
-// or undefined for an optional field left empty. `initial` pre-fills matching values.
-function schemaField(schema, { label, required, top = false, initial }) {
-  const type = schemaType(schema);
-  if (type === 'object' && schema.properties && typeof schema.properties === 'object') {
-    const box = el(top ? 'div' : 'fieldset', 'ask-fields');
-    if (!top) {
-      const legend = el('legend', '', label);
-      if (!required) legend.append(el('span', 'optional', 'optional'));
-      box.append(legend);
-    }
-    const needed = new Set(Array.isArray(schema.required) ? schema.required : []);
-    const fields = Object.entries(schema.properties).map(([key, sub]) => [key, schemaField(sub, { label: humanize(key), required: needed.has(key), initial: initial && typeof initial === 'object' ? initial[key] : undefined })]);
-    for (const [, field] of fields) box.append(field.node);
-    const empty = () => fields.every(([, field]) => field.empty());
-    return {
-      node: box,
-      empty,
-      focus: () => fields[0]?.[1].focus(),
-      read() {
-        if (!required && empty()) return undefined;
-        const value = {};
-        for (const [key, field] of fields) {
-          const item = field.read();
-          if (item !== undefined) value[key] = item;
-        }
-        return value;
-      },
-    };
-  }
-  const id = uid('ask');
-  const wrap = el('div', 'ask-field');
-  const heading = el('label', top ? 'ask-label sr-only' : 'ask-label', label);
-  heading.htmlFor = id;
-  if (!required && !top) heading.append(el('span', 'optional', 'optional'));
-  let input;
-  let read;
-  let empty;
-  const missing = () => new FieldError(`${label} is required`, input);
-  if (type === 'boolean') {
-    input = el('input');
-    input.type = 'checkbox';
-    input.id = id;
-    const row = el('label', 'ask-check');
-    row.htmlFor = id;
-    row.append(input, document.createTextNode(label));
-    if (!required) row.append(el('span', 'optional', 'optional'));
-    wrap.append(row);
-    read = () => input.checked;
-    empty = () => !input.checked;
-  } else if (type === 'string' && Array.isArray(schema.enum)) {
-    input = el('select', 'ask-input');
-    if (!required) input.append(new Option('—', ''));
-    for (const option of schema.enum) input.append(new Option(String(option), String(option)));
-    wrap.append(heading);
-    read = () => (input.value === '' && !required ? undefined : input.value);
-    empty = () => input.value === '';
-  } else if (type === 'string') {
-    input = el('textarea', 'ask-input');
-    input.rows = top ? 3 : 1;
-    if (Number.isInteger(schema.maxLength)) input.maxLength = schema.maxLength;
-    growTextarea(input);
-    wrap.append(heading);
-    read = () => {
-      if (!input.value.trim()) { if (required) throw missing(); return undefined; }
-      return input.value;
-    };
-    empty = () => !input.value.trim();
-  } else if (type === 'integer' || type === 'number') {
-    input = el('input', 'ask-input ask-number');
-    input.type = 'number';
-    input.step = type === 'integer' ? '1' : 'any';
-    if (Number.isFinite(schema.minimum)) input.min = String(schema.minimum);
-    if (Number.isFinite(schema.maximum)) input.max = String(schema.maximum);
-    wrap.append(heading);
-    read = () => {
-      if (input.validity.badInput) throw new FieldError(`${label} must be a number`, input);
-      const raw = input.value.trim();
-      if (!raw) { if (required) throw missing(); return undefined; }
-      const value = Number(raw);
-      if (!Number.isFinite(value)) throw new FieldError(`${label} must be a number`, input);
-      if (type === 'integer' && !Number.isInteger(value)) throw new FieldError(`${label} must be a whole number`, input);
-      return value;
-    };
-    empty = () => !input.value.trim() && !input.validity.badInput;
-  } else if (type === 'array' && (!schema.items || ['string', 'integer', 'number'].includes(schemaType(schema.items)))) {
-    const itemType = schemaType(schema.items) || 'string';
-    input = el('textarea', 'ask-input');
-    input.rows = 3;
-    growTextarea(input);
-    wrap.append(heading, el('small', 'ask-hint', 'One per line'));
-    const lines = () => input.value.split('\n').map((line) => line.trim()).filter(Boolean);
-    read = () => {
-      const items = lines();
-      if (!items.length && !required) return undefined;
-      if (itemType === 'string') return items;
-      return items.map((line) => {
-        const value = Number(line);
-        if (!Number.isFinite(value) || (itemType === 'integer' && !Number.isInteger(value))) throw new FieldError(`${label}: "${line}" is not a ${itemType === 'integer' ? 'whole number' : 'number'}`, input);
-        return value;
-      });
-    };
-    empty = () => !lines().length;
-  } else {
-    input = el('textarea', 'ask-input mono');
-    input.rows = 3;
-    input.spellcheck = false;
-    growTextarea(input);
-    wrap.append(heading, el('small', 'ask-hint', 'JSON'));
-    read = () => {
-      const raw = input.value.trim();
-      if (!raw) { if (required) throw missing(); return undefined; }
-      try { return JSON.parse(raw); } catch { throw new FieldError(`${label} must be valid JSON`, input); }
-    };
-    empty = () => !input.value.trim();
-  }
-  input.id = id;
-  if (initial !== undefined && initial !== null) {
-    if (type === 'boolean') input.checked = initial === true;
-    else if (type === 'array' && Array.isArray(initial)) input.value = initial.join('\n');
-    else if (['string', 'integer', 'number'].includes(type) && typeof initial !== 'object') input.value = String(initial);
-    else if (!['string', 'integer', 'number', 'array'].includes(type)) input.value = JSON.stringify(initial, null, 2);
-    if (input.tagName === 'TEXTAREA') input.rows = Math.max(input.rows, Math.min(10, input.value.split('\n').length));
-  }
-  if (type !== 'boolean') wrap.append(input);
-  if (typeof schema?.description === 'string' && schema.description) wrap.append(el('small', 'ask-hint', schema.description));
-  return { node: wrap, read, empty, focus: () => input.focus({ preventScroll: true }) };
-}
 async function answerQuestion(question, value, controls) {
   for (const control of controls) control.disabled = true;
+  const reply = replyGuard();
   try {
-    const result = await api(`/sessions/${encodeURIComponent(state.session.id)}/answer`, { method: 'POST', body: { id: question.id, value } });
-    if (result.id) applySnapshot(result);
+    reply(await api(`/sessions/${encodeURIComponent(state.session.id)}/answer`, { method: 'POST', body: { id: question.id, value } }));
   } catch (error) {
     toast(error.message);
     for (const control of controls) control.disabled = false;
@@ -385,38 +310,82 @@ function questionDetails(question) {
   }
   return details;
 }
+// Two lines; the rest on click, when there is more.
+function clampedSummary(text) {
+  const summary = el('p', 'question-summary', text);
+  requestAnimationFrame(() => {
+    if (summary.scrollHeight <= summary.clientHeight + 1) return;
+    const toggle = () => summary.setAttribute('aria-expanded', String(summary.getAttribute('aria-expanded') !== 'true'));
+    summary.tabIndex = 0;
+    summary.setAttribute('role', 'button');
+    summary.setAttribute('aria-expanded', 'false');
+    summary.addEventListener('click', toggle);
+    summary.addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggle(); } });
+  });
+  return summary;
+}
+// One chip per proposed file with its diffstat; each opens Changes at that file.
+function changeChips(changes) {
+  const list = el('div', 'change-chips');
+  const chip = (onClick) => {
+    const button = el('button', 'change-chip');
+    button.type = 'button';
+    button.addEventListener('click', onClick);
+    list.append(button);
+    return button;
+  };
+  for (const change of changes.slice(0, 6)) {
+    const button = chip(() => openViz('changes', { beside: true, apply: (tab) => { tab.focusPath = change.path; } }));
+    button.append(el('span', 'chip-name', basename(change.path)), diffStat(changeStats(change)));
+    button.setAttribute('aria-label', change.path);
+    if (basename(change.path) !== change.path) button.title = change.path;
+  }
+  if (changes.length > 6) chip(() => openViz('changes', { beside: true })).textContent = `+${changes.length - 6}`;
+  return list;
+}
+// Title, the command and what approving it means, a clamped summary, the files; then Approve or Decline.
 function approvalCard(question, card) {
-  const prompt = typeof question.prompt === 'string' ? question.prompt : question.prompt?.system || (question.command ? 'Run this command?' : 'Approve these changes?');
-  card.append(el('h3', '', typeof question.title === 'string' && question.title ? question.title : 'Approval needed'), el('p', '', prompt));
   const data = optionValue(question.prompt?.data);
-  if (typeof data?.summary === 'string') card.append(el('p', '', data.summary));
-  if (typeof question.command === 'string' && question.command) card.append(codeBlock(question.command, 'sh'));
+  const command = typeof question.command === 'string' && question.command ? question.command : null;
+  card.append(el('h3', '', typeof question.title === 'string' && question.title ? question.title : command ? 'Run this command?' : 'Approve these changes?'));
+  if (command) {
+    const note = el('div', 'question-note');
+    note.append(icon('i-shield'), 'Runs with your user permissions.');
+    card.append(codeBlock(command, 'sh'), note);
+  }
+  if (typeof question.prompt === 'string' && question.prompt) card.append(el('p', '', question.prompt));
+  if (typeof data?.summary === 'string' && data.summary.trim()) card.append(clampedSummary(data.summary.trim()));
+  const changes = Array.isArray(data?.changes) ? data.changes : command ? [] : state.session.changes || [];
+  if (changes.length) card.append(changeChips(changes));
   const actions = el('div', 'question-actions');
-  const approve = el('button', 'approve-button', 'Approve & continue');
-  const decline = el('button', 'decline-button', 'Decline');
+  const approve = el('button', 'primary-button', 'Approve');
+  const decline = el('button', 'secondary-button', 'Decline');
   approve.addEventListener('click', () => answerQuestion(question, { accept: true }, [approve, decline]));
   decline.addEventListener('click', () => answerQuestion(question, { accept: false }, [approve, decline]));
   actions.append(approve, decline);
-  const proposed = Array.isArray(data?.changes) ? data.changes.length : state.session.changes?.length;
-  if (proposed) {
-    const changes = el('button', 'text-button', 'View changes');
-    changes.addEventListener('click', () => openViz('changes', { beside: true }));
-    actions.append(changes);
-  }
   card.append(actions);
+}
+// The answer given last time a question JOSH asks again (same interaction), so only what was rejected needs fixing.
+const askAnswers = new Map();
+function previousAnswer(question) {
+  if (typeof question.interaction !== 'string' || !(question.attempt > 1)) return undefined;
+  const events = state.session.events || [];
+  const asked = events.findLast((event) => event.type === 'user.question' && event.interaction === question.interaction && event.effectId !== question.id);
+  const answered = asked && events.findLast((event) => event.type === 'user.answered' && event.effectId === asked.effectId);
+  return answered ? answered.value : askAnswers.get(question.interaction);
 }
 function askCard(question, card) {
   const skill = (state.session.runs || []).findLast((run) => ACTIVE_RUN.has(run.state))?.skill;
-  const title = typeof question.title === 'string' && question.title ? question.title : skill ? `Question from /${skill}` : 'Question';
+  const title = typeof question.title === 'string' && question.title ? question.title : skill ? `/${skill}` : 'Question';
   const prompt = typeof question.prompt === 'string' ? question.prompt : question.prompt?.system;
   card.append(el('h3', '', title));
   if (prompt) card.append(el('p', '', prompt));
   const details = questionDetails(question);
   const schema = question.schema && typeof question.schema === 'object' ? question.schema : {};
   const actions = el('div', 'question-actions');
-  if (schemaType(schema) === 'boolean') {
-    const yes = el('button', 'approve-button', 'Yes');
-    const no = el('button', 'decline-button', 'No');
+  if (kindOf(schema) === 'boolean') {
+    const yes = el('button', 'primary-button', 'Yes');
+    const no = el('button', 'secondary-button', 'No');
     yes.addEventListener('click', () => answerQuestion(question, true, [yes, no]));
     no.addEventListener('click', () => answerQuestion(question, false, [yes, no]));
     actions.append(yes, no);
@@ -425,14 +394,16 @@ function askCard(question, card) {
     return null;
   }
   const form = el('form', 'ask-form');
-  // A skill offers editable defaults by putting same-named fields in the prompt's data.
+  // Asked again, the form keeps the rejected answer and marks why (question.issues). Otherwise a skill offers
+  // editable defaults by putting same-named fields in the prompt's data.
   const data = question.prompt?.data;
-  const initial = data && typeof data === 'object' && data.tag === 'Some' ? data.value : data?.tag === 'None' ? undefined : data;
-  const field = schemaField(schema, { label: prompt ? 'Answer' : 'Your answer', required: true, top: true, initial });
+  const retry = previousAnswer(question);
+  const initial = retry !== undefined ? retry : data && typeof data === 'object' && data.tag === 'Some' ? data.value : data?.tag === 'None' ? undefined : data;
+  const answer = askForm(schema, { initial, issues: question.issues });
   const body = el('div', 'ask-body');
   if (details) body.append(details);
-  body.append(field.node);
-  const submit = el('button', 'approve-button', 'Submit');
+  body.append(answer.node);
+  const submit = el('button', 'primary-button', 'Submit');
   submit.type = 'submit';
   actions.append(submit);
   form.append(body, actions);
@@ -441,17 +412,14 @@ function askCard(question, card) {
   });
   form.addEventListener('submit', (event) => {
     event.preventDefault();
-    let value;
-    try { value = field.read(); } catch (error) {
-      if (!(error instanceof FieldError)) throw error;
-      toast(error.message);
-      error.input?.focus();
-      return;
-    }
-    answerQuestion(question, value, [submit, ...form.querySelectorAll('input, textarea, select')]);
+    // Only an answer that matches the schema is sent; what is wrong is marked in place.
+    const result = answer.read();
+    if (!result) return;
+    if (typeof question.interaction === 'string') askAnswers.set(question.interaction, result.value);
+    answerQuestion(question, result.value, [submit, ...form.querySelectorAll('input, textarea, select, button')]);
   });
   card.append(form);
-  return field;
+  return answer;
 }
 function renderQuestion() {
   const question = state.session?.question;
@@ -468,99 +436,56 @@ function renderQuestion() {
   // Move focus to a new question only when the user isn't typing somewhere else.
   if (field && [document.body, $('message-input')].includes(document.activeElement)) field.focus();
 }
-function sessionRow(session, sleeping) {
-  const row = el('div', `session-row${session.id === state.session?.id ? ' active' : ''}${sleeping ? ' sleeping' : ''}`);
-  const button = el('button', 'session-item');
-  button.setAttribute('aria-current', session.id === state.session?.id ? 'page' : 'false');
-  button.append(el('span', 'session-name', session.title || 'Untitled session'));
-  if (sleeping) button.append(el('time', 'session-time', time(session.updatedAt)));
-  else {
-    const meta = el('span', 'session-meta');
-    meta.append(el('span', `status-pill ${statusKind(session)}`, session.question ? (session.question.kind === 'ask' ? 'awaiting answer' : 'awaiting approval') : session.status || 'ready'), el('span', '', `· ${session.mode === 'fixture' ? 'Fixture' : 'Live'}`), el('time', '', time(session.updatedAt)));
-    button.append(meta);
-  }
-  button.addEventListener('click', () => selectSession(session.id).catch((error) => toast(error.message)));
-  const action = el('button', 'icon-button session-action');
-  const label = sleeping ? 'Wake session' : 'Put session to sleep';
-  action.setAttribute('aria-label', `${label}: ${session.title || 'Untitled session'}`);
-  action.title = label;
-  action.innerHTML = `<svg><use href="#i-${sleeping ? 'sun' : 'moon'}"/></svg>`;
-  // Busy sessions stay awake so a running task or open question is never tucked out of sight.
-  action.hidden = !sleeping && (['thinking', 'running', 'waiting_user'].includes(session.status) || !!session.question);
-  action.addEventListener('click', () => setSleeping(session.id, !sleeping));
-  row.append(button, action);
-  return row;
-}
-function renderSidebar() {
-  const awake = state.sessions.filter((session) => !session.sleeping);
-  const sleeping = state.sessions.filter((session) => session.sleeping).sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
-  $('session-count').textContent = String(awake.length);
-  $('session-list').replaceChildren();
-  if (!state.sessions.length) $('session-list').append(el('p', 'empty-copy', 'No sessions yet'));
-  for (const session of awake) $('session-list').append(sessionRow(session, false));
-  $('sleeping-section').hidden = !sleeping.length;
-  $('sleeping-count').textContent = `(${sleeping.length})`;
-  $('sleeping-toggle').setAttribute('aria-expanded', String(state.sleepingOpen));
-  $('sleeping-section').classList.toggle('open', state.sleepingOpen);
-  const list = $('sleeping-list');
-  list.hidden = !state.sleepingOpen;
-  list.replaceChildren();
-  if (!state.sleepingOpen) return;
-  for (const session of sleeping.slice(0, state.sleepingShown)) list.append(sessionRow(session, true));
-  const more = sleeping.length - state.sleepingShown;
-  if (more > 0) {
-    const button = el('button', 'sleeping-more');
-    button.innerHTML = '<svg><use href="#i-plus"/></svg>';
-    button.append(`Show ${more} more`);
-    button.addEventListener('click', () => { state.sleepingShown += 25; renderSidebar(); });
-    list.append(button);
-  }
-}
-const effortLabel = (effort) => ({ low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra high', max: 'Max' })[effort] || effort;
 const modelEfforts = (id) => state.config.models.find((item) => item.id === id)?.efforts || state.config.efforts;
+const pickers = [popover($('model-button'), $('model-list')), popover($('effort-button'), $('effort-list')), popover($('more-button'), $('more-menu'))];
+let pickerSignature = '';
+// Model and effort popovers and the ⋯ menu. Once the first message is sent the model picker still opens,
+// with every other model disabled; effort changes while idle.
 function renderModelPicker() {
-  const config = state.config;
-  if (!config?.models) return;
-  const model = $('model-select'), effort = $('effort-select');
-  if (!model.options.length) {
-    // Grouped by provider; models of a provider that is not signed in can't be chosen.
-    for (const provider of config.providers || []) {
-      const group = el('optgroup');
-      group.label = provider.label;
-      for (const item of config.models.filter((candidate) => candidate.provider === provider.id)) group.append(Object.assign(new Option(item.label, item.id), { disabled: !provider.available }));
-      model.append(group);
-    }
+  const { config, session, busy } = state;
+  const active = isActive(session);
+  const model = session?.model || config?.defaultModel?.model;
+  const effort = session?.effort || config?.defaultModel?.effort;
+  const signature = JSON.stringify([!!config?.models, session?.id, model, effort, !!session?.modelLocked, busy, active, session?.timeBudgetsEnabled]);
+  if (signature === pickerSignature) return;
+  pickerSignature = signature;
+  $('model-button').disabled = !config?.models || !session || busy;
+  $('effort-button').disabled = !config?.models || !session || busy || active;
+  $('more-button').disabled = !session;
+  if (config?.models) {
+    renderModels($('model-button'), $('model-list'), { providers: config.providers || [], models: config.models, model, locked: !!session?.modelLocked, onPick: (id) => saveModel(id, effort) });
+    renderEfforts($('effort-button'), $('effort-list'), { efforts: modelEfforts(model), effort, onPick: (value) => saveModel(model, value) });
   }
-  model.value = state.session?.model || config.defaultModel.model;
-  if (effort.dataset.model !== model.value) {
-    effort.replaceChildren(...modelEfforts(model.value).map((item) => new Option(effortLabel(item), item)));
-    effort.dataset.model = model.value;
-  }
-  effort.value = state.session?.effort || config.defaultModel.effort;
-  // The model is fixed once the session's first message is sent; effort can still change.
-  model.disabled = !state.session || state.busy || Boolean(state.session.modelLocked);
-  effort.disabled = !state.session || state.busy;
+  renderMenu($('more-menu'), [
+    ['No time limits', { checked: session?.timeBudgetsEnabled === false, disabled: !session || active || busy, choose: () => setTimeBudgets(session.timeBudgetsEnabled === false) }],
+    ['Export session', { icon: 'i-download', disabled: !session, choose: exportSession }],
+  ]);
+  for (const picker of pickers) if (picker.isOpen && picker.trigger.disabled) picker.close();
 }
-async function saveModel() {
+async function saveModel(model, effort) {
   const session = state.session;
   if (!session) return;
   // An effort the newly chosen model lacks becomes its highest one.
-  const model = $('model-select').value, efforts = modelEfforts(model);
-  const effort = efforts.includes($('effort-select').value) ? $('effort-select').value : efforts.at(-1);
+  const efforts = modelEfforts(model);
+  const reply = replyGuard();
   try {
-    applySnapshot(await api(`/sessions/${encodeURIComponent(session.id)}/model`, { method: 'POST', body: { model, effort } }));
-  } catch (error) { toast(error.message); renderModelPicker(); }
+    reply(await api(`/sessions/${encodeURIComponent(session.id)}/model`, { method: 'POST', body: { model, effort: efforts.includes(effort) ? effort : efforts.at(-1) } }));
+  } catch (error) { toast(error.message); pickerSignature = ''; renderModelPicker(); }
 }
-async function setSleeping(id, sleeping) {
+async function setTimeBudgets(enabled) {
+  const reply = replyGuard();
   try {
-    const session = await api(`/sessions/${encodeURIComponent(id)}/sleep`, { method: 'POST', body: { sleeping } });
-    if (session.id === state.session?.id) applySnapshot(session);
-    else {
-      const index = state.sessions.findIndex((candidate) => candidate.id === session.id);
-      if (index >= 0) state.sessions[index] = { ...state.sessions[index], sleeping: session.sleeping, updatedAt: session.updatedAt };
-      renderSidebar();
-    }
+    reply(await api(`/sessions/${encodeURIComponent(state.session.id)}/budget`, { method: 'POST', body: { enabled } }));
   } catch (error) { toast(error.message); }
+}
+function exportSession() {
+  if (!state.session) return;
+  const link = el('a');
+  link.href = `/api/sessions/${encodeURIComponent(state.session.id)}/export`;
+  link.download = `shout-${state.session.id}.json`;
+  document.body.append(link);
+  link.click();
+  link.remove();
 }
 function statusKind(session) {
   if (session?.question) return 'question';
@@ -571,8 +496,10 @@ function renderStatus() {
   const session = state.session;
   const active = isActive(session);
   document.title = session?.title ? `${session.title} · SHOUT` : 'SHOUT';
-  $('storage-warning').hidden = !session?.storageError;
-  $('storage-warning').textContent = session?.storageError ? `Session could not be saved: ${typeof session.storageError === 'string' ? session.storageError : JSON.stringify(session.storageError)}.` : '';
+  // The server already words the error ("Session could not be saved: …").
+  const storage = typeof session?.storageError === 'string' ? session.storageError : session?.storageError ? JSON.stringify(session.storageError) : '';
+  $('storage-warning').hidden = !storage;
+  $('storage-warning').textContent = !storage || /could not be saved/i.test(storage) ? storage : `Session could not be saved: ${storage}`;
   $('status-line').className = `status-line ${statusKind(session)}`;
   // Session state is shown by the composer's colour; the status text stays for screen readers.
   $('composer').dataset.state = statusKind(session);
@@ -580,26 +507,7 @@ function renderStatus() {
   $('cancel-button').hidden = !active;
   $('send-button').hidden = active;
   $('send-button').disabled = active || state.busy;
-  $('message-input').placeholder = !session ? 'Create a session to start' : session.question ? 'Answer above to continue…' : active ? 'Working… press stop to cancel' : 'Describe a change, or type / for skills';
   renderModelPicker();
-  let budget = $('time-budget-toggle');
-  if (!budget) {
-    const label = el('label', 'time-budget-toggle');
-    budget = el('input'); budget.type = 'checkbox'; budget.id = 'time-budget-toggle';
-    budget.addEventListener('change', async () => {
-      budget.disabled = true;
-      try {
-        const result = await api(`/sessions/${encodeURIComponent(state.session.id)}/budget`, { method: 'POST', body: { enabled: !budget.checked } });
-        applySnapshot(result);
-      } catch (error) { toast(error.message); renderStatus(); }
-    });
-    label.append(budget, document.createTextNode(' No time limits'));
-    $('status-line').append(label);
-  }
-  budget.closest('label').hidden = !session;
-  budget.checked = session?.timeBudgetsEnabled === false;
-  budget.disabled = active || state.busy;
-  budget.title = budget.checked ? 'Time budgets disabled for this session; cancellation remains available' : '10 minute model calls; 30 minute runs';
 }
 
 /* Visualization */
@@ -614,19 +522,15 @@ function classify(event) {
 function filteredEvents(tab) {
   return (state.session?.events || []).filter((event) => (!tab.runFilter || event.run === tab.runFilter) && (!tab.eventFilter || JSON.stringify(event).toLowerCase().includes(tab.eventFilter.toLowerCase())));
 }
-function renderVizEmpty(container) {
-  const empty = el('div', 'viz-empty');
-  empty.append(el('h3', '', state.session?.events?.length ? 'No matching events' : 'No events yet'));
-  container.append(empty);
-}
+// One line per event: #seq, lane dot (the lane is its tooltip), type, time. Ids live in the detail JSON.
 function renderTrace(container, events, tab) {
-  if (!events.length) return renderVizEmpty(container);
+  if (!events.length) return container.append(el('p', 'empty-copy', 'No events'));
   for (const event of events) {
-    const button = el('button', `trace-event ${classify(event).kind}${tab.selectedEvent === event.id ? ' selected' : ''}`);
-    button.append(el('span', 'trace-index', `#${event.sequence}`));
-    const main = el('span', 'trace-event-main');
-    main.append(el('strong', '', event.type), el('small', '', `${time(event.time)}${event.effectId ? ` · effect ${event.effectId}` : event.run ? ` · ${event.run}` : ''}`));
-    button.append(main);
+    const { lane, kind } = classify(event);
+    const button = el('button', `trace-event ${kind}${tab.selectedEvent === event.id ? ' selected' : ''}`);
+    const dot = el('span', `trace-dot ${kind}`);
+    dot.title = LANES[lane][0];
+    button.append(el('span', 'trace-index', `#${event.sequence}`), dot, el('span', 'trace-type', event.type), el('time', 'trace-time', time(event.time)));
     button.addEventListener('click', () => selectEvent(tab, event));
     container.append(button);
   }
@@ -651,7 +555,8 @@ function renderChanges(container, tab) {
     const file = el('section', 'diff-file');
     file.dataset.path = change.path;
     const title = el('div', 'diff-title');
-    const name = el('span', '', change.path + (change.before == null ? ' (new)' : change.after == null ? ' (deleted)' : ''));
+    const name = el('span', 'diff-name', change.path);
+    name.append(changeBadge(change));
     const open = iconButton('i-open', `Open ${change.path}`, () => openFile(change.path), 'icon-button small');
     const titleEnd = el('span', 'diff-title-end');
     titleEnd.append(diffStat(stats));
@@ -659,7 +564,7 @@ function renderChanges(container, tab) {
     title.append(name, titleEnd);
     const body = el('div', 'diff-body');
     for (const line of collapseContext(stats.lines)) {
-      if (line.type === 'gap') { body.append(el('div', 'diff-line gap', `${line.count} unchanged line${line.count === 1 ? '' : 's'}`)); continue; }
+      if (line.type === 'gap') { body.append(el('div', 'diff-line gap', `${line.count} unchanged`)); continue; }
       const row = el('div', `diff-line ${line.type}`);
       const tokens = line.type === 'del' ? before[line.a] : after[line.b];
       row.append(el('span', 'ln', line.a === undefined ? '' : String(line.a + 1)), el('span', 'ln', line.b === undefined ? '' : String(line.b + 1)), el('span', 'sign', line.type === 'add' ? '+' : line.type === 'del' ? '−' : ''));
@@ -723,69 +628,50 @@ function renderEventDetail(tab, detail) {
   if (!event) return;
   const header = el('div', 'detail-header');
   header.append(el('strong', '', `#${event.sequence} · ${event.type}`));
-  header.append(iconButton('i-x', 'Close event details', () => { tab.selectedEvent = null; renderViz(tab); }));
+  header.append(iconButton('i-x', 'Close event details', () => { tab.selectedEvent = null; renderViz(tab); }, 'icon-button small'));
   detail.append(header, codeBlock(JSON.stringify(event, null, 2), 'json'));
   if (event.type === 'program.loaded') {
     const run = state.session.runs?.find((candidate) => candidate.id === event.run);
     if (run?.source) {
       const open = el('button', 'secondary-button detail-action');
-      open.append(icon('i-code'), document.createTextNode('Open ALLEN program'));
+      open.setAttribute('aria-label', 'Open ALLEN program');
+      open.append(icon('i-code'), 'Program');
       open.addEventListener('click', () => openProgram(run.id, { beside: true }));
       detail.append(open);
     }
   }
 }
+// The tab names the view, so Events has only its two filters and Changes none.
 function vizPane(tab) {
   const pane = el('div', 'viz-pane');
   const toolbar = el('div', 'viz-toolbar');
-  const views = el('div', 'segmented');
-  views.setAttribute('role', 'tablist');
-  views.setAttribute('aria-label', 'Visualization');
-  for (const [view, { label }] of Object.entries(VIEWS)) {
-    const button = el('button', '', label);
-    button.dataset.view = view;
-    button.setAttribute('role', 'tab');
-    button.addEventListener('click', () => { tab.view = view; tab.selectedEvent = null; saveLayout(); renderTabStrips(); renderViz(tab); });
-    views.append(button);
-  }
   const runFilter = el('select', 'run-filter');
   runFilter.setAttribute('aria-label', 'Filter by run');
   runFilter.addEventListener('change', () => { tab.runFilter = runFilter.value; tab.selectedEvent = null; renderViz(tab); });
   const eventFilter = el('input', 'event-filter');
   eventFilter.type = 'search';
-  eventFilter.placeholder = 'Filter events';
+  eventFilter.placeholder = 'Filter';
   eventFilter.setAttribute('aria-label', 'Filter events');
   eventFilter.addEventListener('input', () => { tab.eventFilter = eventFilter.value; renderViz(tab); });
-  toolbar.append(views, runFilter, eventFilter);
+  toolbar.append(runFilter, eventFilter);
   const main = el('div', 'viz-main');
   const content = el('div', 'viz-content keep-scroll');
   const detail = el('div', 'event-detail');
   detail.hidden = true;
   main.append(content, detail);
-  const legend = el('div', 'viz-legend');
-  for (const [name, kind] of LANES) {
-    const item = el('span');
-    item.append(el('i', `legend-dot ${kind}`), document.createTextNode(name));
-    legend.append(item);
-  }
-  pane.append(toolbar, main, legend);
-  Object.assign(pane, { views, runFilter, eventFilter, content, detail, legend });
+  pane.append(toolbar, main);
+  Object.assign(pane, { toolbar, runFilter, eventFilter, content, detail });
   return pane;
 }
 function renderViz(tab) {
   const pane = panes.get(tab.id);
   if (!pane) return;
-  const isChanges = tab.view === 'changes';
-  for (const button of pane.views.children) {
-    button.classList.toggle('active', button.dataset.view === tab.view);
-    button.setAttribute('aria-selected', String(button.dataset.view === tab.view));
-  }
-  pane.runFilter.hidden = pane.eventFilter.hidden = pane.legend.hidden = isChanges;
-  const runIds = [...new Set((state.session?.events || []).map((event) => event.run).filter(Boolean))];
-  const signature = JSON.stringify(runIds);
+  pane.toolbar.hidden = tab.view === 'changes';
+  const runs = (state.session?.runs || []).map((run, i) => [run.id, `${i + 1} · ${runName(run)}`]);
+  const signature = JSON.stringify(runs);
   if (pane.runFilter.dataset.signature !== signature) {
     pane.runFilter.dataset.signature = signature;
-    pane.runFilter.replaceChildren(new Option('All runs', ''), ...runIds.map((id, i) => new Option(`Run ${i + 1} · ${id.slice(-8)}`, id)));
+    pane.runFilter.replaceChildren(new Option('All runs', ''), ...runs.map(([id, label]) => new Option(label, id)));
   }
   pane.runFilter.value = tab.runFilter || '';
   if (pane.eventFilter.value !== (tab.eventFilter || '')) pane.eventFilter.value = tab.eventFilter || '';
@@ -849,33 +735,64 @@ function programPane(tab) {
   select.setAttribute('aria-label', 'Program source');
   select.addEventListener('change', () => { tab.run = select.value; saveLayout(); renderTabStrips(); renderProgram(tab); });
   const status = el('span', 'status-pill');
-  const meta = el('span', 'pane-meta');
-  const flow = iconButton('i-flow', 'Show this run in Flow chat', () => showFlowChat(programTarget(tab).run?.id), 'icon-button small');
-  header.append(select, status, meta, flow);
+  const flow = iconButton('i-flow', 'Flow', () => showFlowChat(programTarget(tab).run?.id), 'icon-button small');
+  header.append(select, status, flow);
   const scroller = el('div', 'code-scroll keep-scroll');
   pane.append(header, scroller);
-  Object.assign(pane, { select, status, meta, flow, scroller });
+  Object.assign(pane, { select, status, flow, scroller });
   return pane;
+}
+// Opens a run's program at a line (from a Flow step's detail) and marks it.
+function showProgramLine(run, line) {
+  openProgram(run, { beside: true });
+  const tab = Object.values(state.layout.tabs).find((candidate) => candidate.kind === 'program' && candidate.run === run);
+  if (tab) { tab.focusLine = line; renderProgram(tab); }
+}
+// What the run did at each line: effect counts at their exact sites when events carry control-flow
+// data (programActivity), otherwise at lines that look like effects (effectKey), counted by name.
+function programMarks(pane, events, activity, active) {
+  const marks = new Map();
+  if (activity.origin || activity.sites.length) {
+    for (const site of activity.sites) marks.set(site.line, { kind: site.kind, count: 0 });
+    for (const [line, info] of activity.lines) marks.set(line, { ...marks.get(line), ...info });
+    if (!activity.sites.length) pane.raw.forEach((text, i) => { const effect = effectKey(text); if (effect && !marks.has(i + 1)) marks.set(i + 1, { kind: effect.split(':')[0], count: 0 }); });
+    return marks;
+  }
+  const starts = ['tool.started', 'model.started', 'user.question'];
+  const counts = new Map();
+  for (const event of events) {
+    const effect = starts.includes(event.type) && eventEffectKey(event);
+    if (effect) counts.set(effect, [(counts.get(effect)?.[0] || 0) + 1, counts.get(effect)?.[1] || event.id]);
+  }
+  const last = active ? events.filter((event) => eventEffectKey(event)).at(-1) : null;
+  const current = last && starts.includes(last.type) ? eventEffectKey(last) : null;
+  pane.raw.forEach((text, i) => {
+    const effect = effectKey(text);
+    if (effect) marks.set(i + 1, { kind: effect.split(':')[0], count: counts.get(effect)?.[0] || 0, first: counts.get(effect)?.[1], state: effect === current ? (effect === 'user' ? 'waiting' : 'running') : '' });
+  });
+  return marks;
 }
 function renderProgram(tab) {
   const pane = panes.get(tab.id);
   if (!pane) return;
   const runs = state.session?.runs || [];
   const target = programTarget(tab);
-  const options = [['', runs.length ? `Latest run (Run ${runs.length})` : 'Latest run'], ...runs.map((run, i) => [run.id, `Run ${i + 1} · ${runName(run)}`]), ...(state.config?.workflows || []).map((workflow) => [`workflow:${workflow.name}`, `File · ${workflow.name}`])];
+  const options = [['', 'Latest'], ...runs.map((run, i) => [run.id, `${i + 1} · ${runName(run)}`]), ...(state.config?.workflows || []).map((workflow) => [`workflow:${workflow.name}`, workflow.name])];
   const signature = JSON.stringify(options);
   if (pane.select.dataset.signature !== signature) {
     pane.select.dataset.signature = signature;
     pane.select.replaceChildren(...options.map(([value, label]) => new Option(label, value)));
   }
   pane.select.value = options.some(([value]) => value === tab.run) ? tab.run : '';
+  const runState = target.run ? (target.run.state || 'unknown').replace(/_/g, ' ') : '';
   pane.status.hidden = !target.run;
   pane.status.className = `status-pill ${runStateKind(target.run?.state)}`;
-  pane.status.textContent = target.run ? (target.run.state || 'unknown').replace(/_/g, ' ') : '';
+  pane.status.title = runState;
+  pane.status.setAttribute('aria-label', runState);
   pane.flow.hidden = !target.run;
   if (!target.source) {
     pane.dataset.source = '';
-    pane.scroller.replaceChildren(el('p', 'empty-copy', 'No ALLEN program yet'));
+    pane.scroller.replaceChildren(el('p', 'empty-copy', 'No program'));
     return;
   }
   const key = `${target.run?.id || target.name}:${target.source.length}`;
@@ -883,51 +800,69 @@ function renderProgram(tab) {
     pane.dataset.source = key;
     const lines = highlightLines(target.source, 'allen');
     if (lines.length > 1 && !lines.at(-1).length) lines.pop();
-    const raw = target.source.split('\n');
+    pane.raw = target.source.split('\n');
     const view = el('div', 'code-view program-view');
     view.style.setProperty('--gutter', `${String(lines.length).length + 1}ch`);
-    pane.effectRows = [];
-    lines.forEach((tokens, i) => {
+    pane.rows = lines.map((tokens, i) => {
       const row = el('div', 'code-line');
       const code = renderTokens(el('span', 'lc'), tokens);
       // Wrapped continuation lines hang at the statement's indentation.
-      code.style.setProperty('--indent', /^ */.exec(raw[i] || '')[0].length + 2);
+      code.style.setProperty('--indent', /^ */.exec(pane.raw[i] || '')[0].length + 2);
       row.append(el('span', 'ln', String(i + 1)), code);
-      const effect = effectKey(raw[i] || '');
-      if (effect) {
-        row.classList.add('effect-line', effect === 'model' ? 'model' : effect === 'user' ? 'user' : 'tool');
-        const inlay = el('button', 'inlay');
-        inlay.addEventListener('click', () => {
-          const { run } = programTarget(tab);
-          const first = (state.session?.events || []).find((event) => event.run === run?.id && eventEffectKey(event) === effect);
-          openViz('trace', { beside: true, apply: (viz) => { viz.runFilter = run?.id || ''; viz.eventFilter = ''; viz.selectedEvent = first?.id || null; } });
-        });
-        row.append(inlay);
-        pane.effectRows.push({ row, inlay, effect });
-      }
       view.append(row);
+      return row;
     });
-    pane.meta.textContent = `${lines.length} lines`;
+    Object.assign(pane, { inlays: new Map(), loopInlays: new Map(), marks: new Map(), currentLine: null });
     pane.scroller.replaceChildren(view);
   }
-  // Annotate effect lines with what this run actually did there.
+  // Annotate the source with what this run did: effect counts, the running site, loop iteration totals.
   const events = target.run ? (state.session?.events || []).filter((event) => event.run === target.run.id) : [];
-  const starts = { tool: 'tool.started', model: 'model.started', user: 'user.question' };
-  const active = target.run && ACTIVE_RUN.has(target.run.state);
-  const last = active ? events.filter((event) => eventEffectKey(event)).at(-1) : null;
-  const current = last && ['tool.started', 'model.started', 'user.question'].includes(last.type) ? eventEffectKey(last) : null;
-  for (const { row, inlay, effect } of pane.effectRows) {
-    const type = starts[effect.split(':')[0]];
-    const count = events.filter((event) => event.type === type && eventEffectKey(event) === effect).length;
-    const live = current === effect;
-    row.classList.toggle('current', live);
-    row.classList.toggle('unreached', !!target.run && !count);
-    inlay.hidden = !target.run || (active && !count && !live);
-    inlay.textContent = live ? (effect === 'user' ? 'waiting for you' : 'running…') : count ? `${count}× ${effect === 'model' ? 'judgment' : effect === 'user' ? 'question' : 'call'}${count === 1 ? '' : 's'}` : 'not reached';
-    inlay.title = count ? 'Show these events' : 'This effect did not run';
-    inlay.disabled = !count;
-  }
-  if (current) pane.effectRows.find((item) => item.effect === current)?.row.scrollIntoView({ block: 'nearest' });
+  const active = !!target.run && ACTIVE_RUN.has(target.run.state);
+  const activity = programActivity(events, { live: active });
+  pane.marks = target.run ? programMarks(pane, events, activity, active) : new Map();
+  pane.calls = activity.calls;
+  if (tab.focusLine) { pane.focusLine = tab.focusLine; tab.focusLine = null; pane.rows[pane.focusLine - 1]?.scrollIntoView({ block: 'center' }); }
+  let currentLine = null;
+  pane.rows.forEach((row, i) => {
+    const line = i + 1;
+    const mark = pane.marks.get(line);
+    const loop = target.run && activity.loops.get(line);
+    if (mark?.state) currentLine = line;
+    row.classList.toggle('effect-line', !!mark);
+    row.classList.toggle('model', mark?.kind === 'model');
+    row.classList.toggle('user', mark?.kind === 'user');
+    row.classList.toggle('current', !!mark?.state);
+    row.classList.toggle('waiting', mark?.state === 'waiting');
+    // Sites a finished run never reached are dimmed; there is nothing to count there.
+    row.classList.toggle('unreached', !!mark && !mark.count && !active);
+    row.classList.toggle('loop-line', !!loop);
+    row.classList.toggle('focus', line === pane.focusLine);
+    // A helper's call line counts the effects beneath it, more quietly than an effect site.
+    const call = target.run && !mark ? activity.calls.get(line) : null;
+    const counted = mark && (mark.count || mark.state) ? mark : call;
+    let inlay = pane.inlays.get(line);
+    if (counted && !inlay) {
+      inlay = el('button', 'inlay');
+      inlay.addEventListener('click', () => {
+        const { run } = programTarget(tab);
+        const first = pane.marks.get(line)?.first || pane.calls?.get(line)?.first;
+        openViz('trace', { beside: true, apply: (viz) => { viz.runFilter = run?.id || ''; viz.eventFilter = ''; viz.selectedEvent = first || null; } });
+      });
+      pane.inlays.set(line, inlay);
+      row.append(inlay);
+    }
+    if (inlay) { inlay.hidden = !counted; inlay.classList.toggle('call', !!call); inlay.textContent = `${counted?.count || 0}×`; inlay.title = counted?.attempts > counted?.count ? `${counted.attempts} attempts` : ''; }
+    let loopInlay = pane.loopInlays.get(line);
+    if (loop && !loopInlay) {
+      loopInlay = el('span', 'inlay loop');
+      loopInlay.append(icon('i-loop'), el('span'));
+      pane.loopInlays.set(line, loopInlay);
+      row.append(loopInlay);
+    }
+    if (loopInlay) { loopInlay.hidden = !loop; loopInlay.lastChild.textContent = loop ? String(loop.total) : ''; loopInlay.classList.toggle('live', !!loop?.live); }
+  });
+  if (currentLine && currentLine !== pane.currentLine) pane.rows[currentLine - 1]?.scrollIntoView({ block: 'nearest' });
+  pane.currentLine = currentLine;
 }
 function renderProgramPanes() {
   for (const tab of Object.values(state.layout.tabs)) if (tab.kind === 'program') renderProgram(tab);
@@ -979,7 +914,7 @@ async function loadFileInto(tab) {
       row.append(el('span', 'ln', String(i + 1)), renderTokens(el('span', 'lc'), tokens));
       view.append(row);
     });
-    pane.meta.textContent = `${languageLabel(tab.path)} · ${lines.length} line${lines.length === 1 ? '' : 's'}`;
+    pane.meta.textContent = languageLabel(tab.path);
     const { scrollTop, scrollLeft } = pane.scroller;
     pane.scroller.replaceChildren(view);
     pane.scroller.scrollTop = scrollTop;
@@ -1041,7 +976,6 @@ function renderTreeNode(container, node, depth, openPaths) {
     const item = el('div', `tree-file${openPaths.active === path ? ' active' : openPaths.all.has(path) ? ' open' : ''}`);
     item.style.setProperty('--depth', depth);
     const row = el('button', 'tree-row');
-    row.title = path;
     row.draggable = true;
     row.append(icon('i-file'), el('span', 'tree-name', basename(path)));
     row.setAttribute('aria-label', path);
@@ -1053,10 +987,10 @@ function renderTreeNode(container, node, depth, openPaths) {
   }
 }
 function renderFilesPanel(container) {
-  if (!state.session) return container.append(el('p', 'empty-copy', 'No session selected'));
+  if (!state.session) return;
   if (state.filesError) return container.append(el('p', 'empty-copy', state.filesError));
-  if (!state.files) return container.append(el('p', 'empty-copy', 'Loading files…'));
-  if (!state.files.length) return container.append(el('p', 'empty-copy', 'No readable files'));
+  if (!state.files) return container.append(el('p', 'empty-copy', 'Loading…'));
+  if (!state.files.length) return container.append(el('p', 'empty-copy', 'No files'));
   const tabs = Object.values(state.layout.tabs).filter((tab) => tab.kind === 'file');
   const focusedTab = state.layout.tabs[focusedGroup(state.layout).active];
   const tree = el('div', 'file-tree');
@@ -1111,24 +1045,23 @@ function skillPane(tab) {
   const pane = el('div', 'skill-pane');
   const header = el('div', 'pane-header');
   const crumbs = el('div', 'crumbs');
-  crumbs.append(el('span', 'crumb-file', `/${tab.name}`));
-  const meta = el('span', 'pane-meta');
-  const run = el('button', 'pane-button');
+  const crumb = el('span', 'crumb-file', `/${tab.name}`);
+  crumbs.append(crumb);
+  // "Use" puts /name in the composer; it does not run anything by itself.
+  const run = el('button', 'pane-button', 'Use');
   run.type = 'button';
-  run.append(icon('i-send'), document.createTextNode('Run'));
-  run.title = `Insert /${tab.name} into the message`;
   run.addEventListener('click', () => useSkill(tab.name));
-  header.append(crumbs, meta, run, iconButton('i-refresh', 'Reload skill', () => loadSkillInto(tab), 'icon-button small'));
+  header.append(crumbs, run, iconButton('i-refresh', 'Reload skill', () => loadSkillInto(tab), 'icon-button small'));
   const scroller = el('div', 'code-scroll keep-scroll');
   scroller.append(el('p', 'empty-copy', 'Loading…'));
   pane.append(header, scroller);
-  Object.assign(pane, { meta, run, scroller });
+  Object.assign(pane, { crumb, run, scroller });
   return pane;
 }
 function chipList(values, kindOf) {
   if (!Array.isArray(values) || !values.length) return el('span', 'skill-none', 'None');
   const list = el('span', 'chips');
-  for (const value of values) list.append(el('span', `run-step ${kindOf(String(value))}`, String(value)));
+  for (const value of values) list.append(el('span', `chip ${kindOf(String(value))}`, String(value)));
   return list;
 }
 async function loadSkillInto(tab) {
@@ -1145,8 +1078,8 @@ async function loadSkillInto(tab) {
     const facts = el('dl', 'skill-facts');
     const fact = (name, value) => { facts.append(el('dt', '', name)); const dd = el('dd'); dd.append(value); facts.append(dd); };
     if (skill.args) fact('Arguments', el('code', 'skill-path', `/${skill.name} ${skill.args}`));
-    fact('Scope', document.createTextNode(SCOPE_LABEL[skill.scope] || skill.scope || ''));
-    if (skill.path) fact('Path', el('span', 'skill-path', skill.path));
+    // Scope and path on demand, on the name.
+    pane.crumb.title = [SCOPE_LABEL[skill.scope] || skill.scope, skill.path].filter(Boolean).join(' · ');
     fact('Capabilities', chipList(skill.capabilities, (value) => (value.startsWith('model') ? 'model' : value.startsWith('user') ? 'user' : 'vm')));
     fact('Tools', chipList(skill.tools, () => 'tool'));
     summary.append(facts);
@@ -1191,7 +1124,6 @@ async function loadSkillInto(tab) {
       if (diagnostics.length) box.append(list);
       summary.append(box);
     }
-    pane.meta.textContent = `ALLEN · ${lines.length} line${lines.length === 1 ? '' : 's'}`;
     const { scrollTop } = pane.scroller;
     pane.scroller.replaceChildren(summary, source ? view : el('p', 'empty-copy', 'No source'));
     pane.scroller.scrollTop = scrollTop;
@@ -1212,12 +1144,9 @@ function openSkill(name, options = {}) {
 }
 
 /* Inspector summary */
-function summarySection(title, action) {
+function summarySection(title) {
   const section = el('section', 'summary-section');
-  const heading = el('div', 'summary-heading');
-  heading.append(el('h3', '', title));
-  if (action) heading.append(action);
-  section.append(heading);
+  section.append(el('h3', 'summary-heading', title));
   return section;
 }
 function viewLauncher(view, meta) {
@@ -1228,60 +1157,31 @@ function viewLauncher(view, meta) {
   open.draggable = true;
   open.append(icon(info.icon), el('span', 'view-name', info.label), el('span', 'view-meta', meta));
   open.setAttribute('aria-label', `Open ${info.label} in a tab`);
-  open.title = 'Open in a tab (drag to place)';
   open.addEventListener('click', () => openIt());
   open.addEventListener('dragstart', (event) => startDrag(event, { view }));
   open.addEventListener('dragend', endDrag);
   row.append(open, iconButton('i-split-right', `Open ${info.label} to the side`, () => openIt({ split: 'right' }), 'icon-button small'), iconButton('i-split-down', `Open ${info.label} below`, () => openIt({ split: 'bottom' }), 'icon-button small'));
   return row;
 }
-function minimap(events) {
-  // Decorative overview of the most recent events by lane; the whole strip opens Flow chat.
-  const recent = events.slice(-96);
-  const button = el('button', 'minimap');
-  button.setAttribute('aria-label', 'Show Flow chat');
-  button.title = 'Show Flow chat';
-  const grid = el('div', 'minimap-grid');
-  grid.setAttribute('aria-hidden', 'true');
-  const tracks = LANES.map(([name, kind]) => {
-    const track = el('div', `minimap-lane ${kind}`);
-    grid.append(el('span', `minimap-label ${kind}`, name), track);
-    return track;
-  });
-  recent.forEach((event, i) => {
-    const { lane, kind } = classify(event);
-    const tick = el('i', `minimap-tick ${kind}`);
-    tick.style.left = `${recent.length === 1 ? 50 : (i / (recent.length - 1)) * 100}%`;
-    tracks[lane].append(tick);
-  });
-  button.append(grid);
-  button.addEventListener('click', () => showFlowChat());
-  return button;
-}
+const changeBadge = (change) => (change.before == null ? el('span', 'badge new', 'new') : change.after == null ? el('span', 'badge deleted', 'deleted') : '');
+// View launchers, the latest runs and the proposed changes; everything else lives in the views.
 function renderSummary(container) {
   const session = state.session;
-  if (!session) return container.append(el('p', 'empty-copy', 'No session selected'));
+  if (!session) return;
   const events = session.events || [];
   const changes = session.changes || [];
   const runs = session.runs || [];
-  const views = summarySection('Views');
+  const views = el('div', 'view-launchers');
   const latest = runs.at(-1);
-  views.append(viewLauncher('program', latest ? runName(latest) : state.config?.workflows?.[0]?.name || ''));
-  views.append(viewLauncher('trace', `${events.length} event${events.length === 1 ? '' : 's'}`), viewLauncher('changes', changes.length ? `${changes.length} file${changes.length === 1 ? '' : 's'}` : ''));
+  views.append(viewLauncher('program', latest ? runName(latest) : state.config?.workflows?.[0]?.name || ''), viewLauncher('trace', String(events.length)), viewLauncher('changes', changes.length ? String(changes.length) : ''));
   container.append(views);
-  if (events.length) {
-    const activity = summarySection('Activity');
-    activity.append(minimap(events));
-    container.append(activity);
-  }
   if (runs.length) {
     const section = summarySection('Runs');
     runs.slice(-5).reverse().forEach((run) => {
       const index = runs.indexOf(run);
       const row = el('button', 'summary-row');
-      const runEvents = events.filter((event) => event.run === run.id);
-      row.append(el('span', `status-pill ${runStateKind(run.state)}`, `Run ${index + 1}`), el('span', 'summary-row-meta', `${(run.state || 'unknown').replace(/_/g, ' ')} · ${runEvents.length} events`));
-      row.title = `Show Run ${index + 1} in Flow chat`;
+      row.append(runDot(run), el('span', 'summary-name', runName(run)));
+      if (['failed', 'interrupted', 'cancelled'].includes(run.state)) row.append(el('span', 'summary-row-meta', stateText(run.state)));
       row.addEventListener('click', () => showFlowChat(run.id));
       const item = el('div', 'summary-run');
       item.append(row, iconButton('i-code', `Open Run ${index + 1} program`, () => openProgram(run.id), 'icon-button small'));
@@ -1293,41 +1193,29 @@ function renderSummary(container) {
     const section = summarySection('Changes');
     for (const change of changes) {
       const row = el('button', 'summary-row');
-      row.append(el('span', 'summary-path', change.path), diffStat(changeStats(change)));
-      row.title = `Show ${change.path} in Changes`;
+      row.append(el('span', 'summary-path', change.path), changeBadge(change), diffStat(changeStats(change)));
+      row.title = change.path;
       row.addEventListener('click', () => openViz('changes', { beside: true, apply: (tab) => { tab.focusPath = change.path; } }));
       section.append(row);
     }
     container.append(section);
   }
-  if (events.length) {
-    const section = summarySection('Recent events');
-    for (const event of events.slice(-6).reverse()) {
-      const row = el('button', `summary-row trace-event ${classify(event).kind}`);
-      const main = el('span', 'trace-event-main');
-      main.append(el('strong', '', event.type), el('small', '', `#${event.sequence} · ${time(event.time)}`));
-      row.append(main);
-      row.addEventListener('click', () => openViz('trace', { apply: (tab) => { tab.selectedEvent = event.id; tab.runFilter = ''; tab.eventFilter = ''; } }));
-      section.append(row);
-    }
-    container.append(section);
-  }
 }
+// Side panel views by name; other views (e.g. Flow step detail) can register here.
+const sideViews = { files: renderFilesPanel, summary: renderSummary };
 function renderSide() {
   const open = !$('side-panel').hidden;
+  // Without a session there is nothing to show: the panel and its toggle hide.
+  $('side-panel').classList.toggle('no-session', !state.session);
+  $('viz-button').hidden = !state.session;
   $('viz-button').setAttribute('aria-pressed', String(open && state.side === 'summary'));
-  for (const [id, side] of [['side-files-tab', 'files'], ['side-summary-tab', 'summary']]) {
-    $(id).classList.toggle('active', state.side === side);
-    $(id).setAttribute('aria-selected', String(state.side === side));
-  }
-  $('side-refresh').hidden = state.side === 'summary' || !state.session;
-  $('connection-status').hidden = state.side !== 'summary' || !state.session;
+  for (const tab of $('side-tabs').querySelectorAll('[data-side]')) tab.setAttribute('aria-selected', String(state.side === tab.dataset.side));
+  $('side-refresh').hidden = state.side !== 'files';
   if (!open) return;
   const container = $('side-content');
   const scroll = container.scrollTop;
-  container.replaceChildren();
-  if (state.side === 'files') renderFilesPanel(container);
-  else renderSummary(container);
+  container.replaceChildren(...container.querySelectorAll(':scope > .flow-detail'));
+  (sideViews[state.side] || renderSummary)(container);
   container.scrollTop = scroll;
 }
 function showSide(side) {
@@ -1351,28 +1239,31 @@ function commitLayout() {
   if (state.side !== 'summary') renderSide();
 }
 function tabInfo(tab) {
-  if (tab.kind === 'chat') return { label: 'Chat', icon: 'i-chat', title: 'Session chat' };
+  // Only a file tab has a title: its full path.
+  if (tab.kind === 'chat') return { label: 'Chat', icon: 'i-chat' };
   if (tab.kind === 'file') return { label: basename(tab.path), icon: 'i-file', title: tab.path };
-  if (tab.kind === 'skill') return { label: `/${tab.name}`, icon: 'i-skill', title: `Skill /${tab.name}` };
+  if (tab.kind === 'skill') return { label: `/${tab.name}`, icon: 'i-skill' };
+  // A sub-agent's tab is named for the agent; its brief is a hover away.
+  if (tab.kind === 'agent') { const agent = agentOfTab(tab); return { label: agent?.name || 'Agent', icon: 'i-agents', title: agent?.brief }; }
   if (tab.kind === 'program') {
     const index = (state.session?.runs || []).findIndex((run) => run.id === tab.run);
-    return { label: index >= 0 ? `Program · Run ${index + 1}` : tab.run?.startsWith('workflow:') ? tab.run.slice(9) : PROGRAM.label, icon: PROGRAM.icon, title: 'ALLEN program' };
+    return { label: index >= 0 ? `Program · Run ${index + 1}` : tab.run?.startsWith('workflow:') ? tab.run.slice(9) : PROGRAM.label, icon: PROGRAM.icon };
   }
-  return { label: VIEWS[tab.view].label, icon: VIEWS[tab.view].icon, title: `${VIEWS[tab.view].label} visualization` };
+  return { label: VIEWS[tab.view].label, icon: VIEWS[tab.view].icon };
 }
 function paneFor(tab) {
   if (tab.kind === 'chat') return $('chat-pane');
   if (!panes.has(tab.id)) {
-    const pane = tab.kind === 'file' ? filePane(tab) : tab.kind === 'program' ? programPane(tab) : tab.kind === 'skill' ? skillPane(tab) : vizPane(tab);
+    const pane = tab.kind === 'file' ? filePane(tab) : tab.kind === 'program' ? programPane(tab) : tab.kind === 'skill' ? skillPane(tab) : tab.kind === 'agent' ? agentPane(tab) : vizPane(tab);
     panes.set(tab.id, pane);
-    if (tab.kind === 'file') loadFileInto(tab); else if (tab.kind === 'program') renderProgram(tab); else if (tab.kind === 'skill') loadSkillInto(tab); else renderViz(tab);
+    if (tab.kind === 'file') loadFileInto(tab); else if (tab.kind === 'program') renderProgram(tab); else if (tab.kind === 'skill') loadSkillInto(tab); else if (tab.kind !== 'agent') renderViz(tab);
   }
   return panes.get(tab.id);
 }
 function renderDock() {
   for (const node of document.querySelectorAll('#dock .keep-scroll, #dock #messages')) scrollMemory.set(node, [node.scrollTop, node.scrollLeft]);
   $('pane-store').append($('chat-pane'), ...panes.values());
-  for (const [id, pane] of panes) if (!state.layout.tabs[id]) { pane.remove(); panes.delete(id); }
+  for (const [id, pane] of panes) if (!state.layout.tabs[id]) { pane.stop?.(); pane.remove(); panes.delete(id); }
   $('dock').replaceChildren(renderNode(state.layout.root));
   for (const node of document.querySelectorAll('#dock .keep-scroll, #dock #messages')) {
     const saved = scrollMemory.get(node);
@@ -1415,9 +1306,10 @@ function renderTab(group, tab, index) {
   const label = el('button', 'tab-label');
   label.setAttribute('role', 'tab');
   label.setAttribute('aria-selected', String(active));
-  label.title = info.title;
+  if (info.title) label.title = info.title;
   label.append(icon(info.icon), el('span', 'tab-text', info.label));
   if (tab.kind === 'chat') label.append(el('span', `tab-dot ${statusKind(state.session)}`));
+  if (tab.kind === 'agent') label.append(el('span', `tab-dot ${({ running: 'active', failed: 'failed' })[agentOfTab(tab)?.status] || ''}`));
   if (tab.kind === 'viz' && tab.view === 'changes' && state.session?.changes?.length) label.append(el('span', 'count', String(state.session.changes.length)));
   label.addEventListener('click', () => { activate(state.layout, tab.id); commitLayout(); });
   item.append(label);
@@ -1467,7 +1359,7 @@ function renderGroup(group) {
   const actions = el('div', 'group-actions');
   const splittable = canSplit(group);
   for (const [side, name, label] of [['right', 'i-split-right', 'Split right'], ['bottom', 'i-split-down', 'Split down']]) {
-    const button = iconButton(name, splittable ? label : `${label} (open another tab first)`, () => splitActive(group, side), 'icon-button small');
+    const button = iconButton(name, label, () => splitActive(group, side), 'icon-button small');
     button.disabled = !splittable;
     actions.append(button);
   }
@@ -1561,7 +1453,7 @@ function focusGroup(id) {
 function startDrag(event, payload) {
   dragPayload = payload;
   event.dataTransfer.effectAllowed = 'move';
-  event.dataTransfer.setData('text/plain', payload.file || payload.view || payload.tab || `/${payload.skill}`);
+  event.dataTransfer.setData('text/plain', payload.file || payload.view || payload.tab);
   document.body.classList.add('dragging-tab');
 }
 function endDrag() {
@@ -1578,13 +1470,6 @@ function tabForPayload(payload) {
     const existing = Object.values(state.layout.tabs).find((tab) => tab.kind === 'file' && tab.path === payload.file);
     if (existing) return existing.id;
     const tab = { id: uid('file'), kind: 'file', path: payload.file };
-    state.layout.tabs[tab.id] = tab;
-    return tab.id;
-  }
-  if (payload.skill) {
-    const existing = Object.values(state.layout.tabs).find((tab) => tab.kind === 'skill' && tab.name === payload.skill);
-    if (existing) return existing.id;
-    const tab = { id: uid('skill'), kind: 'skill', name: payload.skill };
     state.layout.tabs[tab.id] = tab;
     return tab.id;
   }
@@ -1633,16 +1518,28 @@ function openViz(view, { split, beside, apply } = {}) {
   if (window.matchMedia('(max-width:1040px)').matches && !$('side-panel').hidden) showSide(state.side);
 }
 
+// Snapshots of the open thread (its stream, mutation replies, the sidebar). One for any other thread, or arriving
+// with no thread open, is dropped: only selectSession opens a thread.
 function applySnapshot(session) {
-  if (!session?.id || state.session && session.id !== state.session.id) return;
+  if (!session?.id || session.id !== state.session?.id) return;
   // A POST response can arrive after a newer SSE snapshot; never step back to an older revision.
   const revision = (snapshot) => snapshot.revision ?? snapshot.sequence ?? 0;
-  if (state.session && revision(session) < revision(state.session)) return;
+  if (revision(session) < revision(state.session)) return;
+  showSnapshot(session);
+}
+// A mutation's reply is shown only if its thread is still open and nothing navigated in between; true when shown.
+function replyGuard() {
+  const id = state.session?.id, nav = state.selection;
+  return (snapshot) => {
+    if (!snapshot?.id || snapshot.id !== id || state.selection !== nav) return false;
+    applySnapshot(snapshot);
+    return true;
+  };
+}
+function showSnapshot(session) {
   const wasActive = isActive(state.session);
   state.session = session;
-  const index = state.sessions.findIndex((candidate) => candidate.id === session.id);
-  if (index >= 0) state.sessions[index] = session;
-  else state.sessions.unshift(session);
+  upsert(summarize(session));
   renderSidebar();
   renderMessages();
   renderQuestion();
@@ -1650,15 +1547,37 @@ function applySnapshot(session) {
   renderTabStrips();
   renderVizPanes();
   renderProgramPanes();
+  renderAgentPanes();
   if (state.side === 'summary') renderSide();
   // Approved patches change files on disk; refresh open file views once a run settles.
   if (wasActive && !isActive(session)) { reloadFilePanes(); loadFiles(); loadSkills({ force: true }); reloadSkillPanes(); }
 }
+// Composer drafts per thread; '' is the welcome screen's.
+const draftKey = () => state.session?.id ?? '';
+function setComposer(value) {
+  $('message-input').value = value;
+  resizeComposer();
+}
+// Puts text back without losing anything typed since: into the composer while its thread is on screen, else into its draft.
+function restoreDraft(key, text) {
+  const shown = key === draftKey();
+  const current = shown ? $('message-input').value : state.drafts.get(key) ?? '';
+  const value = current.trim() ? `${text}\n\n${current}` : text;
+  if (shown) setComposer(value); else state.drafts.set(key, value);
+}
 async function selectSession(id) {
   const selection = ++state.selection;
-  if (state.session) state.drafts.set(state.session.id, $('message-input').value);
-  const session = await api(`/sessions/${encodeURIComponent(id)}`);
+  state.opening = id;
+  let session;
+  try { session = await api(`/sessions/${encodeURIComponent(id)}`); }
+  finally { if (selection === state.selection) state.opening = null; }
   if (selection !== state.selection) return;
+  // The composer's text is filed at the switch itself, so edits made while this thread loaded are kept. Text typed on
+  // the welcome screen comes along into a thread whose composer would otherwise be empty.
+  const leaving = draftKey(), typed = $('message-input').value;
+  const draft = state.drafts.has(id) ? state.drafts.get(id) : session.messages.length ? '' : session.suggestedPrompt || '';
+  const carry = leaving === '' && Boolean(typed.trim()) && !draft.trim();
+  state.drafts.set(leaving, carry ? '' : typed);
   state.stream?.close();
   state.session = null;
   state.messageSignature = '';
@@ -1670,13 +1589,12 @@ async function selectSession(id) {
   for (const pane of panes.values()) pane.remove();
   panes.clear();
   state.layout = restore(localStorage.getItem(`shout.layout.${id}`));
-  applySnapshot(session);
+  showSnapshot(session);
   renderDock();
   renderSide();
   if (state.side === 'files' && !$('side-panel').hidden) loadFiles();
   loadSkills();
-  $('message-input').value = state.drafts.get(id) || (session.messages.length ? '' : session.suggestedPrompt || '');
-  resizeComposer();
+  setComposer(carry ? typed : draft);
   localStorage.setItem('shout.session', id);
   history.replaceState(null, '', `/#${encodeURIComponent(id)}`);
   $('app').classList.remove('menu-open');
@@ -1687,99 +1605,67 @@ async function selectSession(id) {
       if (state.session?.id === id) applySnapshot(JSON.parse(event.data));
     } catch (error) { toast(`Could not read runtime update: ${error.message}`); }
   });
-  stream.onopen = () => {
-    if (state.stream !== stream) return;
-    $('connection-status').textContent = 'Live';
-    $('connection-status').classList.remove('disconnected');
-  };
-  stream.onerror = () => {
-    if (state.stream !== stream) return;
-    $('connection-status').textContent = 'Reconnecting';
-    $('connection-status').classList.add('disconnected');
-  };
+  // Connected is the normal state and shows nothing; only a lost stream shows "Reconnecting".
+  stream.onopen = () => { if (state.stream === stream) $('connection-status').hidden = true; };
+  stream.onerror = () => { if (state.stream === stream) $('connection-status').hidden = false; };
+  stream.addEventListener('deleted', () => { if (state.session?.id === id) clearSession(); state.drafts.delete(id); });
   $('messages').scrollTop = $('messages').scrollHeight;
 }
-// A sample opened from the welcome screen supplies its own workspace and test command.
-function prepareDialogFields() {
-  $('workspace-input').disabled = !!state.selectedScenario;
-  $('workspace-input').placeholder = state.selectedScenario ? 'A fresh copy of the sample is created' : '/path/to/your/project';
-  $('workspace-input').value = state.selectedScenario ? '' : state.config?.defaultWorkspace || state.config?.cwd || '';
-  $('test-command-input').disabled = !!state.selectedScenario;
-  $('test-command-input').placeholder = state.selectedScenario ? 'Provided by the sample' : 'npm test';
-}
-function openNewDialog(scenarioId = null) {
-  state.selectedScenario = scenarioId;
-  $('new-error').hidden = true;
-  $('new-form').reset();
-  prepareDialogFields();
-  $('new-dialog').showModal();
-}
-$('new-session').addEventListener('click', () => openNewDialog());
-$('model-select').addEventListener('change', saveModel);
-$('effort-select').addEventListener('change', saveModel);
-$('sleeping-toggle').addEventListener('click', () => {
-  state.sleepingOpen = !state.sleepingOpen;
-  state.sleepingShown = 10;
-  localStorage.setItem('shout.sleepingOpen', state.sleepingOpen ? '1' : '0');
+// No thread open: the welcome screen; the lists stay live.
+function clearSession() {
+  ++state.selection;
+  state.opening = null;
+  state.drafts.set(draftKey(), $('message-input').value);
+  state.stream?.close();
+  state.stream = null;
+  state.session = null;
+  state.messageSignature = '';
+  state.questionSignature = '';
+  state.files = null;
+  state.filesError = '';
+  state.skills = { sessionId: null, list: null, error: '', at: 0, pending: null };
+  closeSlash();
+  for (const pane of panes.values()) pane.remove();
+  panes.clear();
+  state.layout = createLayout();
+  setComposer(state.drafts.get('') ?? '');
+  localStorage.removeItem('shout.session');
+  history.replaceState(null, '', '/');
+  $('connection-status').hidden = true;
+  renderDock();
+  renderMessages();
+  renderQuestion();
+  renderStatus();
+  renderTabStrips();
+  renderSide();
   renderSidebar();
-});
-$('close-dialog').addEventListener('click', () => $('new-dialog').close());
-$('cancel-dialog').addEventListener('click', () => $('new-dialog').close());
-$('new-form').addEventListener('submit', async (event) => {
-  event.preventDefault();
-  $('create-button').disabled = true;
-  $('new-error').hidden = true;
-  try { await createSession(); }
-  catch (error) {
-    // A folder that doesn't exist yet can be created on the spot.
-    if (error.code === 'workspace_missing') {
-      $('create-folder-path').textContent = error.path;
-      $('create-folder-dialog').showModal();
-    } else {
-      $('new-error').textContent = error.message;
-      $('new-error').hidden = false;
-    }
-  } finally { $('create-button').disabled = false; }
-});
-async function createSession({ createWorkspace = false } = {}) {
-  const scenario = state.config?.scenarios.find((item) => item.id === state.selectedScenario);
-  const session = await api('/sessions', { method: 'POST', body: { ...(scenario ? { scenario: scenario.id } : { workspace: $('workspace-input').value.trim(), testCommand: $('test-command-input').value.trim() || undefined, createWorkspace }) } });
-  await selectSession(session.id);
-  $('new-dialog').close();
-  $('message-input').value = scenario?.prompt || '';
-  resizeComposer();
-  $('message-input').focus();
 }
-$('create-folder-cancel').addEventListener('click', () => $('create-folder-dialog').close());
-$('create-folder-confirm').addEventListener('click', async () => {
-  $('create-folder-confirm').disabled = true;
-  try {
-    await createSession({ createWorkspace: true });
-    $('create-folder-dialog').close();
-  } catch (error) {
-    $('create-folder-dialog').close();
-    $('new-error').textContent = error.message;
-    $('new-error').hidden = false;
-  } finally { $('create-folder-confirm').disabled = false; }
-});
 $('composer').addEventListener('submit', async (event) => {
   event.preventDefault();
-  const text = $('message-input').value.trim();
+  const raw = $('message-input').value, text = raw.trim();
   if (!text || state.busy || isActive()) return;
-  if (!state.session) { openNewDialog(); return; }
+  // Locked before anything is awaited. The text leaves the composer now, so the next prompt can be typed while this
+  // one is sent; it comes back if the send fails or is overtaken.
   state.busy = true;
+  setComposer('');
   renderStatus();
+  let id = state.session?.id;
   try {
-    const id = state.session.id;
-    const session = await api(`/sessions/${encodeURIComponent(id)}/messages`, { method: 'POST', body: { text } });
-    if (state.session?.id === id) {
-      $('message-input').value = '';
-      resizeComposer();
-      if (session.id) applySnapshot(session);
-      $('messages').scrollTop = $('messages').scrollHeight;
+    if (!id) {
+      // From the welcome screen a thread is made first; opening another thread (or Home) meanwhile cancels the send
+      // and the text goes where the user went.
+      const created = await newThread();
+      if (!created || created.id !== state.session?.id || state.opening) { restoreDraft(state.opening ?? draftKey(), raw); return; }
+      id = created.id;
+      // A sample thread opens with its suggested prompt; this message replaces it.
+      if (created.suggestedPrompt && $('message-input').value === created.suggestedPrompt) setComposer('');
     }
-  } catch (error) { toast(error.message); }
-  finally { state.busy = false; renderStatus(); }
+    const reply = replyGuard();
+    if (reply(await api(`/sessions/${encodeURIComponent(id)}/messages`, { method: 'POST', body: { text } }))) $('messages').scrollTop = $('messages').scrollHeight;
+  } catch (error) {
+    toast(error.message);
+    restoreDraft(id ?? draftKey(), raw);
+  } finally { state.busy = false; renderStatus(); }
 });
 function resizeComposer() {
   $('message-input').style.height = 'auto';
@@ -1896,36 +1782,41 @@ $('message-input').addEventListener('focus', updateSlash);
 $('message-input').addEventListener('blur', closeSlash);
 $('cancel-button').addEventListener('click', async () => {
   $('cancel-button').disabled = true;
+  const reply = replyGuard();
   try {
-    const session = await api(`/sessions/${encodeURIComponent(state.session.id)}/cancel`, { method: 'POST', body: {} });
-    if (session.id) applySnapshot(session);
+    reply(await api(`/sessions/${encodeURIComponent(state.session.id)}/cancel`, { method: 'POST', body: {} }));
   } catch (error) { toast(error.message); }
   finally { $('cancel-button').disabled = false; }
 });
 $('viz-button').addEventListener('click', () => showSide('summary'));
-$('side-files-tab').addEventListener('click', () => { if (state.side !== 'files') showSide('files'); });
-$('side-summary-tab').addEventListener('click', () => { if (state.side !== 'summary') showSide('summary'); });
+for (const tab of $('side-tabs').querySelectorAll('[data-side]')) tab.addEventListener('click', () => { if (state.side !== tab.dataset.side) showSide(tab.dataset.side); });
 $('side-close').addEventListener('click', () => showSide(state.side));
 $('side-refresh').addEventListener('click', () => {
   loadFiles();
   reloadFilePanes();
 });
-$('menu-button').addEventListener('click', () => $('app').classList.toggle('menu-open'));
-for (const id of ['scrim', 'sidebar-close']) $(id).addEventListener('click', () => $('app').classList.remove('menu-open'));
 function applyTheme(choice) {
   if (choice === 'light' || choice === 'dark') document.documentElement.dataset.theme = choice;
   else delete document.documentElement.dataset.theme;
   try { localStorage.setItem('shout.theme', choice); } catch {}
   for (const button of document.querySelectorAll('[data-theme-choice]')) button.setAttribute('aria-checked', String(button.dataset.themeChoice === choice));
+  shell.setTheme(choice === 'light' || choice === 'dark' ? choice : 'system').catch(() => {});
 }
+const darkTheme = () => (document.documentElement.dataset.theme ? document.documentElement.dataset.theme === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches);
 for (const button of document.querySelectorAll('[data-theme-choice]')) button.addEventListener('click', () => applyTheme(button.dataset.themeChoice));
 applyTheme(document.documentElement.dataset.theme || 'system');
-document.addEventListener('keydown', (event) => {
-  if (event.key.toLowerCase() === 'n' && !event.ctrlKey && !event.metaKey && !event.altKey && !['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement.tagName) && !$('new-dialog').open) { event.preventDefault(); openNewDialog(); }
-});
+document.addEventListener('keydown', handleShortcut);
 window.addEventListener('beforeunload', () => state.stream?.close());
 
 async function init() {
+  initSidebar({
+    state, api, toast,
+    select: selectSession,
+    deselect: clearSession,
+    applySnapshot,
+    focusComposer: () => { const input = $('message-input'); resizeComposer(); input.focus(); input.setSelectionRange(input.value.length, input.value.length); },
+    toggleTheme: () => applyTheme(darkTheme() ? 'light' : 'dark'),
+  });
   const side = localStorage.getItem('shout.side');
   state.side = side === 'files' ? 'files' : 'summary';
   $('side-panel').hidden = side === 'closed' || window.matchMedia('(max-width:1040px)').matches;
@@ -1938,26 +1829,20 @@ async function init() {
   renderStatus();
   renderSide();
   try {
-    const [config, sessions] = await Promise.all([api('/config'), api('/sessions')]);
+    const [config, sessions, projects] = await Promise.all([api('/config'), api('/sessions'), api('/projects')]);
     state.config = config;
-    state.sessions = Array.isArray(sessions) ? sessions : sessions.sessions || [];
-    const providers = config.providers || [];
-    $('provider-status').textContent = config.provider?.available ? providers.filter((item) => item.available).map((item) => item.label).join(' · ') || 'Connected' : 'Live model unavailable';
-    $('engine-dot').className = `engine-dot ${config.provider?.available ? 'ok' : 'off'}`;
-    $('provider-status').title = providers.filter((item) => !item.available).map((item) => item.error).filter(Boolean).join(' ') || (config.provider?.available ? '' : config.provider?.error || '');
-    if (!config.provider?.available) {
-      $('model-help').textContent = `Live model unavailable: ${config.provider?.error || 'sign in to Codex or Claude Code.'}`;
-      $('model-help').hidden = false;
-    }
+    setLists({ projects, sessions });
+    renderProviders(config);
     state.messageSignature = '';
     renderModelPicker();
     renderMessages();
     renderSidebar();
     renderProgramPanes();
+    startLive();
     const remembered = decodeURIComponent(location.hash.slice(1)) || localStorage.getItem('shout.session');
     if (remembered && state.sessions.some((session) => session.id === remembered)) await selectSession(remembered);
   } catch (error) {
-    $('provider-status').textContent = 'Disconnected';
+    renderProviders(null);
     toast(`Cannot connect to SHOUT: ${error.message}`);
   }
 }

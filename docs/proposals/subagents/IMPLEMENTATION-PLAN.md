@@ -1,6 +1,6 @@
 # Sub-agents in SHOUT: implementation plan
 
-Status: plan only, nothing implemented. Written 2026-09-27.
+Status: implemented 2026-09-27 (phases 1–4), described in [the app README](../../../apps/shout/README.md#sub-agents); live checks in [GUI verification](../../GUI-VERIFICATION.md). Written 2026-09-27.
 Design reference: [index.html](index.html), section **Flow B**, and `shots/flow-b-dark.png`.
 
 ## What we are building

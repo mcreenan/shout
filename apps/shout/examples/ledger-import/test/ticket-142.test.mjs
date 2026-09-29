@@ -85,6 +85,8 @@ const august = importStatement([
   '08/01/2026,BLUE BOTTLE,-4.50',
   '08/02/2026,UBER TRIP,-18.20',
 ].join('\n'));
+// Deep copies taken before any test runs, so a merge that changes its inputs cannot hide it.
+const pristine = structuredClone({ july, august });
 
 test('ledger: overlapping statements are not double-counted', () => {
   const ledger = mergeImports(july, august);
@@ -104,9 +106,11 @@ test('ledger: repeats beyond those already recorded are kept', () => {
 });
 
 test('ledger: inputs are not mutated', () => {
-  const existing = [...july];
-  mergeImports(existing, august);
-  assert.deepEqual(existing, july);
+  const existing = structuredClone(pristine.july);
+  const incoming = structuredClone(pristine.august);
+  mergeImports(existing, incoming);
+  assert.deepEqual(existing, pristine.july);
+  assert.deepEqual(incoming, pristine.august);
 });
 
 test('report: merged overlapping statements give the real August spending', () => {

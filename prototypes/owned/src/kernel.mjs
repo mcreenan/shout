@@ -5,7 +5,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Ajv from 'ajv';
 import { JoshTransport } from './transport.mjs';
-import { callbackSchema, validate, record, textField, chatSchema } from './schema.mjs';
+import { callbackCodec, validate, schemaErrors, SchemaRejection, record, textField, chatSchema } from './schema.mjs';
 
 export const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const host = { name: 'owned-allen-prototype', version: '0.1.0' };
@@ -19,6 +19,38 @@ export class ToolError extends Error {}
 // Leaves room for the response envelope inside the negotiated max_frame_bytes.
 const maxToolResultBytes = limits.max_frame_bytes - 64 * 1024;
 const terminal = state => ['completed', 'failed', 'cancelled', 'stopped', 'interrupted'].includes(state);
+// JOSH sends at most 16 validation issues with 256-byte paths; the events keep the same bound.
+const boundedIssues = issues => (Array.isArray(issues) ? issues : []).slice(0, 16)
+  .map(issue => ({ path: String(issue?.path ?? '').slice(0, 256), code: String(issue?.code ?? '').slice(0, 64) }));
+// Sent to JOSH for an answer that is not JSON at all. It decodes as no ALLEN type (no record field
+// or enum tag starts with $, and Bytes is exactly {"$bytes": ...}), so JOSH rejects it and re-asks.
+const UNPARSEABLE = Object.freeze({ $unparseable: true });
+/**
+ * The answer inside a provider failure that only means the answer was invalid: a SchemaRejection
+ * of the callback schema, or of a provider's {value} envelope around it, or an error with
+ * code 'invalid_answer' (UNPARSEABLE when it has no value). Anything else is not an answer (null).
+ */
+function rejectedAnswer(error, schema) {
+  if (error instanceof SchemaRejection) {
+    if (error.schema === schema) return error.value;
+    const envelope = error.value;
+    return envelope !== null && typeof envelope === 'object' && 'value' in envelope ? envelope.value : UNPARSEABLE;
+  }
+  if (error?.code === 'invalid_answer') return 'value' in error ? error.value : UNPARSEABLE;
+  return null;
+}
+const issueText = { type: 'wrong type', required: 'missing', unknown: 'not allowed here', range: 'out of range',
+  fields: 'wrong set of fields', length: 'wrong number of items', encoding: 'not valid base64', tag: 'unknown variant tag',
+  // The kernel sorts map entries into JOSH's key order, so an order issue is a repeated key.
+  order: 'repeated key (map keys must be distinct)' };
+// The model sees why its previous answer was rejected, as part of the instructions for this attempt.
+function withRetryNote(prompt, attempt, issues, unparseable) {
+  const reasons = unparseable ? ['- the answer was not a JSON value']
+    : issues.map(issue => `- ${issue.path || '(the whole answer)'}: ${issueText[issue.code] ?? issue.code}`);
+  return { ...prompt, system: `${prompt.system}\n\nThis is attempt ${attempt} of ${prompt.policy?.max_attempts ?? attempt}. `
+    + `The previous answer was rejected because it does not match the required output type:\n${reasons.join('\n')}\n`
+    + 'Answer again with a value that matches the output schema exactly.' };
+}
 
 export const DEFAULT_RUN_WALL_MS = 30 * 60 * 1000;
 
@@ -46,6 +78,8 @@ export class Run extends EventEmitter {
     this.id = `run-${randomUUID()}`; this.state = 'starting'; this.provider = provider;
     this.source = source; this.input = input; this.wallMs = wallMs;
     this.scratch = resolve(scratchRoot, this.id); this.effects = new Map(); this.events = [];
+    // interaction_id -> the effect of its latest attempt, to link JOSH's re-asks to rejected answers.
+    this.interactions = new Map();
     this.counters = { modelJudgments: 0, nativeToolCalls: 0, userQuestions: 0, providerRequests: 0, automaticProviderReplies: 0, deterministicTransitions: 0, modelForwardingEnvelopes: 0 };
     this.abort = new AbortController();
     this.done = new Promise(resolve => { this.resolveDone = resolve; });
@@ -61,6 +95,8 @@ export class Run extends EventEmitter {
     })), ...(this.result ? { result: this.result } : {}) };
   }
   async start() {
+    if (this.started) throw new Error('A run may start only once');
+    this.started = true;
     this.event('run.started', { sourceBytes: Buffer.byteLength(this.source), wallMs: this.wallMs });
     this.timer = this.wallMs === null ? null : setTimeout(() => this.finish('failed', {
       outcome: 'failed', error: `Host wall-time budget expired after ${this.wallMs} ms (${this.wallMs / 1000} seconds)`,
@@ -73,11 +109,14 @@ export class Run extends EventEmitter {
           if (terminal(this.state)) return;
           if (frame.kind === 'cancel') {
             const effect = this.effects.get(`${this.id}:${frame.id}`);
-            if (effect) { effect.abort.abort(); this.effects.delete(effect.id); this.event('effect.cancelled', { id: effect.id }); }
+            if (effect) {
+              effect.abort.abort(); this.effects.delete(effect.id); this.settleState();
+              this.event('effect.cancelled', { id: effect.id });
+            }
           } else this.event('vm.event', { method: frame.method, detail: frame.params });
         }, onFailure: error => this.finish('interrupted', { outcome: 'interrupted', error: error.message }) });
       await this.transport.ready;
-      await this.transport.request('initialize', { host, protocol_versions: ['josh/1.6'], language_versions: ['>=0.1.0, <0.2.0'],
+      await this.transport.request('initialize', { host, protocol_versions: ['josh/1.8'], language_versions: ['>=0.1.0, <0.2.0'],
         execution_mode: 'unattended', invoking_session_id: null, standard_capabilities: [], limits: { ...limits, max_catalog_tools: Math.max(1, this.tools.length) }, extensions: [] });
       const metadata = { source: host.name, source_revision: host.version, observed_at_unix_ms: Date.now(), freshness: 'current', complete: true };
       await this.transport.request('host/project', { profile: 'josh.host-projection/0.1', projection_id: this.id,
@@ -86,13 +125,23 @@ export class Run extends EventEmitter {
       await this.transport.request('catalog/set', { schema_dialect: 'https://json-schema.org/draft/2020-12/schema', metadata, tools: this.tools });
       const loaded = await this.transport.request('program/load', { format: 'source_bundle', files: [{ path: 'src/main.allen', encoding: 'utf8', content: this.source }] });
       if (!Array.isArray(loaded.required_tools) || loaded.required_tools.some(name => !this.toolMap.has(name))) throw new Error('Program requests an unauthorized tool');
-      this.state = 'running'; this.event('program.loaded', { artifactDigest: loaded.artifact_digest, tools: loaded.required_tools });
+      // With debug information JOSH also returns the program's static construct and effect-site
+      // tables; `origin.scope[].construct` and `origin.site.id` refer to them.
+      const tables = loaded.debug ? { sites: loaded.debug.effect_sites, constructs: loaded.debug.constructs } : {};
+      this.state = 'running'; this.event('program.loaded', { artifactDigest: loaded.artifact_digest, tools: loaded.required_tools, ...tables });
       const result = await this.transport.request('execution/start', { execution_id: this.id, program_id: loaded.program_id,
         artifact_digest: loaded.artifact_digest, entry: 'main', input: this.input, working_directory: null,
         granted_capabilities: [], granted_tools: loaded.required_tools, allowed_http_origins: [], granted_exec: [], granted_exec_environment: [], limits: this.wallMs === null ? {} : { wall_ms: this.wallMs } });
       const state = result.outcome === 'completed' ? 'completed' : result.outcome === 'cancelled' ? 'cancelled' : result.outcome === 'stopped' ? 'stopped' : 'failed';
       this.finish(state, result);
-    } catch (error) { this.finish('failed', { outcome: 'failed', error: error.message }); }
+    } catch (error) {
+      // A source program that does not compile fails program/load with the compiler's diagnostics.
+      const diagnostics = error.wire?.data?.diagnostics;
+      if (Array.isArray(diagnostics) && diagnostics.length) {
+        const shown = diagnostics.slice(0, 5).map(d => `${d.source}:${d.line}:${d.column}: error[${d.code}]: ${d.message}`);
+        this.finish('failed', { outcome: 'failed', error: `Program does not compile:\n${shown.join('\n')}`, diagnostics });
+      } else this.finish('failed', { outcome: 'failed', error: error.message });
+    }
   }
   async dispatch(frame) {
     if (terminal(this.state)) return;
@@ -102,24 +151,57 @@ export class Run extends EventEmitter {
     if (this.effects.has(id)) throw new Error('Duplicate provider request');
     const effect = { id, wireId, method, params, state: 'pending', abort: new AbortController() };
     this.effects.set(id, effect); this.counters.providerRequests++;
-    this.event('effect.requested', { id, method });
+    // Where the effect came from: its source site, enclosing loops (with iterations), branches, calls and task.
+    const origin = params.origin && typeof params.origin === 'object' ? { origin: params.origin } : {};
+    // Typed responses: JOSH validates each answer itself and, while the prompt's max_attempts allows,
+    // asks again with the same interaction_id, the next attempt and the validation issues.
+    const typed = method === 'model/request' || method === 'user/ask';
+    const attempt = typed && Number.isInteger(params.attempt) ? params.attempt : 1;
+    const previous = typed && attempt > 1 ? this.interactions.get(params.interaction_id) : undefined;
+    // Issue paths point into the rejected answer as it was given (the model shape), not JOSH's wire form.
+    const wireIssues = typed && attempt > 1 ? boundedIssues(params.validation_issues) : [];
+    const issues = previous?.codec ? previous.codec.modelIssues(wireIssues, previous.answer) : wireIssues;
+    const retry = typed ? { interaction: params.interaction_id, attempt, ...(attempt > 1 ? { issues } : {}) } : {};
+    if (typed) this.interactions.set(params.interaction_id, { id, attempt, unparseable: false });
+    if (method === 'model/request' && previous) this.event('model.rejected', { id: previous.id, interaction: params.interaction_id, attempt: previous.attempt, issues });
+    this.event('effect.requested', { id, method, ...origin, ...retry });
     try {
       if (method === 'model/request') {
+        // Every attempt is one model judgment.
         if (this.counters.modelJudgments >= this.maxModelJudgments) throw new Error(`Model judgment budget exhausted (${this.maxModelJudgments} per run)`);
-        this.counters.modelJudgments++; effect.schema = callbackSchema(params.response_schema.descriptor);
-        this.event('model.started', { id, prompt: params.prompt });
-        const value = await this.provider.judge({ prompt: params.prompt, schema: effect.schema, signal: effect.abort.signal,
-          onEvent: detail => { if (!terminal(this.state)) this.event('model.worker', detail); } });
+        this.counters.modelJudgments++; effect.codec = callbackCodec(params.response_schema.descriptor); effect.schema = effect.codec.schema;
+        this.event('model.started', { id, prompt: params.prompt, ...origin, ...retry });
+        const prompt = attempt > 1 ? withRetryNote(params.prompt, attempt, issues, previous?.unparseable) : params.prompt;
+        let value;
+        try {
+          value = await this.provider.judge({ prompt, schema: effect.schema, signal: effect.abort.signal, attempt, issues,
+            onEvent: detail => { if (!terminal(this.state)) this.event('model.worker', { ...detail, id }); } });
+        } catch (error) {
+          if (!this.isPending(effect)) return;
+          value = rejectedAnswer(error, effect.schema);
+          if (value === null) {
+            // A refusal is JOSH's model.denied: the program's Err branch handles it. Transport
+            // failures, timeouts and budgets still fail the run with their message.
+            if (error?.code !== 'refusal') throw error;
+            this.rejectEffect(effect, 'model.denied', error.message);
+            return;
+          }
+        }
         if (!this.isPending(effect)) return;
-        validate(effect.schema, value);
-        this.event('model.completed', { id, value }); this.respond(effect, { value });
+        // JOSH is the authority on validity. An invalid answer is still sent, so that JOSH re-asks
+        // with its validation issues or, after the last attempt, returns Err to the program.
+        const unparseable = value === UNPARSEABLE || value === undefined;
+        Object.assign(this.interactions.get(params.interaction_id), { unparseable, codec: effect.codec, answer: value });
+        const valid = !unparseable && !schemaErrors(effect.schema, value);
+        this.event('model.completed', { id, value: unparseable ? null : value, ...(valid ? {} : { valid: false }) });
+        this.respond(effect, { value: unparseable ? UNPARSEABLE : effect.codec.toWire(value) });
       } else if (method === 'tool/invoke') {
         const definition = this.toolMap.get(params.tool);
         if (!definition) throw new Error('Unknown host tool');
         validate(definition.input_schema, params.input);
         if (this.counters.nativeToolCalls >= this.maxToolCalls) throw new Error(`Native tool budget exhausted (${this.maxToolCalls} per run)`);
         this.counters.nativeToolCalls++;
-        this.event('tool.started', { id, tool: params.tool, input: params.input });
+        this.event('tool.started', { id, tool: params.tool, input: params.input, ...origin });
         let value; let artifact;
         if (this.toolHandler) {
           try { value = await this.toolHandler(params.tool, params.input, { signal: effect.abort.signal, effectId: id }); }
@@ -154,10 +236,10 @@ export class Run extends EventEmitter {
         this.event('tool.completed', { id, tool: params.tool, value, ...(artifact ? { artifact } : {}) });
         this.respond(effect, { outcome: 'ok', value });
       } else if (method === 'user/ask') {
-        effect.schema = callbackSchema(params.response_schema.descriptor);
+        effect.codec = callbackCodec(params.response_schema.descriptor); effect.schema = effect.codec.schema;
         if (this.counters.userQuestions >= 8) throw new Error('User question budget exhausted (8 per run)');
         this.counters.userQuestions++; this.state = 'waiting_user';
-        this.event('user.question', { id, prompt: params.prompt, schema: effect.schema });
+        this.event('user.question', { id, prompt: params.prompt, schema: effect.schema, ...origin, ...retry });
       } else {
         this.rejectEffect(effect, `${method.split('/')[0] === 'agent' ? 'agent' : 'request'}.${method.startsWith('agent/') ? 'unavailable' : 'method_not_found'}`, 'Provider not implemented by this prototype');
       }
@@ -170,24 +252,43 @@ export class Run extends EventEmitter {
     }
   }
   isPending(effect) { return !terminal(this.state) && this.effects.get(effect.id) === effect && !effect.abort.signal.aborted; }
+  // While any question is open the run waits for its user.
+  settleState() {
+    if (!terminal(this.state)) this.state = [...this.effects.values()].some(e => e.method === 'user/ask') ? 'waiting_user' : 'running';
+  }
+  // The response frame is encoded before the effect leaves the pending set. One that cannot be
+  // sent (larger than a JOSH frame) throws with the effect still pending: dispatch then fails the
+  // run, and answer() leaves the question open for another answer.
   respond(effect, result) {
     if (!this.isPending(effect)) return;
+    this.commit(effect, this.transport.encode({ kind: 'response', id: effect.wireId, result }));
+  }
+  commit(effect, frame) {
     this.effects.delete(effect.id); this.counters.automaticProviderReplies++;
-    this.transport.send({ kind: 'response', id: effect.wireId, result });
-    this.state = [...this.effects.values()].some(e => e.method === 'user/ask') ? 'waiting_user' : 'running';
+    this.transport.write(frame);
+    this.settleState();
     this.event('effect.resolved', { id: effect.id, method: effect.method });
   }
   rejectEffect(effect, code, message) {
     if (!this.isPending(effect)) return;
+    const text = String(message).slice(0, 1024);
+    const frame = this.transport.encode({ kind: 'response', id: effect.wireId, error: { code, message: text } });
     this.effects.delete(effect.id);
-    this.transport.send({ kind: 'response', id: effect.wireId, error: { code, message } });
-    this.event('effect.rejected', { id: effect.id, code });
+    this.transport.write(frame);
+    this.event('effect.rejected', { id: effect.id, code, message: text });
   }
   answer(id, value, origin = 'user') {
     const effect = this.effects.get(id);
     if (!effect || effect.method !== 'user/ask' || !this.isPending(effect)) throw new Error('Unknown, expired, duplicate, or cross-run question ID');
+    // The form's answer must match the schema here, so the user corrects it at once instead of
+    // being asked again by JOSH.
     validate(effect.schema, value);
-    this.event('user.answered', { id, origin, value }); this.respond(effect, { value });
+    let frame;
+    try { frame = this.transport.encode({ kind: 'response', id: effect.wireId, result: { value: effect.codec ? effect.codec.toWire(value) : value } }); }
+    catch (error) { throw new Error(`Answer not sent: ${error.message}. The question is still open.`); }
+    const interaction = this.interactions.get(effect.params.interaction_id);
+    if (interaction) Object.assign(interaction, { codec: effect.codec, answer: value });
+    this.event('user.answered', { id, origin, value }); this.commit(effect, frame);
   }
   cancel() {
     if (terminal(this.state)) return this.snapshot();

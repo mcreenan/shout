@@ -2,30 +2,69 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src file:">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src file:; script-src file:">
   <meta name="color-scheme" content="light dark">
   <title>SHOUT</title>
   <style>
-    :root{--bg:#ffffff;--text:#18181b;--text-3:#8a8a94;--track:#e4e4e8;--accent:#0038a8;color-scheme:light}
-    @media (prefers-color-scheme:dark){:root{--bg:#0f0f11;--text:#ececef;--text-3:#6e6e78;--track:#26262b;--accent:#4b83ff;color-scheme:dark}}
+    :root{--bg:#ffffff;--surface:#f7f7f8;--text:#18181b;--text-2:#52525b;--text-3:#8a8a94;--border:#e4e4e8;--track:#e4e4e8;--accent:#0038a8;--accent-hover:#002d87;--ring:#0038a833;--danger:#b91c1c;--danger-soft:#fdeeee;--danger-border:#f5c6c6;color-scheme:light}
+    @media (prefers-color-scheme:dark){:root{--bg:#0f0f11;--surface:#18181b;--text:#ececef;--text-2:#a1a1aa;--text-3:#6e6e78;--border:#26262b;--track:#26262b;--accent:#245bce;--accent-hover:#306be2;--ring:#4b83ff66;--danger:#f87171;--danger-soft:#2a1414;--danger-border:#5a2626;color-scheme:dark}}
     html,body{height:100%;margin:0}
     body{background:var(--bg);color:var(--text);font:14px/1.5 ui-sans-serif,system-ui,-apple-system,'Segoe UI',Inter,Roboto,sans-serif;display:grid;place-items:center;-webkit-user-select:none;user-select:none}
-    main{display:flex;flex-direction:column;align-items:center;gap:22px;width:min(440px,80vw);text-align:center}
-    img{width:220px;height:auto}
+    .drag{position:fixed;top:0;left:0;right:0;height:40px;-webkit-app-region:drag}
+    main{display:flex;flex-direction:column;align-items:center;gap:14px;width:min(460px,86vw);text-align:center}
+    img{width:220px;height:auto;margin-bottom:8px}
     .light{display:block}.dark{display:none}
     @media (prefers-color-scheme:dark){.light{display:none}.dark{display:block}}
+    [hidden]{display:none!important}
+    h1{font-size:16px;font-weight:600;margin:0}
+    #hint{margin:-6px 0 0;color:var(--text-2);font-size:13px}
+    #url{margin:0;font:12.5px ui-monospace,'JetBrains Mono','SF Mono',Menlo,Consolas,monospace;color:var(--text-2);-webkit-user-select:text;user-select:text;word-break:break-all}
+    #error{margin:0;width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid var(--danger-border);border-radius:8px;background:var(--danger-soft);color:var(--danger);font-size:13px;text-align:left;-webkit-user-select:text;user-select:text}
     .bar{width:160px;height:3px;border-radius:3px;background:var(--track);overflow:hidden}
     .bar::after{content:'';display:block;width:40%;height:100%;border-radius:3px;background:var(--accent);animation:slide 1.1s ease-in-out infinite}
     @keyframes slide{from{transform:translateX(-100%)}to{transform:translateX(250%)}}
     #status{margin:0;color:var(--text-3);font-size:12.5px;min-height:1.5em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
+    form{display:flex;flex-direction:column;gap:8px;width:100%;text-align:left;-webkit-app-region:no-drag}
+    label{font-size:12.5px;font-weight:550;color:var(--text-2)}
+    .row{display:flex;gap:8px}
+    input{flex:1;min-width:0;height:34px;padding:0 10px;border:1px solid var(--border);border-radius:8px;background:var(--surface);color:var(--text);font:13px ui-monospace,'JetBrains Mono','SF Mono',Menlo,Consolas,monospace}
+    input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--ring)}
+    #form-error{margin:0;color:var(--danger);font-size:12.5px}
+    .actions{display:flex;flex-wrap:wrap;justify-content:center;gap:8px;-webkit-app-region:no-drag}
+    button{height:34px;padding:0 14px;border-radius:8px;border:1px solid var(--border);background:var(--surface);color:var(--text);font:inherit;font-weight:550;cursor:pointer}
+    button:hover{border-color:var(--text-3)}
+    button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+    button.primary:hover{background:var(--accent-hover)}
+    button:focus-visible{outline:none;box-shadow:0 0 0 3px var(--ring)}
   </style>
 </head>
 <body>
+  <div class="drag"></div>
   <main>
-    <img class="light" src="../../shout/public/shout-wordmark.png" alt="SHOUT!">
-    <img class="dark" src="../../shout/public/shout-wordmark-dark.png" alt="SHOUT!">
-    <div class="bar" role="progressbar" aria-label="Starting SHOUT"></div>
-    <p id="status" aria-live="polite">Starting SHOUT…</p>
+    <img class="light" src="../assets/wordmark.png" alt="SHOUT!">
+    <img class="dark" src="../assets/wordmark-dark.png" alt="SHOUT!">
+    <h1 id="title">Starting SHOUT…</h1>
+    <p id="hint" hidden></p>
+    <p id="url" hidden></p>
+    <p id="error" role="alert" hidden></p>
+    <div class="bar" id="bar" role="progressbar" aria-label="Working"></div>
+    <form id="connect-form" hidden>
+      <label for="server-input">Server address</label>
+      <div class="row">
+        <input id="server-input" name="server" placeholder="http://my-computer:4310" autocomplete="url" spellcheck="false" autocapitalize="off">
+        <button type="submit" class="primary" id="connect-button">Connect</button>
+      </div>
+      <p id="form-error" role="alert" hidden></p>
+    </form>
+    <div class="actions">
+      <button type="button" data-action="retry" class="primary" hidden>Retry now</button>
+      <button type="button" data-action="change" hidden>Change server…</button>
+      <button type="button" data-action="local" hidden>Use this computer’s SHOUT</button>
+      <button type="button" data-action="log" hidden>Show log</button>
+      <button type="button" data-action="cancel" hidden>Cancel</button>
+    </div>
+    <p id="status" aria-live="polite"></p>
   </main>
+  <script src="connection.js"></script>
 </body>
 </html>

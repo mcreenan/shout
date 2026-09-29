@@ -73,11 +73,11 @@ export function popover(trigger, panel) {
     else if (event.key === 'Enter' || event.key === ' ') choose(list[index]);
     else if (event.key === 'Escape') close(true);
     else if (event.key === 'Tab') { close(); return; }
-    else return;
+    else { if (event.key.length === 1) event.stopPropagation(); return; } // keep typing out of global shortcuts
     event.preventDefault();
     event.stopPropagation();
   });
-  const api = { open, close, get isOpen() { return !panel.hidden; } };
+  const api = { open, close, trigger, get isOpen() { return !panel.hidden; } };
   return api;
 }
 
@@ -94,7 +94,8 @@ function option(label, { selected = false, disabled = false, title = '', choose,
   if (role === 'option') item.setAttribute('aria-selected', String(selected));
   item.setAttribute('aria-disabled', String(disabled));
   if (title) item.title = title;
-  item.append(el('span', 'popover-label', label), sprite('i-check', 'popover-check'));
+  item.append(el('span', 'popover-label', label));
+  if (role === 'option') item.append(sprite('i-check', 'popover-check'));
   item.choose = choose;
   return item;
 }
@@ -119,12 +120,13 @@ export function renderModels(trigger, panel, { providers, models, model, locked,
     group.setAttribute('aria-labelledby', heading.id);
     group.append(heading);
     for (const entry of models.filter((candidate) => candidate.provider === item.id)) {
-      const lockedOut = locked && entry.id !== info?.id;
+      // The current model always reads as chosen; every other one is disabled when locked or its provider is down.
+      const other = entry.id !== info?.id;
       group.append(option(entry.label, {
-        selected: entry.id === info?.id,
-        disabled: lockedOut || !item.available,
-        title: lockedOut ? LOCKED : !item.available ? item.error || `${item.label} is unavailable` : '',
-        choose: () => entry.id !== info?.id && onPick(entry.id),
+        selected: !other,
+        disabled: other && (locked || !item.available),
+        title: !other ? '' : locked ? LOCKED : !item.available ? item.error || `${item.label} is unavailable` : '',
+        choose: () => other && onPick(entry.id),
       }));
     }
     return group;
@@ -143,12 +145,12 @@ export function renderEfforts(trigger, panel, { efforts, effort, onPick }) {
   refill(panel, efforts.map((item) => option(effortLabel(item), { selected: item === effort, choose: () => item !== effort && onPick(item) })));
 }
 
-/** The overflow menu: items are [label, { checked?, disabled?, icon?, choose }]. */
+/** The overflow menu: items are [label, { checked?, disabled?, icon?, choose }]; a checkbox's icon slot holds its check. */
 export function renderMenu(panel, entries) {
   refill(panel, entries.map(([label, { checked, disabled = false, icon, choose }]) => {
     const item = option(label, { disabled, choose, role: checked === undefined ? 'menuitem' : 'menuitemcheckbox' });
     if (checked !== undefined) item.setAttribute('aria-checked', String(checked));
-    if (icon) item.prepend(sprite(icon, 'popover-icon'));
+    item.prepend(checked === undefined ? sprite(icon, 'popover-icon') : sprite('i-check', 'popover-check'));
     return item;
   }));
 }

@@ -1,9 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { resolve } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { ClaudeAgent } from '../src/claude-agent.mjs';
 import { ClaudeProvider } from '../src/claude-provider.mjs';
+import { Run } from '../../../prototypes/owned/src/kernel.mjs';
+import { SchemaRejection } from '../../../prototypes/owned/src/schema.mjs';
 
 // Stand-in for the SDK's query(): `script(call, index)` is an async generator of SDK messages for each call.
 const fakeQuery = script => {
@@ -109,6 +114,31 @@ test('ClaudeAgent refuses a second turn on a busy thread, and an abort interrupt
   await assert.rejects(agent.turn('s', 'x', { onToolCall: async () => '' }), /needs its thread options/);
 });
 
+test('ClaudeAgent queues a turn sent right after a cancel behind the stopping one, and gives up on one that never stops', async () => {
+  let stuck = false;
+  const query = fakeQuery(async function* ({ options }, index) {
+    yield init;
+    if (index === 1 || (index === 3 && stuck)) await (stuck ? new Promise(() => {}) : aborted(options.abortController.signal));
+    yield said(`turn ${index}`); yield success({ session_id: 's' });
+  });
+  const agent = new ClaudeAgent({ query, sessionInfo: async () => undefined, binary: null, stopWaitMs: 50 });
+  const controller = new AbortController();
+  const running = agent.turn('s', 'long', { onToolCall: async () => '', signal: controller.signal, thread });
+  await new Promise(resolve => setTimeout(resolve, 20));
+  controller.abort();
+  const events = [];
+  const next = agent.turn('s', 'next', { onToolCall: async () => '', onEvent: event => events.push(event), thread });
+  assert.deepEqual(await running, { status: 'interrupted' });
+  assert.deepEqual(await next, { status: 'completed', threadId: 's' });
+  assert.deepEqual([query.calls.length, events[0]], [2, { type: 'message', text: 'turn 2' }], 'the next turn ran once the first had stopped');
+  stuck = true;
+  const hung = new AbortController();
+  void agent.turn('s', 'hangs', { onToolCall: async () => '', signal: hung.signal, thread });
+  await new Promise(resolve => setTimeout(resolve, 20));
+  hung.abort();
+  await assert.rejects(agent.turn('s', 'after', { onToolCall: async () => '', thread }), /previous turn is still stopping/);
+});
+
 test('ClaudeAgent rejects failed turns and refusals with a clear message', async () => {
   const endings = {
     failed: [{ type: 'result', subtype: 'error_during_execution', is_error: true, errors: ['Invalid model: claude-nope'], stop_reason: null }],
@@ -139,6 +169,15 @@ test('ClaudeAgent rejects failed turns and refusals with a clear message', async
 });
 
 const answerOf = value => ({ type: 'object', properties: { value }, required: ['value'], additionalProperties: false });
+const worker = { provider: 'claude-agent-sdk', version: '2.1.283', usage: { input_tokens: 115, cached_input_tokens: 100, output_tokens: 7 }, acceptedToolEvents: 0, profile: 'restricted-no-tools-v1' };
+const structuredCall = input => ({ type: 'assistant', parent_tool_use_id: null, message: { content: [{ type: 'tool_use', id: 'toolu_s', name: 'StructuredOutput', input }], stop_reason: null } });
+const exhausted = { type: 'result', subtype: 'error_max_structured_output_retries', is_error: true, errors: ['no valid output'], stop_reason: null, usage };
+// Like the SDK, a query that ends in an error result throws after yielding it.
+const replying = replies => fakeQuery(async function* (call, index) {
+  const messages = typeof replies === 'function' ? replies(call, index) : replies[index - 1];
+  yield init; yield* messages;
+  if (messages.at(-1).type === 'result' && messages.at(-1).subtype !== 'success') throw new Error('Claude Code returned an error result');
+});
 
 test('ClaudeProvider returns a validated structured answer from one isolated, unsaved query', async () => {
   const query = fakeQuery(async function* () { yield init; yield success({ structured_output: { value: { pick: 'T-100' } }, stop_reason: 'tool_use' }); });
@@ -151,39 +190,91 @@ test('ClaudeProvider returns a validated structured answer from one isolated, un
   assert.deepEqual(options.outputFormat, { type: 'json_schema', schema: answerOf(schema) });
   assert.deepEqual([options.persistSession, options.model, options.effort, options.tools, options.settingSources, options.mcpServers], [false, 'claude-fable-5-1', 'low', [], [], undefined]);
   assert.equal((await options.canUseTool('Bash', {}, {})).behavior, 'deny');
-  assert.deepEqual(events, [{ provider: 'claude-agent-sdk', version: '2.1.283', usage: { input_tokens: 115, cached_input_tokens: 100, output_tokens: 7 }, mode: 'structured', attempts: 1, acceptedToolEvents: 0, profile: 'restricted-no-tools-v1' }]);
+  assert.deepEqual(events, [worker]);
 });
 
-test('ClaudeProvider falls back to JSON in the prompt, with one corrective retry', async () => {
-  const replies = [null, 'Here you go: {"value": 5}', '```json\n{"value": "five"}\n```'];
-  const query = fakeQuery(async function* (_call, index) {
-    yield init;
-    if (index === 1) { yield { type: 'result', subtype: 'error_max_structured_output_retries', is_error: true, errors: ['no valid output'], stop_reason: null, usage }; throw new Error('Claude Code returned an error result'); }
-    yield success({ result: replies[index - 1] });
-  });
-  const events = [];
+test('ClaudeProvider reports an unusable answer as an invalid answer, after its usage, in one query per attempt', async () => {
+  const string = { type: 'string' };
+  const endings = {
+    mismatch: [structuredCall({ value: 5 }), success({ structured_output: { value: 5 }, stop_reason: 'tool_use' })],
+    exhausted: [structuredCall({ value: 7 }), exhausted],
+    silent: [exhausted],
+    missing: [success({ result: 'five' })],
+    bare: [success({ structured_output: 'five' })],
+    apiError: [said('API Error: 529 overloaded', { error: 'overloaded' }), success({ is_error: true, result: 'API Error: 529 overloaded' })],
+  };
+  const query = replying(({ prompt }) => endings[JSON.parse(prompt).system]);
   const provider = new ClaudeProvider({ query, binary: null });
-  assert.equal(await provider.judge({ prompt: { system: 'Spell it' }, schema: { type: 'string' }, onEvent: event => events.push(event) }), 'five');
-  assert.equal(query.calls.length, 3);
-  assert.equal(query.calls[1].options.outputFormat, undefined);
-  assert.match(query.calls[1].prompt, /^\{"system":"Spell it"\}\n\nReply with only a JSON object \{"value": \.\.\.\} whose value matches this JSON Schema, and nothing else:\n\{"type":"string"\}$/);
-  assert.match(query.calls[2].prompt, /Your previous reply was rejected \(Schema rejected response: \/value type\):\nHere you go: \{"value": 5\}\n\nReply again/);
-  assert.deepEqual([events[0].mode, events[0].attempts, events[0].usage.output_tokens], ['json', 3, 14]);
-
-  const stubborn = fakeQuery(async function* (_call, index) { yield init; yield index === 1 ? success() : success({ result: 'not json' }); });
-  await assert.rejects(new ClaudeProvider({ query: stubborn, binary: null }).judge({ prompt: {}, schema: { type: 'string' } }), /The reply is not a JSON object/);
-  assert.equal(stubborn.calls.length, 3, 'structured, JSON, one retry');
+  const judge = async system => {
+    const events = [];
+    const error = await provider.judge({ prompt: { system }, schema: string, onEvent: event => events.push(event) }).then(() => null, caught => caught);
+    assert.deepEqual(events, [worker], `${system}: usage is reported before the answer is checked`);
+    return error;
+  };
+  // A mismatch is the kernel's SchemaRejection of the callback schema, carrying the answer for JOSH.
+  const mismatch = await judge('mismatch');
+  assert.ok(mismatch instanceof SchemaRejection);
+  assert.deepEqual([mismatch.schema, mismatch.value], [string, 5]);
+  // When Claude Code gives up on structured output, the model's last StructuredOutput call is the rejected answer.
+  const gaveUp = await judge('exhausted');
+  assert.deepEqual([gaveUp.code, gaveUp.value], ['invalid_answer', 7]);
+  for (const system of ['silent', 'missing', 'bare']) {
+    const error = await judge(system);
+    assert.deepEqual([error.code, 'value' in error], ['invalid_answer', false], system);
+  }
+  const failed = await judge('apiError');
+  assert.deepEqual([failed.code, failed.message], [undefined, 'API Error: 529 overloaded'], 'a failed call is not an invalid answer');
+  assert.equal(query.calls.length, 6, 'one query per attempt: JOSH does the asking again');
 });
 
-test('ClaudeProvider honours refusals, cancellation and its time budget without retrying', async () => {
+test('through the kernel, JOSH re-asks Claude with the rejection reasons, retries an unusable answer, and a refusal is model.denied', async t => {
+  const scratchRoot = await mkdtemp(resolve(tmpdir(), 'shout-claude-kernel-'));
+  t.after(() => rm(scratchRoot, { recursive: true, force: true }));
+  const source = `manifest { language: "0.1" entry: main capabilities: [model.request] }
+record Tally { counts: Map<String, Int> pair: (String, Int) }
+export async fn main() returns List<String> effects [model.request] {
+  match await model.request<Tally>(prompt { system: "Count" output: Tally policy: { max_attempts: 2 } }) {
+    Ok(tally) => map.keys(tally.counts)
+    Err(error) => [error.code]
+  }
+}`;
+  const run = async replies => {
+    const query = replying(replies);
+    const kernel = new Run({ provider: new ClaudeProvider({ query, binary: null }), source, input: null, scratchRoot });
+    void kernel.start();
+    const result = await kernel.done;
+    assert.equal(result.state, 'completed', JSON.stringify(result.result));
+    return { output: result.result.output, events: kernel.events, prompts: query.calls.map(call => JSON.parse(call.prompt)) };
+  };
+  const tally = counts => [success({ structured_output: { value: { counts, pair: { 0: 'x', 1: 1 } } }, stop_reason: 'tool_use' })];
+  // A repeated map key passes JSON Schema; JOSH rejects it and asks again with the reason.
+  const repeated = await run([tally([{ key: 'a', value: 1 }, { key: 'a', value: 2 }]), tally([{ key: 'b', value: 2 }, { key: 'a', value: 1 }])]);
+  assert.deepEqual(repeated.output, ['a', 'b']);
+  assert.deepEqual(repeated.events.find(event => event.type === 'model.rejected').issues, [{ path: '/counts/1/key', code: 'order' }]);
+  assert.equal(repeated.prompts[0].system, 'Count');
+  assert.match(repeated.prompts[1].system, /^Count\n\nThis is attempt 2 of 2\. .*\n- \/counts\/1\/key: repeated key \(map keys must be distinct\)\n/s);
+  assert.equal(repeated.events.filter(event => event.type === 'model.worker').length, 2, 'both attempts report usage');
+  const unusable = await run([[exhausted], tally([{ key: 'a', value: 1 }])]);
+  assert.deepEqual(unusable.output, ['a']);
+  assert.match(unusable.prompts[1].system, /- the answer was not a JSON value/);
+  const invalidTwice = await run([[structuredCall({ value: {} }), exhausted], [exhausted]]);
+  assert.deepEqual(invalidTwice.output, ['model.validation_failed']);
+  const refused = await run([[{ type: 'system', subtype: 'model_refusal_no_fallback', api_refusal_category: 'cyber' }, success({ stop_reason: 'refusal' })]]);
+  assert.deepEqual(refused.output, ['model.denied']);
+  assert.equal(refused.events.find(event => event.type === 'effect.rejected').message, 'Claude declined this request (flagged: cyber).');
+});
+
+test('ClaudeProvider honours refusals, cancellation and its time budget', async () => {
   const refusing = fakeQuery(async function* () { yield init; yield { type: 'system', subtype: 'model_refusal_no_fallback', api_refusal_category: null }; yield success({ stop_reason: 'refusal' }); });
-  await assert.rejects(new ClaudeProvider({ query: refusing, binary: null }).judge({ prompt: {}, schema: { type: 'string' } }), /^Error: Claude declined this request\.$/);
-  assert.equal(refusing.calls.length, 1);
+  const events = [];
+  await assert.rejects(new ClaudeProvider({ query: refusing, binary: null }).judge({ prompt: {}, schema: { type: 'string' }, onEvent: event => events.push(event) }),
+    error => error.code === 'refusal' && error.message === 'Claude declined this request.');
+  assert.deepEqual([refusing.calls.length, events], [1, [worker]], 'a refused attempt still reports its usage');
   const hanging = fakeQuery(async function* ({ options }) { yield init; await aborted(options.abortController.signal); });
   await assert.rejects(new ClaudeProvider({ query: hanging, binary: null, timeoutMs: 40 }).judge({ prompt: {}, schema: { type: 'string' } }), /time budget exceeded after 40 ms/);
   const controller = new AbortController(); setTimeout(() => controller.abort(), 20);
   await assert.rejects(new ClaudeProvider({ query: hanging, binary: null, timeoutMs: null }).judge({ prompt: {}, schema: { type: 'string' }, signal: controller.signal }), /Model worker cancelled/);
-  assert.equal(hanging.calls.length, 2, 'no fallback after a timeout or cancellation');
+  assert.equal(hanging.calls.length, 2, 'one query each');
   await assert.rejects(new ClaudeProvider({ query: hanging, binary: null }).judge({ prompt: {}, schema: {}, signal: AbortSignal.abort() }), /abort/i);
   assert.throws(() => new ClaudeProvider({ timeoutMs: 0 }), /positive integer or null/);
 });

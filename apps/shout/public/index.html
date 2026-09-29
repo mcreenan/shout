@@ -9,6 +9,8 @@
   <link rel="icon" type="image/png" href="/shout-wordmark.png">
   <script src="/theme.js"></script>
   <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/flow.css">
+  <link rel="stylesheet" href="/sidebar.css">
 </head>
 <body>
   <svg width="0" height="0" style="position:absolute" aria-hidden="true">
@@ -30,6 +32,8 @@
     <symbol id="i-chat" viewBox="0 0 24 24"><path d="M5 5h14a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H9l-4 3V6a1 1 0 0 1 1-1z"/></symbol>
     <symbol id="i-file" viewBox="0 0 24 24"><path d="M7 3h7l5 5v12a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/><path d="M14 3v5h5"/></symbol>
     <symbol id="i-flow" viewBox="0 0 24 24"><circle cx="6" cy="6" r="2"/><circle cx="18" cy="12" r="2"/><circle cx="6" cy="18" r="2"/><path d="M8 6h4a4 4 0 0 1 4 4M8 18h4a4 4 0 0 0 4-4"/></symbol>
+    <symbol id="i-loop" viewBox="0 0 24 24"><path d="M17 3l3 3-3 3"/><path d="M20 6H9a5 5 0 0 0-5 5v1M7 21l-3-3 3-3"/><path d="M4 18h11a5 5 0 0 0 5-5v-1"/></symbol>
+    <symbol id="i-agents" viewBox="0 0 24 24"><circle cx="12" cy="5" r="2.4"/><circle cx="5" cy="19" r="2.4"/><circle cx="19" cy="19" r="2.4"/><path d="M12 7.4V12M12 12L5.8 16.8M12 12l6.2 4.8"/></symbol>
     <symbol id="i-list" viewBox="0 0 24 24"><path d="M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01"/></symbol>
     <symbol id="i-diff" viewBox="0 0 24 24"><path d="M12 3v8M8 7h8M8 17h8M5 21h14"/></symbol>
     <symbol id="i-code" viewBox="0 0 24 24"><path d="M8 7l-5 5 5 5M16 7l5 5-5 5M13.5 4l-3 16"/></symbol>
@@ -41,26 +45,32 @@
     <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l7 3v5.5c0 4.2-2.9 7.9-7 9.5-4.1-1.6-7-5.3-7-9.5V6z"/></symbol>
   </svg>
   <div id="app" class="app">
-    <aside class="sidebar" aria-label="Sessions">
-      <div class="sidebar-top">
-        <a class="brand wordmark" href="/" aria-label="SHOUT home"><img class="wordmark-light" src="/shout-wordmark.png" alt="SHOUT!" width="1983" height="793"><img class="wordmark-dark" src="/shout-wordmark-dark.png" alt="" width="1983" height="793"></a>
-        <button class="icon-button sidebar-close" id="sidebar-close" aria-label="Close sessions"><svg><use href="#i-x"/></svg></button>
+    <aside class="sidebar" id="sidebar" aria-label="Sidebar">
+      <div class="sb-topbar">
+        <button type="button" class="sb-icon-button" id="sidebar-toggle" aria-label="Toggle sidebar" data-icon="sidebar"></button>
+        <a class="sb-brand wordmark" href="/" aria-label="SHOUT home"><img class="wordmark-light" src="/shout-wordmark.png" alt="SHOUT!" width="1983" height="793"><img class="wordmark-dark" src="/shout-wordmark-dark.png" alt="" width="1983" height="793"></a>
       </div>
-      <button class="new-session" id="new-session"><svg><use href="#i-plus"/></svg>New session<kbd>N</kbd></button>
-      <div class="sidebar-label">Sessions <span id="session-count">0</span></div>
-      <nav id="session-list" class="session-list" aria-label="Session list"></nav>
-      <section id="sleeping-section" class="sleeping-section" aria-label="Sleeping sessions" hidden>
-        <button type="button" class="sleeping-toggle" id="sleeping-toggle" aria-expanded="false" aria-controls="sleeping-list"><span>Sleeping <span id="sleeping-count"></span></span><span class="sleeping-rule"></span><svg><use href="#i-chevron"/></svg></button>
-        <div id="sleeping-list" class="sleeping-list" hidden></div>
-      </section>
-      <div class="sidebar-bottom">
-        <div class="provider"><span class="engine-dot" id="engine-dot"></span><span id="provider-status">Connecting…</span></div>
+      <div class="sb-header" id="sidebar-header">
+        <div class="sb-row">
+          <label class="sb-search" data-icon="search"><input id="thread-search" type="search" placeholder="Search" aria-label="Search threads" autocomplete="off" spellcheck="false"><button type="button" class="sb-clear" id="thread-search-clear" aria-label="Clear search" data-icon="x" hidden></button></label>
+          <button type="button" class="sb-icon-button" id="new-session" aria-label="New thread" data-icon="compose"></button>
+        </div>
+        <div class="sb-row">
+          <button type="button" class="sb-scope" id="project-scope" aria-haspopup="listbox" aria-expanded="false" aria-controls="scope-popover" title="Project scope"></button>
+          <button type="button" class="sb-icon-button" id="sidebar-view" aria-label="View options" title="View options" aria-haspopup="menu" data-icon="view"></button>
+          <button type="button" class="sb-icon-button" id="add-project" aria-label="Add project" title="Add project" data-icon="folder-plus"></button>
+        </div>
+      </div>
+      <nav id="session-list" class="sb-list" aria-label="Threads"></nav>
+      <div class="sb-footer">
+        <div class="sb-providers" id="provider-status"></div>
         <div class="theme-switch" role="radiogroup" aria-label="Theme">
           <button type="button" role="radio" data-theme-choice="system" aria-label="System theme" title="System"><svg><use href="#i-monitor"/></svg></button>
           <button type="button" role="radio" data-theme-choice="light" aria-label="Light theme" title="Light"><svg><use href="#i-sun"/></svg></button>
           <button type="button" role="radio" data-theme-choice="dark" aria-label="Dark theme" title="Dark"><svg><use href="#i-moon"/></svg></button>
         </div>
       </div>
+      <div class="sb-rail" id="sidebar-rail" role="separator" aria-orientation="vertical" aria-label="Resize sidebar" tabindex="0"></div>
     </aside>
     <div class="scrim" id="scrim"></div>
     <main class="workspace">
@@ -84,8 +94,8 @@
   <div id="pane-store" class="pane-store" hidden>
     <section id="chat-pane" class="conversation" aria-label="Conversation">
       <div class="pane-float left">
-        <button type="button" class="float-button mobile-menu" id="menu-button" aria-label="Toggle sessions" title="Sessions"><svg><use href="#i-menu"/></svg></button>
-        <div id="chat-mode" class="chat-mode" role="radiogroup" aria-label="Chat view"><button type="button" role="radio" data-mode="chat" aria-checked="true" title="Conversation only">Chat</button><button type="button" role="radio" data-mode="flow" aria-checked="false" title="Conversation with every run step">Flow</button></div>
+        <button type="button" class="float-button mobile-menu" id="menu-button" aria-label="Toggle sidebar" title="Toggle sidebar"><svg><use href="#i-menu"/></svg></button>
+        <div id="chat-mode" class="chat-mode" role="radiogroup" aria-label="Chat view"><button type="button" role="radio" data-mode="chat" aria-checked="true">Chat</button><button type="button" role="radio" data-mode="flow" aria-checked="false">Flow</button></div>
       </div>
       <button type="button" class="float-button pane-float right" id="viz-button" aria-label="Inspector" aria-pressed="true" title="Inspector"><svg><use href="#i-panel"/></svg></button>
       <div id="messages" class="messages" aria-live="polite" aria-relevant="additions"></div>
@@ -118,21 +128,11 @@
       </div>
     </section>
   </div>
-  <dialog id="new-dialog" aria-labelledby="new-dialog-title">
-    <form id="new-form">
-      <div class="dialog-heading"><h2 id="new-dialog-title">New session</h2><button type="button" class="icon-button" id="close-dialog" aria-label="Close"><svg><use href="#i-x"/></svg></button></div>
-      <label for="workspace-input">Workspace path</label><input id="workspace-input" name="workspace" placeholder="/path/to/your/project" autocomplete="off" spellcheck="false">
-      <label for="test-command-input">Test command <span class="optional">optional</span></label><input id="test-command-input" name="testCommand" placeholder="npm test" autocomplete="off" spellcheck="false">
-      <p class="field-help" id="model-help" hidden></p>
-      <p id="new-error" class="form-error" role="alert" hidden></p>
-      <div class="dialog-footer"><button type="button" id="cancel-dialog" class="secondary-button">Cancel</button><button type="submit" class="primary-button" id="create-button">Create session</button></div>
-    </form>
-  </dialog>
   <dialog id="create-folder-dialog" class="confirm-dialog" aria-labelledby="create-folder-title">
     <form method="dialog">
       <h2 id="create-folder-title">Create this folder?</h2>
       <p><code id="create-folder-path"></code></p>
-      <div class="dialog-footer"><button type="button" id="create-folder-cancel" class="secondary-button">Nevermind</button><button type="button" id="create-folder-confirm" class="primary-button">Create</button></div>
+      <div class="dialog-footer"><button value="cancel" id="create-folder-cancel" class="secondary-button">Nevermind</button><button value="create" id="create-folder-confirm" class="primary-button">Create</button></div>
     </form>
   </dialog>
   <div id="toast" class="toast" role="status" hidden></div>

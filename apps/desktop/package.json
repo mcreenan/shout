@@ -4,11 +4,14 @@
   "desktopName": "shout.desktop",
   "private": true,
   "version": "0.0.0",
-  "description": "SHOUT desktop shell: an Electron window around the local SHOUT server",
+  "description": "SHOUT desktop shell: an Electron window around a local or remote SHOUT server",
   "type": "module",
   "main": "src/main.mjs",
+  "engines": {
+    "node": ">=22.12"
+  },
   "scripts": {
-    "start": "bash ../../tools/start-desktop.sh"
+    "start": "electron ."
   },
   "dependencies": {
     "electron": "44.4.5"

@@ -1,0 +1,635 @@
+SHOUT JOSH/ALLEN patch 0006-idle-provider-wait: wait for provider progress instead of busy-polling
+Base: mcreenan/josh-allen abb8a9782fc438d1b87e8aa2fdaea65e5db633c3 plus the earlier patches in this directory.
+Generated from branch shout/effect-origin of .worktrees/josh-allen:
+  git diff --binary --src-prefix=a/ --dst-prefix=b/ 0f36431 3259a78
+Commits:
+  3259a78 Wait for provider progress instead of busy-polling pending effects
+
+diff --git a/crates/allen-compiler/tests/provider_waits.rs b/crates/allen-compiler/tests/provider_waits.rs
+new file mode 100644
+index 0000000..0641ecf
+--- /dev/null
++++ b/crates/allen-compiler/tests/provider_waits.rs
+@@ -0,0 +1,138 @@
++//! The VM waits for provider progress instead of polling in a tight loop.
++
++use allen_bytecode::{EffectOperation, verify};
++use allen_compiler::compile_source;
++use allen_vm::{
++    CancellationSource, Checkpoint, CheckpointObserver, EffectPoll, EffectProvider,
++    ExecutionLimits, MonotonicClock, PendingEffectId, Value, VmError, WorkspaceValue,
++    execute_entry_with_runtime_context,
++};
++use std::rc::Rc;
++use std::time::Duration;
++
++struct FixedClock;
++
++impl MonotonicClock for FixedClock {
++    fn now(&mut self) -> Duration {
++        Duration::ZERO
++    }
++}
++
++struct NeverCancelled;
++
++impl CancellationSource for NeverCancelled {
++    fn is_cancelled(&mut self) -> bool {
++        false
++    }
++}
++
++struct Quiet;
++
++impl CheckpointObserver for Quiet {
++    fn checkpoint(&mut self, _checkpoint: Checkpoint) {}
++}
++
++/// A model provider that answers only after a number of polls and records
++/// every wait the VM asks for in between.
++struct SlowModel {
++    polls_until_ready: usize,
++    polls: usize,
++    waits: Vec<Duration>,
++}
++
++impl EffectProvider for SlowModel {
++    fn workspace(&mut self) -> Result<WorkspaceValue, VmError> {
++        Err(VmError::CapabilityMissing)
++    }
++
++    fn call(
++        &mut self,
++        _operation: EffectOperation,
++        _arguments: &[Value],
++    ) -> Result<Value, VmError> {
++        Err(VmError::CapabilityMissing)
++    }
++
++    fn start_agent(
++        &mut self,
++        _pending: PendingEffectId,
++        _operation: EffectOperation,
++        _arguments: &[Value],
++        _result_type: &allen_bytecode::ValueType,
++        _cancellation: &mut dyn CancellationSource,
++    ) -> Result<EffectPoll, VmError> {
++        Ok(EffectPoll::Pending)
++    }
++
++    fn poll_effect(
++        &mut self,
++        _pending: PendingEffectId,
++        _cancellation: &mut dyn CancellationSource,
++    ) -> Result<EffectPoll, VmError> {
++        self.polls += 1;
++        if self.polls < self.polls_until_ready {
++            return Ok(EffectPoll::Pending);
++        }
++        Ok(EffectPoll::Ready(Value::Enum(Rc::new(
++            allen_vm::EnumValue {
++                identity: allen_vm::EnumIdentity::Result,
++                type_name: Rc::from("Result"),
++                variant: 0,
++                variant_name: Rc::from("Ok"),
++                payload: allen_vm::EnumPayload::Tuple(vec![Value::Int(7)].into()),
++            },
++        ))))
++    }
++
++    fn wait_for_effects(&mut self, timeout: Duration) {
++        self.waits.push(timeout);
++    }
++}
++
++#[test]
++fn idle_scheduler_waits_with_growing_bounded_timeouts_between_polls() {
++    let source = r#"export async fn main() returns Int effects [model.request] {
++  match await model.request<Int>(prompt { system: "slow" output: Int }) {
++    Ok(value) => value
++    Err(_) => 0
++  }
++}
++"#;
++    let compilation = compile_source(source).expect("fixture compiles");
++    let entry = compilation.module.entry;
++    let verified = verify(compilation.module).expect("fixture verifies");
++    let mut model = SlowModel {
++        polls_until_ready: 14,
++        polls: 0,
++        waits: Vec::new(),
++    };
++    let outcome = execute_entry_with_runtime_context(
++        &verified,
++        None,
++        entry,
++        &[],
++        ExecutionLimits::default(),
++        &mut FixedClock,
++        &mut Quiet,
++        &mut NeverCancelled,
++        &mut model,
++    )
++    .expect("fixture runs");
++    assert!(matches!(
++        outcome,
++        allen_vm::ExecutionOutcome::Completed(result) if result.value == Value::Int(7)
++    ));
++    // One wait between consecutive unready polls, doubling from 50
++    // microseconds to a 10 millisecond ceiling.
++    let micros = model
++        .waits
++        .iter()
++        .map(|wait| u64::try_from(wait.as_micros()).unwrap())
++        .collect::<Vec<_>>();
++    assert_eq!(
++        micros,
++        [
++            50, 100, 200, 400, 800, 1_600, 3_200, 6_400, 10_000, 10_000, 10_000, 10_000, 10_000
++        ]
++    );
++}
+diff --git a/crates/allen-runtime/src/lib.rs b/crates/allen-runtime/src/lib.rs
+index 5db3302..c26b6eb 100644
+--- a/crates/allen-runtime/src/lib.rs
++++ b/crates/allen-runtime/src/lib.rs
+@@ -919,6 +919,17 @@ pub struct RuntimeProviders<'provider> {
+     pub model: Option<&'provider mut dyn ResponseProvider>,
+     pub user: Option<&'provider mut dyn ResponseProvider>,
+     pub sub_agent: Option<&'provider mut dyn SubAgentProvider>,
++    /// Wakes a waiting execution when a host provider may have progressed.
++    /// Without one, a waiting execution sleeps between polls.
++    pub effect_waiter: Option<&'provider dyn EffectWaiter>,
++}
++
++/// Blocks an execution whose tasks all wait on host providers until one of
++/// them may have progressed.
++pub trait EffectWaiter {
++    /// Return when any pending provider operation may be ready, or when
++    /// `timeout` elapses. Spurious early returns are allowed.
++    fn wait_for_progress(&self, timeout: Duration);
+ }
+ 
+ struct ProductionHttpFactory;
+@@ -1836,6 +1847,7 @@ pub fn execute_prepared_with_context(
+                     "production effect broker could not be initialized",
+                 ));
+             };
++            live_effects.effect_waiter = providers.effect_waiter.take();
+             live_effects
+         };
+     let binding = catch_unwind(AssertUnwindSafe(|| {
+@@ -2485,6 +2497,7 @@ struct BrokerEffects<'provider> {
+     model: Option<&'provider mut dyn ResponseProvider>,
+     user: Option<&'provider mut dyn ResponseProvider>,
+     sub_agent: Option<&'provider mut dyn SubAgentProvider>,
++    effect_waiter: Option<&'provider dyn EffectWaiter>,
+     sub_agent_handles: Vec<SubAgentHandleEntry>,
+     projection_limits: BTreeMap<String, u64>,
+     tool_catalog: Option<FrozenCatalog>,
+@@ -2558,6 +2571,7 @@ impl<'provider> BrokerEffects<'provider> {
+             model,
+             user,
+             sub_agent,
++            effect_waiter: None,
+             sub_agent_handles: Vec::new(),
+             projection_limits,
+             tool_catalog,
+@@ -4311,6 +4325,13 @@ impl EffectProvider for BrokerEffects<'_> {
+         self.finish_agent_poll(pending, poll, pending_agent, cancellation)
+     }
+ 
++    fn wait_for_effects(&mut self, timeout: Duration) {
++        match self.effect_waiter {
++            Some(waiter) => waiter.wait_for_progress(timeout),
++            None => std::thread::sleep(timeout),
++        }
++    }
++
+     fn cancel_effect(&mut self, pending: PendingEffectId) {
+         if self.pending_permissions.remove(&pending).is_some() {
+             if let Some(provider) = self.external_grants.as_deref_mut() {
+@@ -10184,6 +10205,7 @@ export fn main() returns Range { Range { min: 2, max: 1 } }
+                 model: None,
+                 user: None,
+                 sub_agent: None,
++                effect_waiter: None,
+             };
+             launch_with_providers(&artifact, &launch_request(), &policy, &mut providers).unwrap()
+         };
+diff --git a/crates/allen-vm/src/lib.rs b/crates/allen-vm/src/lib.rs
+index 71b631d..e1ed4f3 100644
+--- a/crates/allen-vm/src/lib.rs
++++ b/crates/allen-vm/src/lib.rs
+@@ -916,6 +916,17 @@ pub trait EffectProvider {
+     /// Cancel one provider operation that previously returned pending.
+     fn cancel_effect(&mut self, _pending: PendingEffectId) {}
+ 
++    /// Block until a pending provider operation may have progressed, or until
++    /// `timeout` elapses.
++    ///
++    /// The VM calls this only when no task can run and at least one task waits
++    /// on a provider effect, then polls again. Providers that can signal
++    /// completion should return as soon as any pending operation may be
++    /// ready. The default sleeps for `timeout`.
++    fn wait_for_effects(&mut self, timeout: Duration) {
++        std::thread::sleep(timeout);
++    }
++
+     /// Cancel every issued provider operation that is still pending.
+     ///
+     /// The VM calls this before it produces a terminal cancellation or stopped
+@@ -1913,6 +1924,15 @@ fn origin_frames(task: &MachineTask) -> Vec<OriginFrame> {
+         .collect()
+ }
+ 
++/// The provider wait after `idle_turns` consecutive idle scheduler turns.
++fn idle_wait(idle_turns: u32) -> Duration {
++    const FIRST: Duration = Duration::from_micros(50);
++    const LONGEST: Duration = Duration::from_millis(10);
++    FIRST
++        .checked_mul(1_u32 << idle_turns.min(8))
++        .map_or(LONGEST, |wait| wait.min(LONGEST))
++}
++
+ fn machine_failure(task: &MachineTask, error: VmError) -> TaskFailure {
+     TaskFailure {
+         error,
+@@ -1942,6 +1962,8 @@ fn execute_task_machine(
+         }
+     };
+     let origins = debug.is_some() && budget.observer.observes_effect_origins();
++    // Consecutive scheduler turns in which every task waited on a provider.
++    let mut idle_turns = 0_u32;
+     let mut machine = TaskMachine {
+         cleanup_limit: limits.cleanup_instructions,
+         cleanup_remaining: limits.cleanup_instructions,
+@@ -2068,6 +2090,11 @@ fn execute_task_machine(
+                                 frames: Vec::new(),
+                             });
+                         }
++                        // Wait for provider progress instead of polling in a
++                        // tight loop. The wait grows from 50 microseconds to
++                        // 10 milliseconds while nothing becomes ready.
++                        effects.wait_for_effects(idle_wait(idle_turns));
++                        idle_turns = idle_turns.saturating_add(1);
+                         continue;
+                     }
+                     machine.cancel_pending_effects(budget, effects);
+@@ -2085,6 +2112,7 @@ fn execute_task_machine(
+                 }
+             }
+         };
++        idle_turns = 0;
+         machine.rotation_cursor = Some(task_id);
+         let failed_checkpoint = machine.tasks.get(&task_id).and_then(|task| {
+             task.frames.last().map(|frame| ActiveFrame {
+diff --git a/crates/josh-host/src/server.rs b/crates/josh-host/src/server.rs
+index 8e94672..1768cb2 100644
+--- a/crates/josh-host/src/server.rs
++++ b/crates/josh-host/src/server.rs
+@@ -8,13 +8,13 @@ use std::time::{Duration, Instant};
+ 
+ use allen_runtime::{
+     AgentAskCall, AgentCancellationSignal, AgentHostError, AgentMessageCall, AgentProviderPoll,
+-    ExternalGrantDecision, ExternalGrantDecisionProvider, ExternalGrantId, ExternalGrantPoll,
+-    ExternalGrantRequest, GrantDuration as RuntimeGrantDuration, InvokingAgentProvider,
+-    PromptPayload, ResponseHostError, ResponseProvider, ResponseProviderPoll, RuntimeProviders,
+-    SubAgentAskCall, SubAgentCreateCall, SubAgentHostError, SubAgentId, SubAgentMessageCall,
+-    SubAgentProjection, SubAgentProvider, SubAgentProviderPoll, SubAgentRunCall,
+-    ToolCancellationSignal, ToolHostError, ToolInvocation, ToolOutcome, ToolProvider,
+-    ToolProviderPoll, TranscriptMessage as RuntimeTranscriptMessage,
++    EffectWaiter, ExternalGrantDecision, ExternalGrantDecisionProvider, ExternalGrantId,
++    ExternalGrantPoll, ExternalGrantRequest, GrantDuration as RuntimeGrantDuration,
++    InvokingAgentProvider, PromptPayload, ResponseHostError, ResponseProvider,
++    ResponseProviderPoll, RuntimeProviders, SubAgentAskCall, SubAgentCreateCall, SubAgentHostError,
++    SubAgentId, SubAgentMessageCall, SubAgentProjection, SubAgentProvider, SubAgentProviderPoll,
++    SubAgentRunCall, ToolCancellationSignal, ToolHostError, ToolInvocation, ToolOutcome,
++    ToolProvider, ToolProviderPoll, TranscriptMessage as RuntimeTranscriptMessage,
+     TranscriptPart as RuntimeTranscriptPart, TranscriptQuery,
+     TranscriptRole as RuntimeTranscriptRole, TranscriptSnapshot as RuntimeTranscriptSnapshot,
+ };
+@@ -93,12 +93,12 @@ where
+                     disconnected.store(true, Ordering::Release);
+                     break;
+                 }
+-                Err(_) => {
++                Err(error) => {
+                     disconnected.store(true, Ordering::Release);
+                     cancel_active(&session, "");
+                     return Err(HostError {
+                         code: WireErrorCode::ProtocolViolation,
+-                        message: "protocol frame is invalid",
++                        message: frame_error_message(&error),
+                     });
+                 }
+             };
+@@ -547,6 +547,7 @@ fn spawn_execution(
+             external_grants: external_grants
+                 .as_mut()
+                 .map(|provider| provider as &mut dyn ExternalGrantDecisionProvider),
++            effect_waiter: Some(pending.as_ref()),
+             ..RuntimeProviders::default()
+         };
+         let computed = prepared.run_with_observer(&mut providers, &mut observer);
+@@ -856,6 +857,26 @@ fn write_notification<T: serde::Serialize + Validate>(
+     )
+ }
+ 
++/// A safe, specific reason for closing the connection on an unreadable frame.
++const fn frame_error_message(error: &ProtocolError) -> &'static str {
++    match error {
++        ProtocolError::FrameTooLarge => {
++            "protocol frame exceeds the negotiated max_frame_bytes; closing the connection"
++        }
++        ProtocolError::HeaderLineTooLong
++        | ProtocolError::InvalidHeader
++        | ProtocolError::InvalidLength => {
++            "protocol frame header is invalid; closing the connection"
++        }
++        ProtocolError::UnexpectedEof => "protocol frame ended early; closing the connection",
++        ProtocolError::InvalidUtf8 | ProtocolError::InvalidJson(_) => {
++            "protocol frame body is not strict UTF-8 JSON; closing the connection"
++        }
++        ProtocolError::InvalidMessage(_) => "protocol message is invalid; closing the connection",
++        ProtocolError::Io(_) => "protocol input failed; closing the connection",
++    }
++}
++
+ fn write_event(writer: &ConnectionWriter, event: &ExecutionEventParams) -> Result<(), HostError> {
+     write_notification(writer, "execution/event", event)
+ }
+@@ -927,9 +948,21 @@ const fn poisoned() -> HostError {
+ #[derive(Default)]
+ struct PendingRegistry {
+     calls: Mutex<BTreeMap<String, Arc<PendingCall>>>,
++    /// Counts completed and failed outbound requests to wake a waiting execution.
++    progress: Mutex<u64>,
++    progressed: Condvar,
++    /// The progress count that the execution's last wait observed.
++    observed: AtomicU64,
+ }
+ 
+ impl PendingRegistry {
++    fn record_progress(&self) {
++        if let Ok(mut progress) = self.progress.lock() {
++            *progress = progress.wrapping_add(1);
++            self.progressed.notify_all();
++        }
++    }
++
+     fn insert(&self, id: String, call: Arc<PendingCall>) -> Result<(), ()> {
+         let mut calls = self.calls.lock().map_err(|_| ())?;
+         if calls.contains_key(&id) {
+@@ -953,6 +986,7 @@ impl PendingRegistry {
+             .and_then(|mut calls| calls.remove(id));
+         if let Some(call) = call {
+             call.complete(message);
++            self.record_progress();
+         }
+     }
+ 
+@@ -962,19 +996,48 @@ impl PendingRegistry {
+                 call.fail();
+             }
+         }
++        self.record_progress();
+     }
+ 
+     fn fail_all_with_ids(&self) -> Vec<String> {
+         let Ok(mut calls) = self.calls.lock() else {
+             return Vec::new();
+         };
+-        std::mem::take(&mut *calls)
++        let ids = std::mem::take(&mut *calls)
+             .into_iter()
+             .map(|(id, call)| {
+                 call.fail();
+                 id
+             })
+-            .collect()
++            .collect();
++        drop(calls);
++        self.record_progress();
++        ids
++    }
++}
++
++impl EffectWaiter for PendingRegistry {
++    /// Returns at once if any response arrived since the previous wait, so a
++    /// response that lands between the VM's poll and this wait is not missed.
++    fn wait_for_progress(&self, timeout: Duration) {
++        let Ok(mut progress) = self.progress.lock() else {
++            return;
++        };
++        let observed = self.observed.load(Ordering::Acquire);
++        if *progress == observed {
++            let started = Instant::now();
++            while *progress == observed {
++                let remaining = timeout.saturating_sub(started.elapsed());
++                if remaining.is_zero() {
++                    break;
++                }
++                match self.progressed.wait_timeout(progress, remaining) {
++                    Ok((next, _)) => progress = next,
++                    Err(_) => return,
++                }
++            }
++        }
++        self.observed.store(*progress, Ordering::Release);
+     }
+ }
+ 
+diff --git a/crates/josh/tests/stdio.rs b/crates/josh/tests/stdio.rs
+index 2293d51..625c870 100644
+--- a/crates/josh/tests/stdio.rs
++++ b/crates/josh/tests/stdio.rs
+@@ -510,6 +510,143 @@ fn active_partial_frame_eof_cleans_up_and_reports_only_a_safe_error() {
+     assert!(!process.status.success());
+     assert_eq!(
+         String::from_utf8(process.stderr).unwrap(),
+-        "josh: protocol frame is invalid\n"
++        "josh: protocol frame header is invalid; closing the connection\n"
++    );
++}
++
++/// CPU time used so far by one process, in clock ticks, on Linux.
++#[cfg(target_os = "linux")]
++fn cpu_ticks(pid: u32) -> u64 {
++    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
++    // Fields after the parenthesized command name; utime and stime are fields 14 and 15.
++    let fields = stat[stat.rfind(')').unwrap() + 2..]
++        .split(' ')
++        .collect::<Vec<_>>();
++    fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
++}
++
++#[test]
++#[allow(clippy::too_many_lines)]
++fn pending_provider_waits_idle_and_an_oversized_response_closes_the_connection_promptly() {
++    let schema_json = json!({"type":"string"});
++    let schema = ToolSchema::from_value(&schema_json, &SchemaLimits::default()).unwrap();
++    let initialize = InitializeParams {
++        host: PeerInfo {
++            name: "oversized-frame-host".to_owned(),
++            version: "1.0.0".to_owned(),
++        },
++        protocol_versions: vec![josh_protocol::PROTOCOL_VERSION.to_owned()],
++        language_versions: vec![">=0.1.0, <0.2.0".to_owned()],
++        execution_mode: ExecutionMode::Unattended,
++        invoking_session_id: InvokingSessionId::Null,
++        standard_capabilities: Vec::new(),
++        limits: ProtocolLimits {
++            max_frame_bytes: 65_536,
++            max_catalog_bytes: 65_536,
++            ..limits()
++        },
++        extensions: Vec::new(),
++    };
++    let catalog = CatalogSetParams {
++        schema_dialect: josh_protocol::SCHEMA_DIALECT.to_owned(),
++        metadata: josh_protocol::CatalogMetadata::complete("test-host", "1", 1),
++        tools: vec![CatalogTool {
++            name: "example.lookup".to_owned(),
++            version: "1.2.3".to_owned(),
++            description: "Look up one example value.".to_owned(),
++            input_schema: schema_json.clone(),
++            output_schema: schema_json.clone(),
++            error_schema: schema_json,
++            effects: Vec::new(),
++            idempotency: Idempotency::Unknown,
++        }],
++    };
++    let load = ProgramLoadParams::Bytecode {
++        artifact: base64::engine::general_purpose::STANDARD.encode(tool_artifact(&schema)),
++    };
++    let mut child = Command::new(env!("CARGO_BIN_EXE_josh"))
++        .arg("serve")
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::piped())
++        .spawn()
++        .unwrap();
++    let mut input = child.stdin.take().unwrap();
++    let mut output = FrameReader::new(
++        child.stdout.take().unwrap(),
++        josh_protocol::DEFAULT_MAX_FRAME_BYTES,
++    );
++    receive(&mut output);
++    send(&mut input, "h-1", "initialize", &initialize);
++    receive(&mut output);
++    send(
++        &mut input,
++        "h-p",
++        "host/project",
++        &projection(&initialize, &catalog),
++    );
++    receive(&mut output);
++    send(&mut input, "h-2", "catalog/set", &catalog);
++    receive(&mut output);
++    send(&mut input, "h-3", "program/load", &load);
++    let WireMessage::Response {
++        result: Some(loaded),
++        ..
++    } = receive(&mut output)
++    else {
++        panic!("program load failed");
++    };
++    let start = ExecutionStartParams {
++        execution_id: "exec-oversized".to_owned(),
++        program_id: loaded["program_id"].as_str().unwrap().to_owned(),
++        artifact_digest: loaded["artifact_digest"].as_str().unwrap().to_owned(),
++        entry: "main".to_owned(),
++        input: json!("question"),
++        working_directory: None,
++        granted_capabilities: Vec::new(),
++        granted_tools: vec!["example.lookup".to_owned()],
++        allowed_http_origins: Vec::new(),
++        granted_exec: Vec::new(),
++        granted_exec_environment: Vec::new(),
++        limits: BTreeMap::from([("wall_ms".to_owned(), 30_000)]),
++    };
++    send(&mut input, "h-4", "execution/start", &start);
++    let request_id = loop {
++        if let WireMessage::Request { id, method, .. } = receive(&mut output) {
++            assert_eq!(method, "tool/invoke");
++            break id;
++        }
++    };
++
++    // While the host has not answered, the runtime blocks instead of polling.
++    #[cfg(target_os = "linux")]
++    {
++        let before = cpu_ticks(child.id());
++        std::thread::sleep(std::time::Duration::from_millis(600));
++        let used = cpu_ticks(child.id()) - before;
++        assert!(used < 15, "josh used {used} CPU ticks while waiting 600 ms");
++    }
++
++    // A response frame above the negotiated limit closes the connection with a
++    // specific diagnostic instead of stalling.
++    let body = format!(
++        r#"{{"protocol":"josh/1","kind":"response","id":"{request_id}","result":{{"outcome":"ok","value":"{}"}}}}"#,
++        "x".repeat(70_000)
++    );
++    let started = std::time::Instant::now();
++    let _ = write!(
++        input,
++        "Content-Length: {}\r\nContent-Type: application/josh+json; charset=utf-8\r\n\r\n{body}",
++        body.len()
++    );
++    let _ = input.flush();
++    drop(input);
++    while output.read_message().ok().flatten().is_some() {}
++    let process = child.wait_with_output().unwrap();
++    assert!(started.elapsed() < std::time::Duration::from_secs(5));
++    assert!(!process.status.success());
++    assert_eq!(
++        String::from_utf8(process.stderr).unwrap(),
++        "josh: protocol frame exceeds the negotiated max_frame_bytes; closing the connection\n"
+     );
+ }
+diff --git a/docs/agents/reference/josh-protocol.md b/docs/agents/reference/josh-protocol.md
+index 282a109..cf048b9 100644
+--- a/docs/agents/reference/josh-protocol.md
++++ b/docs/agents/reference/josh-protocol.md
+@@ -25,7 +25,9 @@ The length counts bytes, not characters. The two header lines are exact and
+ in this order. Readers bound the header and payload length before allocation;
+ the default limit is 4,194,304 bytes and `initialize` negotiates a smaller
+ `max_frame_bytes`. A clean EOF between frames ends the connection; EOF inside a
+-frame is fatal.
++frame is fatal. An oversized or malformed frame closes the connection after
++active work is cancelled, and `josh serve` names the reason on stderr. Keep
++every frame you send within the negotiated limit.
+ 
+ JSON objects reject duplicate and unknown fields. Numbers, strings, IDs,
+ methods, enum values, and nested payloads use their exact declared shape. Do
+diff --git a/docs/implementation-spec.md b/docs/implementation-spec.md
+index 6a0b6ec..e6651cf 100644
+--- a/docs/implementation-spec.md
++++ b/docs/implementation-spec.md
+@@ -283,6 +283,12 @@ observer receives the task, spawn chain, and frames immediately before the
+ provider is asked to start each effect. Tracking adds no instructions and
+ charges no budget; functions without loops do no per-instruction work.
+ 
++When no task can run and at least one waits on a provider effect, the VM asks
++the provider to wait for progress, with a timeout that grows from 50
++microseconds to 10 milliseconds, before polling again. A host provider returns
++as soon as any response may have arrived, so a pending provider request costs
++no CPU. The default provider sleeps for the timeout.
++
+ The VM validates every provider completion against the exact result type and
+ operation-specific error-code allowlist before resuming a task. A missing
+ provider produces the operation's documented unavailable result when that
+@@ -447,7 +453,10 @@ line, and exactly that many UTF-8 JSON bytes. The default frame limit is
+ 4,194,304 bytes, and `initialize` negotiates a smaller `max_frame_bytes`.
+ Frames are bounded before allocation. JSON objects reject duplicate and
+ unknown fields; request IDs and methods are validated before entering
+-connection state.
++connection state. A frame that exceeds the negotiated `max_frame_bytes`, has an
++invalid header, ends early, or is not strict JSON closes the connection after
++active work is cancelled; `josh serve` exits unsuccessfully and names the
++reason on stderr.
+ 
+ The host sends `initialize` once with `protocol_versions: ["josh/1.7"]`, one
+ execution mode, an invoking-session identity or `null`, limits, and standard

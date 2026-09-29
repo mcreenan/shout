@@ -12,7 +12,31 @@ const ITEM = /^( {0,3})([-*+]|\d{1,9}[.)])(\s+|$)(.*)$/;
 const TABLE_DELIMITER = /^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?\s*$/;
 const ESCAPABLE = /[\\`*_{}[\]()#+\-.!~|>]/;
 
-const indentOf = (line) => line.match(/^ */)[0].length;
+// Columns of leading whitespace, a tab reaching the next multiple of four. Tabs are measured, never rewritten, so
+// fenced code (a Makefile recipe) keeps them.
+function indentOf(line) {
+  let column = 0;
+  for (const c of line) {
+    if (c === ' ') column++;
+    else if (c === '\t') column += 4 - (column % 4);
+    else break;
+  }
+  return column;
+}
+// Drops up to `columns` of leading whitespace; a tab that straddles the cut leaves its remainder as spaces.
+function dedent(line, columns) {
+  let column = 0;
+  let i = 0;
+  for (; i < line.length && column < columns; i++) {
+    if (line[i] === ' ') column++;
+    else if (line[i] === '\t') {
+      const next = column + 4 - (column % 4);
+      if (next > columns) return ' '.repeat(next - columns) + line.slice(i + 1);
+      column = next;
+    } else break;
+  }
+  return line.slice(i);
+}
 const blank = (line) => !line.trim();
 
 function splitRow(line) {
@@ -47,7 +71,7 @@ function interrupts(lines, i) {
 }
 
 export function parseBlocks(text) {
-  const lines = String(text ?? '').replace(/\r\n?/g, '\n').replace(/\t/g, '    ').split('\n');
+  const lines = String(text ?? '').replace(/\r\n?/g, '\n').split('\n');
   const blocks = [];
   let i = 0;
   while (i < lines.length) {
@@ -61,7 +85,7 @@ export function parseBlocks(text) {
       const body = [];
       i++;
       while (i < lines.length && !new RegExp(`^ {0,3}${marker[0] === '`' ? '`' : '~'}{${marker.length},}\\s*$`).test(lines[i])) {
-        body.push(lines[i].slice(Math.min(strip, indentOf(lines[i]))));
+        body.push(dedent(lines[i], strip));
         i++;
       }
       i++;
@@ -113,7 +137,7 @@ export function parseBlocks(text) {
             if (j < lines.length && indentOf(lines[j]) >= contentIndent) { body.push(...lines.slice(i, j)); i = j; sawBlank = true; continue; }
             break;
           }
-          if (indentOf(next) >= contentIndent) { body.push(next.slice(contentIndent)); i++; continue; }
+          if (indentOf(next) >= contentIndent) { body.push(dedent(next, contentIndent)); i++; continue; }
           if (sawBlank || ITEM.test(next) || interrupts(lines, i)) break;
           body.push(next.trimStart()); // lazy paragraph continuation
           i++;

@@ -4,12 +4,12 @@
 // structure expands in place: a loop group shows one iteration's cards in a frame, a stack lists its steps.
 import { phases } from './flow-graph.js';
 import { renderMarkdown } from './markdown-dom.js';
-import { formatDuration, modelTask, modelOutput, toolResult, stepFailed, plural } from './flow.js';
+import { buildFlow, formatDuration, modelTask, modelOutput, toolResult, stepFailed, failureLine, plural, tokens, clip, issueLabel } from './flow.js';
 
 const MAX_ROW = 980; // rows wrap past this width (or the stage width, if narrower)
-const GAP_X = 18, GAP_Y = 16, ROW_GAP = 56, MIN_CARD = 230;
+const GAP_X = 18, GAP_Y = 16, ROW_GAP = 46, MIN_CARD = 230;
 const FRAME = { head: { run: 34, loop: 34, group: 14 }, foot: 16, side: 20, nest: 14 };
-const TOP_INSET = 58; // the Chat/Flow switch and the Inspector button float over the stage's top edge
+const TOP_INSET = 58; // by default the Chat/Flow switch and the Inspector button float over the stage's top edge
 const ICON = { ok: 'M5 12.5l4.5 4.5L19 7.5', no: 'M6.5 6.5l11 11M17.5 6.5l-11 11', chevron: 'M9 6l6 6-6 6', prev: 'M14.5 6l-6 6 6 6' };
 const TILE_LIMIT = 12; // more iterations than this draw as numbered cells
 const PIP_LIMIT = 80;
@@ -32,11 +32,11 @@ function button(className, act, ...children) {
   node.append(...children.filter(Boolean));
   return node;
 }
-const clip = (text, max) => { const value = String(text ?? '').replace(/\s+/g, ' ').trim(); return value.length > max ? `${value.slice(0, max - 1)}…` : value; };
 const isLive = (status) => status === 'active' || status === 'waiting';
 // Exponential easing: always approaches, never overshoots.
 const ease = (current, target, dt, tau) => current + (target - current) * (1 - Math.exp(-dt / tau));
-const eventOf = (step, type) => step.events.find((event) => event.type === type);
+// The latest matching event: after a retry, the last attempt's.
+const eventOf = (step, type) => (step.attempts?.at(-1)?.events ?? step.events).findLast((event) => event.type === type);
 // Model prose on one or two card lines: Markdown punctuation only gets in the way.
 const plain = (text) => String(text).replace(/```[\s\S]*?```/g, ' ').replace(/^\s{0,3}(#{1,6}|[-*+]|\d+\.)\s+/gm, '').replace(/\*\*|__|`/g, '');
 
@@ -56,6 +56,20 @@ function head(title, ...extra) {
   row.append(el('i', 'fl-dot'), el('strong', 'fl-title', title), ...extra.filter(Boolean));
   return row;
 }
+// Retried requests (answers that failed validation) are one card: `attempt 2` while it runs, `2 attempts` after.
+function attemptChip(node) {
+  const attempts = node.step.attempts;
+  if (!attempts || attempts.length < 2) return null;
+  return el('span', 'fl-chip retry', isLive(node.status) ? `attempt ${attempts.at(-1).attempt}` : `${attempts.length} attempts`);
+}
+const issueText = (issues) => issues.map((issue) => `${issue.path || '/'} ${issueLabel(issue)}`).join(' · ');
+// A judgment's timer also carries its token count, for hover.
+function usageTimer(step) {
+  const time = timer(step.start, step.end);
+  const usage = step.events.filter((event) => event.usage).reduce((sum, event) => ({ input_tokens: sum.input_tokens + (event.usage.input_tokens || 0), output_tokens: sum.output_tokens + (event.usage.output_tokens || 0) }), { input_tokens: 0, output_tokens: 0 });
+  if (tokens(usage) && time.title) time.title += ` · ${tokens(usage)}`;
+  return time;
+}
 function outcome(e, ok, tone = ok ? 'pass' : 'fail') {
   e.classList.add(tone);
   return svgIcon(ok ? ICON.ok : ICON.no);
@@ -68,7 +82,7 @@ function stateMark(status) {
 }
 function failCount(count) {
   const mark = el('span', 'fl-fails');
-  mark.append(svgIcon(ICON.no, ''), String(count));
+  mark.append(stateMark('failed'), String(count));
   return mark;
 }
 // One pip per step, coloured by kind; long strips merge neighbours, keeping the most telling one.
@@ -95,16 +109,19 @@ function renderHub(e, node) {
   if (step.pair === 'chat') {
     // SHOUT's agent thinking between actions: the action it chose next, if any.
     const next = eventOf(step, 'chat.completed')?.tool;
-    e.append(head('Agent', next && el('span', 'fl-chip strong', next.replace(/_/g, ' ')), timer(step.start, step.end)));
+    e.append(head('Agent', next && el('span', 'fl-chip strong', next.replace(/_/g, ' ')), usageTimer(step)));
     return;
   }
   const failed = eventOf(step, 'model.failed');
-  const out = modelOutput(eventOf(step, 'model.completed')?.value);
+  // Every answer failed the output type (the program took its Err branch): say why, not what was said.
+  const rejected = !failed && step.attempts?.at(-1)?.status === 'rejected' && !isLive(node.status);
+  const out = modelOutput(rejected ? null : eventOf(step, 'model.completed')?.value);
   const findings = out.items.filter((item) => item.tone !== 'edit').length;
   const edited = out.items.length - findings;
   const fact = out.files.length ? plural(out.files.length, 'files') : findings ? plural(findings, 'findings') : edited ? plural(edited, 'files') : '';
-  e.append(head('Model', failed && outcome(e, false), fact && el('span', 'fl-chip', fact), timer(step.start, step.end)));
+  e.append(head('Model', (failed || rejected) && outcome(e, false), attemptChip(node), fact && el('span', 'fl-chip', fact), usageTimer(step)));
   if (failed) e.append(el('div', 'fl-text error clamp2', failed.error?.message || failed.message || 'Failed'));
+  else if (rejected) { const issues = step.attempts.findLast((attempt) => attempt.issues.length)?.issues || []; if (issues.length) e.append(el('div', 'fl-text error clamp2', issueText(issues))); }
   else if (isLive(node.status)) { const { task } = modelTask(eventOf(step, 'model.started')?.prompt); if (task) e.append(el('div', 'fl-text muted clamp1', task)); }
   else if (out.text) e.append(el('div', 'fl-text clamp2', plain(out.text)));
   else if (out.items[0]) e.append(el('div', 'fl-text clamp1', out.items[0].title));
@@ -118,14 +135,15 @@ function renderTool(e, node) {
   const result = failure ? '' : toolResult(step);
   e.append(head(step.label, icon, result && !['passed', 'failed'].includes(result) && el('span', 'fl-chip', result), timer(step.start, step.end)));
   if (step.detail) { const arg = el('div', 'fl-code', step.detail); arg.title = fullArg(step); e.append(arg); }
-  if (failure) e.append(el('div', 'fl-text error clamp2', failure.error?.message || 'Failed'));
+  const problem = failure ? failure.error?.message || 'Failed' : failureLine(step);
+  if (problem) e.append(el('div', 'fl-text error clamp2', problem));
 }
 function renderApproval(e, node) {
   const { step } = node;
   const asked = eventOf(step, 'user.question') || {};
   const value = eventOf(step, 'user.answered')?.value;
   const icon = value?.accept === true ? outcome(e, true) : value?.accept === false ? outcome(e, false, 'declined') : null;
-  e.append(head(step.label, icon, timer(step.start, step.end)));
+  e.append(head(step.label, icon, attemptChip(node), timer(step.start, step.end)));
   const text = asked.title || asked.command || asked.prompt?.system || asked.summary;
   if (text) e.append(el('div', 'fl-text clamp2', text));
 }
@@ -146,9 +164,10 @@ function renderMessage(e, node, ctx) {
 function structureHead(node, title, count, ...extra) {
   const top = el('div', 'fl-head');
   top.dataset.act = 'toggle';
-  const toggle = button('fl-toggle', 'toggle', el('i', 'fl-dot'), el('strong', 'fl-title', title), el('span', 'fl-count', count));
+  // A loop's header is code; a stack of one tool is named by the tool.
+  const toggle = button('fl-toggle', 'toggle', el('i', 'fl-dot'), el('strong', `fl-title${node.bare ? '' : ' code'}`, title), el('span', 'fl-count', count));
   toggle.setAttribute('aria-expanded', String(node.open !== null && node.open !== false));
-  top.append(toggle, node.failed ? failCount(node.failed) : null, ...extra, timer(node.start, node.end), svgIcon(ICON.chevron, 'fl-chevron'));
+  top.append(...[toggle, node.failed && failCount(node.failed), ...extra, timer(node.start, node.end), svgIcon(ICON.chevron, 'fl-chevron')].filter(Boolean));
   return top;
 }
 // A loop whose iterations take several steps: one tile per iteration; the open one's cards follow in a frame.
@@ -187,10 +206,10 @@ function stepRow(step, bare) {
   const row = button(`fl-row ${status}${stepFailed(step) ? ' fail' : ''}`, 'row');
   row.dataset.step = step.id;
   const label = bare ? step.detail || step.label : step.pair === 'model' ? 'Model' : `${step.label}${step.detail ? ` ${step.detail}` : ''}`;
-  const result = step.pair === 'tool' && !stepFailed(step) ? toolResult(step) : '';
+  const result = step.pair === 'tool' && !stepFailed(step) ? toolResult(step) : step.attempts?.length > 1 ? `${step.attempts.length} attempts` : '';
   const arg = el('span', 'fl-row-arg', label);
   arg.title = fullArg(step) || label;
-  row.append(el('i', `fl-row-dot ${step.pair === 'user' ? 'user' : step.kind}`), arg, el('span', 'fl-row-result', ['passed', 'failed'].includes(result) ? '' : result), timer(step.start, step.end), stateMark(isLive(status) ? status : stepFailed(step) ? 'failed' : 'ok'));
+  row.append(el('i', `fl-row-dot ${step.pair === 'user' ? 'user' : step.kind}`), arg, el('span', 'fl-row-result', ['passed', 'failed'].includes(result) ? '' : result), timer(step.start, step.end), stateMark(isLive(status) || status === 'stale' ? status : stepFailed(step) ? 'failed' : 'ok'));
   const item = el('li');
   item.append(row);
   return item;
@@ -200,25 +219,75 @@ function renderStack(e, node) {
   const count = node.steps.length;
   e.append(structureHead(node, node.title, node.ended ? `×${count}` : String(count)));
   if (!node.open) {
-    e.append(el('div', 'fl-code', node.activity.replace(/^[^·]*·\s*/, '')), pips(node.pips));
+    const line = node.bare ? node.outcome : node.activity;
+    if (line) e.append(el('div', node.bare && node.steps[0].pair === 'model' ? 'fl-text clamp1' : 'fl-code', line));
+    e.append(pips(node.pips));
     return;
   }
-  const list = el('ol', 'fl-rows');
+  const list = el('ol', `fl-rows${node.bare ? ' bare' : ''}`);
   for (const step of node.steps) list.append(stepRow(step, node.bare));
   e.append(list);
 }
 // One task of an await block: its steps in order.
 function renderTrack(e, node) {
-  e.append(head(node.title, node.failed ? failCount(node.failed) : null, timer(node.start, node.end)));
+  e.append(head(node.title, node.failed && failCount(node.failed), timer(node.start, node.end)));
   const list = el('ol', 'fl-rows');
   for (const step of node.steps) list.append(stepRow(step, false));
   e.append(list);
 }
+/* Sub-agents: a fan-out is one fleet card with a tile per agent (Flow B of the sub-agent design). */
+const AGENT_STATE = { queued: 'queued', running: 'active', completed: 'ok', failed: 'failed', cancelled: 'stale', interrupted: 'stale' };
+const FLEET_PIPS = 8;
+const agentsOf = (node, ctx) => (ctx.session?.agents || []).filter((agent) => agent.group === node.group);
+// What a tile says: the running agent's current step (tool calls take milliseconds, so the latest one
+// stands in while the model thinks), the first line of a report, or the error.
+function agentLine(agent) {
+  if (agent.status === 'failed') return agent.error || 'Failed';
+  if (agent.status === 'completed') return clip(String(agent.report || '').replace(/^[#>*\s-]+/gm, '').split('\n').find((line) => line.trim()) || '', 90);
+  if (agent.status !== 'running') return '';
+  if (agent.activity && agent.activity !== 'Thinking') return agent.activity;
+  const call = agent.events?.findLast((event) => event.type === 'tool.started');
+  const input = call?.input || {};
+  const arg = input.path || (input.query && `"${input.query}"`) || (Array.isArray(input.args) && input.args[0]) || '';
+  return call ? `${call.tool}${arg ? ` ${arg}` : ''}` : agent.activity || 'Thinking';
+}
+// The agent's latest steps, coloured by kind; empty slots until it has taken that many.
+function agentPips(agent) {
+  // Built live while the agent runs, so its open step stays active (and pulses) rather than stale.
+  const steps = buildFlow(agent.events || [], { live: agent.status === 'running' }).flatMap((segment) => segment.steps).filter((step) => step.pair === 'chat' || step.pair === 'tool');
+  const pips = steps.slice(-FLEET_PIPS).map((step) => (stepFailed(step) ? 'x' : step.pair === 'chat' ? 'm' : 't') + (step.status === 'active' ? ' live' : ''));
+  const bar = el('span', 'fl-pips');
+  for (let i = 0; i < FLEET_PIPS; i++) bar.append(el('i', pips[i] || 'empty'));
+  return bar;
+}
+function renderFleet(e, node, ctx) {
+  const agents = agentsOf(node, ctx);
+  const input = eventOf(node.step, 'tool.started')?.input || {};
+  const count = agents.length || input.agents?.length || 0;
+  const failed = agents.filter((agent) => agent.status === 'failed').length;
+  const top = head(`${count} agent${count === 1 ? '' : 's'}`, input.purpose && el('span', 'fl-role', input.purpose), failed && failCount(failed), timer(node.step.start, node.step.end));
+  e.append(top);
+  const grid = el('div', 'fl-tiles fleet');
+  for (const agent of agents) {
+    const status = AGENT_STATE[agent.status] || 'stale';
+    const tile = button(`fl-tile fleet-tile ${status}`, 'agent');
+    tile.dataset.agent = agent.id;
+    const top = el('span', 'fl-tile-top');
+    top.append(stateMark(status), el('span', 'fl-tile-n', agent.name));
+    if (agent.startedAt) top.append(timer(Date.parse(agent.startedAt), agent.endedAt ? Date.parse(agent.endedAt) : null));
+    tile.append(top, el('span', 'fl-tile-now', agentLine(agent)), agentPips(agent));
+    tile.title = agent.brief || '';
+    grid.append(tile);
+  }
+  e.append(grid);
+}
 const leafSig = (node) => [node.status, node.step?.events.length, node.step?.end, node.message?.id, node.message?.content.length, node.final];
 const stepsSig = (steps) => steps.map((step) => `${step.id}:${step.status}:${step.events.length}`).join();
 /**
- * Node types: how each renders, what it depends on, and whether it is a selectable leaf. A later type
- * (e.g. a fleet of sub-agents) is added through `createFlowCanvas(stage, { types: { fleet: {...} } })`.
+ * Node types. Each is { render(e, node, ctx), sig(node, ctx), select?(node), act?(node, control, ctx) }:
+ * `render` fills the card, `sig` lists what it depends on (it re-renders when that changes), `select`
+ * makes it a selectable leaf, and `act` handles clicks on its own `[data-act]` controls. A later type
+ * (e.g. a fleet of sub-agents) is added with `createFlowCanvas(stage, { types: { fleet: {...} } })`.
  */
 export const NODE_TYPES = {
   msg: { render: renderMessage, sig: leafSig, select: (node) => node.message.role !== 'user' },
@@ -229,6 +298,12 @@ export const NODE_TYPES = {
   group: { render: renderGroup, sig: (node) => [node.status, node.open, node.ended, node.failed, node.title, node.iterations.map((it) => [it.index, it.status, it.pips.join(), it.activity, it.end])] },
   stack: { render: renderStack, sig: (node) => [node.status, node.open, node.ended, node.failed, node.title, node.activity, node.open ? stepsSig(node.steps) : node.pips.join()] },
   track: { render: renderTrack, sig: (node) => [node.status, node.title, node.failed, stepsSig(node.steps)] },
+  // Tiles open their agent (the canvas's `openAgent` option).
+  fleet: {
+    render: renderFleet,
+    sig: (node, ctx) => [node.status, node.step.end, agentsOf(node, ctx).map((agent) => [agent.id, agent.status, agent.calls, agentLine(agent), agent.events?.length, agent.endedAt])],
+    act: (node, control, ctx) => { if (control.dataset.act === 'agent') ctx.options.openAgent?.(control.dataset.agent); },
+  },
 };
 
 /**
@@ -237,17 +312,23 @@ export const NODE_TYPES = {
  * stage bottom and the followed card's bottom edge: a number, or a function for UI floating over
  * the stage (it is re-read every frame and eased, so the canvas glides when that UI resizes).
  * `onSelect(selection | null)` hears the selected step or message: { id, step | message, segment, node, session },
- * again whenever it changes. `types` adds or overrides node types.
+ * again whenever it changes. `top` is the px kept clear at the stage's top edge (for floating controls).
+ * `openAgent(id)` opens a sub-agent from its fleet tile. `types` adds or
+ * overrides node types. The source may also give `actor` ({ name, kind }) when it shows a sub-agent.
  */
-export function createFlowCanvas(stage, { anchor = 120, openFile, onSelect = () => {}, types: extraTypes = {} } = {}) {
+export function createFlowCanvas(stage, options = {}) {
+  const { anchor = 120, top: topInset = TOP_INSET, openFile, onSelect = () => {}, types: extraTypes = {} } = options;
   const types = { ...NODE_TYPES, ...extraTypes };
+  // A node type nobody registered still shows as a plain card.
+  const typeOf = (node) => types[node.type] || { render: (e) => e.append(head(node.title || node.step?.label || node.type)), sig: leafSig };
   stage.classList.add('flow-stage');
   const world = el('div', 'fl-world');
   const framesLayer = el('div', 'fl-frames');
   const edgesLayer = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
   edgesLayer.setAttribute('class', 'fl-edges');
   const nodesLayer = el('div', 'fl-nodes');
-  world.append(framesLayer, edgesLayer, nodesLayer);
+  // Frames sit above the edges so an edge passes under a frame's label rather than through its text.
+  world.append(edgesLayer, framesLayer, nodesLayer);
   const followButton = el('button', 'fl-follow');
   followButton.type = 'button';
   followButton.hidden = true;
@@ -263,8 +344,10 @@ export function createFlowCanvas(stage, { anchor = 120, openFile, onSelect = () 
   };
   let source = null;
   let raf = 0;
-  const ctx = { markdown: (container, text) => renderMarkdown(container, text, { openFile }) };
-  const selectable = (node) => !!types[node.type]?.select?.(node);
+  // What renderers get besides their node: Markdown, the session being drawn, and the canvas's options
+  // (so a type can reach its own callbacks, e.g. opening a sub-agent).
+  const ctx = { markdown: (container, text) => renderMarkdown(container, text, { openFile }), get session() { return s.session; }, options };
+  const selectable = (node) => !!typeOf(node).select?.(node);
 
   // Cards can change size after rendering (fonts loading, markdown settling); layout and the follow
   // position always use their current size.
@@ -277,11 +360,10 @@ export function createFlowCanvas(stage, { anchor = 120, openFile, onSelect = () 
       s.dirty = true;
     }
   });
-  function measure(entry) {
-    entry.el.style.width = '';
-    entry.natural = entry.el.offsetWidth;
-    entry.w = entry.el.offsetWidth;
-    entry.h = entry.el.offsetHeight;
+  // Natural sizes: every width is cleared before any is read, so a whole batch costs one reflow.
+  function measure(entries) {
+    for (const entry of entries) entry.el.style.width = '';
+    for (const entry of entries) Object.assign(entry, { natural: entry.el.offsetWidth, w: entry.el.offsetWidth, h: entry.el.offsetHeight });
   }
   function paintTimers(entry, now) {
     for (const time of entry.timers) {
@@ -301,7 +383,7 @@ export function createFlowCanvas(stage, { anchor = 120, openFile, onSelect = () 
   }
   function renderNode(entry, node) {
     const e = entry.el;
-    const type = types[node.type] || types.note;
+    const type = typeOf(node);
     const focused = e.contains(document.activeElement) ? focusKey(document.activeElement, e) : null;
     const pick = selectable(node);
     const expanded = node.open !== undefined && node.open !== null && node.open !== false;
@@ -316,7 +398,6 @@ export function createFlowCanvas(stage, { anchor = 120, openFile, onSelect = () 
     paintTimers(entry, s.now);
     markRows(entry);
     if (focused) (focused === ':scope' ? e : e.querySelector(focused))?.focus({ preventScroll: true });
-    measure(entry);
   }
   function markRows(entry) {
     for (const row of entry.el.querySelectorAll('[data-step]')) row.classList.toggle('selected', row.dataset.step === s.selected);
@@ -347,6 +428,7 @@ export function createFlowCanvas(stage, { anchor = 120, openFile, onSelect = () 
   /* Scene: keyed cards and frames laid out in rows. New cards fade in where they belong; moves ease with no overshoot. */
   function sync(graph) {
     const seen = new Set();
+    const rendered = [];
     for (const node of graph.nodes) {
       seen.add(node.id);
       let entry = s.sim.get(node.id);
@@ -358,10 +440,18 @@ export function createFlowCanvas(stage, { anchor = 120, openFile, onSelect = () 
         s.sim.set(node.id, entry);
       }
       entry.node = node;
-      const sig = JSON.stringify([node.type, node.kind, node.chip?.label, (types[node.type] || types.note).sig?.(node)]);
-      if (sig !== entry.sig) { entry.sig = sig; renderNode(entry, node); }
+      const sig = JSON.stringify([node.type, node.kind, node.chip?.label, typeOf(node).sig?.(node, ctx)]);
+      if (sig !== entry.sig) { entry.sig = sig; renderNode(entry, node); rendered.push(entry); }
     }
+    measure(rendered);
     for (const [id, entry] of s.sim) if (!seen.has(id)) { cardSizes.unobserve(entry.el); entry.el.remove(); s.sim.delete(id); s.ticking.delete(entry); }
+    // Cards sit in the DOM in reading order, so Tab moves down the canvas.
+    const order = graph.nodes.map((node) => s.sim.get(node.id).el);
+    if (order.some((node, i) => nodesLayer.children[i] !== node)) {
+      const focused = document.activeElement;
+      nodesLayer.append(...order);
+      if (focused && nodesLayer.contains(focused) && document.activeElement !== focused) focused.focus({ preventScroll: true });
+    }
     const keys = new Set();
     for (const frame of graph.frames) {
       keys.add(frame.key);
@@ -396,16 +486,23 @@ export function createFlowCanvas(stage, { anchor = 120, openFile, onSelect = () 
     let y = 0;
     const tops = new Map();
     const bottoms = new Map();
+    // Siblings share one line where they can: cards narrow (to a floor) rather than wrap, and only as far
+    // as the siblings that will actually share a line need. All widths are written, then all sizes read.
+    const resized = [];
+    for (const row of s.rows) {
+      const entries = row.ids.map((id) => s.sim.get(id)).filter(Boolean);
+      const perLine = Math.min(entries.length, Math.max(1, Math.floor((s.rowWidth + GAP_X) / (MIN_CARD + GAP_X))));
+      const fit = perLine > 1 ? Math.floor((s.rowWidth - GAP_X * (perLine - 1)) / perLine) : null;
+      for (const entry of entries) {
+        const width = fit && fit < entry.natural ? `${fit}px` : '';
+        if (entry.el.style.width !== width) { entry.el.style.width = width; resized.push(entry); }
+      }
+    }
+    for (const entry of resized) { entry.w = entry.el.offsetWidth; entry.h = entry.el.offsetHeight; }
     for (const row of s.rows) {
       for (const key of row.open) { tops.set(key, y); y += FRAME.head[s.frames.get(key)?.frame.kind] ?? FRAME.head.group; }
       const entries = row.ids.map((id) => s.sim.get(id)).filter(Boolean);
       if (entries.length) {
-        // Siblings share one line where they can: cards narrow (to a floor) instead of wrapping.
-        const fit = entries.length > 1 ? Math.max(MIN_CARD, Math.floor((s.rowWidth - GAP_X * (entries.length - 1)) / entries.length)) : null;
-        for (const entry of entries) {
-          const width = fit && fit < entry.natural ? `${fit}px` : '';
-          if (entry.el.style.width !== width) { entry.el.style.width = width; entry.w = entry.el.offsetWidth; entry.h = entry.el.offsetHeight; }
-        }
         const cell = Math.max(...entries.map((entry) => entry.w));
         const cols = Math.max(1, Math.floor((s.rowWidth + GAP_X) / (cell + GAP_X)));
         for (let i = 0; i < entries.length; i += cols) {
@@ -487,11 +584,13 @@ export function createFlowCanvas(stage, { anchor = 120, openFile, onSelect = () 
     return paths;
   }
 
-  // Following pins the focus card: centred horizontally, its bottom edge `anchor` px above the stage bottom,
-  // unless everything fits, in which case the first card starts just below the floating controls.
-  function focusCamera(focus, height) {
-    const halfH = height / 2 / s.cam.z;
-    return { x: focus.x, y: Math.max(focus.y + focus.h / 2 + s.anchor / s.cam.z - halfH, s.top - TOP_INSET / s.cam.z + halfH) };
+  // Following pins the focus card: its bottom edge `anchor` px above the stage bottom, unless everything
+  // fits, in which case the first card starts just below the floating controls. Sideways the view stays on
+  // the axis rows centre on, and moves only to bring a card of a wide row into view.
+  function focusCamera(focus, height, width = stage.clientWidth) {
+    const halfH = height / 2 / s.cam.z, halfW = width / 2 / s.cam.z;
+    const x = Math.abs(focus.x) + focus.w / 2 <= halfW - 16 ? 0 : Math.max(-Math.abs(focus.x), Math.min(Math.abs(focus.x), focus.x + Math.sign(-focus.x) * Math.max(0, halfW - focus.w / 2 - 16)));
+    return { x, y: Math.max(focus.y + focus.h / 2 + s.anchor / s.cam.z - halfH, s.top - topInset / s.cam.z + halfH) };
   }
   // Manual panning stays within the cards. Sideways: their extent (centred if they all fit).
   // Up and down: the floating controls' height above the first card, and at the bottom the follow
@@ -504,7 +603,7 @@ export function createFlowCanvas(stage, { anchor = 120, openFile, onSelect = () 
     const right = Math.max(...entries.map((e) => e.tx + e.w / 2)) + margin;
     const halfW = width / 2 / s.cam.z;
     s.cam.x = right - left <= halfW * 2 ? (left + right) / 2 : Math.min(right - halfW, Math.max(left + halfW, s.cam.x));
-    const top = s.top - TOP_INSET / s.cam.z;
+    const top = s.top - topInset / s.cam.z;
     const bottom = Math.max(...entries.map((e) => e.ty + e.h / 2)) + s.anchor / s.cam.z;
     const halfH = height / 2 / s.cam.z;
     const a = top + halfH, b = bottom - halfH;
@@ -529,13 +628,13 @@ export function createFlowCanvas(stage, { anchor = 120, openFile, onSelect = () 
   // Keyboard focus on a card out of view pans to it.
   function reveal(entry) {
     const z = s.cam.z, halfW = stage.clientWidth / 2 / z, halfH = stage.clientHeight / 2 / z;
-    const top = s.cam.y - halfH + TOP_INSET / z, bottom = s.cam.y + halfH - s.anchor / z;
+    const top = s.cam.y - halfH + topInset / z, bottom = s.cam.y + halfH - s.anchor / z;
     const inside = entry.ty - entry.h / 2 >= top && entry.ty + entry.h / 2 <= bottom && Math.abs(entry.tx - s.cam.x) + entry.w / 2 <= halfW;
     if (inside) return;
     stopFollowing();
     s.cam.x = entry.tx;
-    s.cam.y = entry.ty - entry.h / 2 - TOP_INSET / z + halfH - 12 / z;
-    if (entry.h > bottom - top) s.cam.y = entry.ty - entry.h / 2 + halfH - TOP_INSET / z;
+    s.cam.y = entry.ty - entry.h / 2 - topInset / z + halfH - 12 / z;
+    if (entry.h > bottom - top) s.cam.y = entry.ty - entry.h / 2 + halfH - topInset / z;
     clampView();
   }
   function draw(dt, now) {
@@ -561,7 +660,7 @@ export function createFlowCanvas(stage, { anchor = 120, openFile, onSelect = () 
     // When the focus changes the canvas scrolls once to the new card, then locks to it again.
     const focus = s.sim.get(s.focus);
     if (s.follow && focus) {
-      const target = focusCamera(focus, height);
+      const target = focusCamera(focus, height, width);
       if (s.locked === s.focus || s.snap) { Object.assign(s.cam, target); s.snap = false; s.locked = s.focus; }
       else {
         s.cam.x = ease(s.cam.x, target.x, dt, 180);
@@ -576,6 +675,8 @@ export function createFlowCanvas(stage, { anchor = 120, openFile, onSelect = () 
   }
 
   function frame(time) {
+    // A canvas whose pane was removed stops; start() brings it back.
+    if (!stage.isConnected) { raf = 0; return; }
     raf = requestAnimationFrame(frame);
     const dt = Math.min(64, time - (s.last || time)) || 16;
     s.last = time;
@@ -596,7 +697,7 @@ export function createFlowCanvas(stage, { anchor = 120, openFile, onSelect = () 
     if (rowWidth === s.rowWidth) return;
     s.rowWidth = rowWidth;
     stage.style.setProperty('--row-width', `${rowWidth}px`);
-    for (const entry of s.sim.values()) measure(entry);
+    measure([...s.sim.values()]);
     s.locked = null;
     s.dirty = true;
   });
@@ -615,7 +716,8 @@ export function createFlowCanvas(stage, { anchor = 120, openFile, onSelect = () 
       case 'iter': { const index = Number(target.dataset.index); open.set(node.id, node.open === index ? null : index); break; }
       case 'prev': case 'next': open.set(node.id, node.iterations[Math.max(0, Math.min(node.iterations.length - 1, at + (target.dataset.act === 'next' ? 1 : -1)))].index); break;
       case 'row': select(s.selected === target.dataset.step ? null : target.dataset.step); return;
-      default: return;
+      // Other controls belong to their node type (e.g. a fleet's agent tiles).
+      default: typeOf(node).act?.(node, target, ctx); return;
     }
     s.uiRev++;
   }
@@ -696,7 +798,7 @@ export function createFlowCanvas(stage, { anchor = 120, openFile, onSelect = () 
       if (!box) return;
       stopFollowing();
       s.cam.x = 0; // rows centre on x = 0
-      s.cam.y = box.y0 - TOP_INSET / s.cam.z + stage.clientHeight / 2 / s.cam.z;
+      s.cam.y = box.y0 - topInset / s.cam.z + stage.clientHeight / 2 / s.cam.z;
     },
   };
 }

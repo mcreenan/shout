@@ -2,11 +2,13 @@ import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readdir, readFile, writeFile, mkdir, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { joshBinary } from '../../../prototypes/owned/src/transport.mjs';
 import { shoutTools } from './tools.mjs';
 
-export const builtinSkillsDir = resolve(dirname(new URL(import.meta.url).pathname), '../skills');
+// fileURLToPath decodes the URL: `.pathname` keeps spaces and other characters percent-encoded.
+export const builtinSkillsDir = fileURLToPath(new URL('../skills', import.meta.url));
 const SKILL_FILE = /^([a-z][a-z0-9-]{0,39})\.allen$/;
 const MAX_SOURCE_BYTES = 64 * 1024;
 // Host-handled commands. Skills cannot shadow these names.

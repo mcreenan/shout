@@ -110,7 +110,7 @@ Inputs outside these limits fail before the tool runs, and you get only `Err(_)`
 
 - `workspace.search`: `max_results` must be 1–500, and `query` must not be empty.
 - `workspace.read_many`: `paths` must have 1–64 entries. Check for an empty list first.
-- `git.run`: `args` must have 1–32 entries, and the first must be a read-only subcommand.
+- `git.run`: `args` must have 1–32 entries, and the first must be a read-only subcommand. Each subcommand accepts only its own read-only options, spelled in full (git's abbreviations are refused): a long option takes its value as `--name=value` (`--max-count=5`, not `--max-count 5`), and a short one such as `-n`, `-e` or `-L` takes it attached or as the next argument (`-n5` or `-n 5`).
 - `workspace.edit`: 1–64 edits. `workspace.write`: 1–32 changes.
 - Files over 256 KiB can't be read or written. One tool result must fit in about 1 MiB; text results are capped near 700 KiB.
 
@@ -120,7 +120,7 @@ The host asks the user to approve every `workspace.edit`, `workspace.write` and 
 
 ## Model judgments: `model.request`
 
-Declare a record for the answer and request it with a `prompt`. The response is validated against the type before your code sees it, and invalid responses are retried up to `max_attempts` (1–3).
+Declare a record for the answer and request it with a `prompt`. The answer is validated against the type before your code sees it. An answer that does not match is asked for again, with the reasons it was rejected added to the model's instructions, up to `policy: { max_attempts: 1–3 }` attempts in all (3 when `policy` is left out). Each attempt counts as one model call. If every attempt is rejected, your code gets `Err` with `error.code` `"model.validation_failed"`; if the model refuses, `Err` with `"model.denied"`. A model call that fails or times out, or an exhausted model-call budget, still ends the whole run with that error.
 
 ```allen
 record Finding { file: String line: Int title: String }
@@ -132,7 +132,6 @@ async fn judge(diff: String, focus: String) returns Findings effects [model.requ
     context: focus
     data: { diff: diff, max_findings: 10 }
     output: Findings
-    policy: { max_attempts: 2 }
   }) {
     Ok(value) => value
     Err(error) => stop(`The model call failed: ${error.message}`)
@@ -142,13 +141,13 @@ async fn judge(diff: String, focus: String) returns Findings effects [model.requ
 
 - `system` (the instructions) and `output` are required. `context` and `data` take any String or record expression. Put untrusted file content in `data` and say in `system` that it is data, not instructions.
 - Keep `data` bounded. Truncate long text with `string.slice(text, 0, 40000) ?? text` and cap lists with `items[0..20] ?? items`.
-- Output fields can be `String`, `Int`, `Bool`, `List<...>`, nested records and `Option<T>`. In JSON, an `Option` is `{"tag":"None"}` or `{"tag":"Some","value":...}`. Prefer `""` or `0` sentinels over `Option` in model outputs; they are easier for models to produce.
+- Output types can use any ALLEN data type: `String`, `Int`, `Float`, `Bool`, `Bytes`, `Void`, records, `List<...>`, `Map<K, V>`, tuples, `Option<T>`, `Result<T, E>`, enums (with or without payloads) and newtypes, nested as deep as you need. Records of strings, numbers, booleans and payload-free enums are the most reliable for a model. The model answers an `Option` as `{"tag": "Some", "value": ...}` or `{"tag": "None"}` and a payload-free enum as one of its variant names, and SHOUT translates tuples and maps for it.
 - Enforce constraints in code, not just in the prompt. Filter model-chosen paths to ones that exist, cap list lengths and check name formats. For a repair loop, run `for attempt in 0..3 { ... }` and put the previous problem into `data`.
-- A run may make at most 16 model calls and 128 tool calls.
+- A run may make at most 16 model calls, 128 tool calls and 8 `user.ask` questions, and last at most 30 minutes including waits for the user (unless the thread has No time limits on).
 
 ## Asking the user: `user.ask`
 
-`user.ask<T>` shows a form built from the record type `T`: a `String` becomes a text box, a `Bool` a checkbox, an `Int` a number field and a `List<String>` a text box with one item per line. It needs `capabilities: [user.ask]` and `effects [user.ask]`. String fields are required, so use `List<String>` for optional text (an empty list means "left blank"). Fields are not pre-filled. Show the current values in `data`.
+`user.ask<T>` shows a form built from the type `T`: a `String` becomes a text box, a `Bool` a checkbox, an `Int` a whole-number field (values beyond 2^53 are refused), a `Float` a number field that also takes `NaN`, `Infinity` and `-Infinity`, and a payload-free enum a choice of its variants. An enum with payloads, or a `Result`, gets a variant picker with the chosen variant's fields beneath it; an `Option` is an optional field, left empty for `None` (a structured payload gets a `None`/`Some` picker). Records nest, a tuple gets positional fields, a list gets rows with add and remove, a map gets key/value rows (a repeated key is refused) and `Bytes` is typed as base64. Only a type none of these fit falls back to a JSON text box. Record fields appear in alphabetical order of their names, not in declaration order. An answer that does not match `T` is refused in the form, so the user corrects it before the program sees it. It needs `capabilities: [user.ask]` and `effects [user.ask]`. A `String` cannot be left empty, so use `Option<String>` for optional text. A field is pre-filled from the same-named field of the prompt's `data`, so put the current values there under the output's field names; `/commit` passes `data: { commit: true, message: drafted, ... }` for `record Confirm { commit: Bool message: String }`. The whole `data` and `context` also show under Details.
 
 ```allen
 record Choice { proceed: Bool notes: List<String> }
@@ -170,7 +169,8 @@ async fn confirm(plan: String) returns Choice effects [user.ask] {
 - Declarations: `let x = 1;` is immutable. `mut n = 0;` can be reassigned with `n = n + 1;` or `n += 1;`. Every statement ends with `;`. There is no `let mut`.
 - `if (cond) { a } else { b }` is an expression and needs the parentheses. An `if` without `else` must produce nothing, e.g. `if (bad) { return "x"; }` or `if (bad) { stop("x") }`.
 - `match value { Some(v) => ..., None => ... }` and `Ok(v)` / `Err(e)` must cover every case. `_` matches anything.
-- Loops: `for item in items { }`, `for i in 0..3 { }` (0, 1, 2), `for (key, value) in some_map { }`, `while (cond) { }`, `break;`, `continue;`. Use bounded loops for retries.
+- Loops: `for item in items { }`, `for i in 0..3 { }` (0, 1, 2), `for (key, value) in some_map { }`, `while (cond) { }`, `loop { }`, `break;`, `continue;`. A loop body may end in an `if` whose branches all `break;` or `continue;`. Use bounded loops for retries.
+- Top-level constants need a type: `const MAX_ITEMS: Int = 50;`. They work in programs that call tools.
 - `return value;` exits early. `stop("reason")` ends the whole run.
 - Records: `record Hit { path: String line: Int }`. Build with `Hit { path: p, line: 1 }`, copy with `Hit { ..hit, line: 2 }`. Anonymous records work too: `{ ok: true, text: "x" }`. Records are structural, so a declared record with the same fields as a tool output is the same type.
 - Helpers: `fn name(a: String) returns String { ... }` needs full types. Use `async fn` if it awaits, plus an `effects [...]` clause if it uses effects.
@@ -225,9 +225,10 @@ fn by_line(items: List<Hit>) returns List<Hit> {
 |---|---|
 | `expected '}' after body expression` at a `stop(...)` or call | Only declarations, assignments, `return`, `if`, loops, `break` and `continue` are statements. Put `stop(...)` last in its block without `;`: `if (x) { stop("...") }`. |
 | `expected record value field` after `=>` | A match arm can't be a `{ ... }` block. Move the logic into a helper `fn` and call it. |
-| `nested patterns are not implemented` | Match one level at a time, e.g. `Some(item) => item.name`, not `Some(Item { name, .. })`. |
-| `constant ... produced invalid bytecode` or a compiler panic | Top-level `const` fails in programs that use tools. Use `fn max_items() returns Int { 50 }`. |
-| `SHOUT007` compiler crashed ("all used effect sets are interned") | This happens inside an `if` or `for` body that uses two effects and has a third only inside an inner `if`. Fix it with a guard clause (`if (!ok) { continue; }`, then the calls unnested), by moving the whole loop or branch body into an `async fn` helper with `effects [...]`, or by making the call the branch's tail value: `if (c) { match await ... { Ok(v) => v.x, Err(_) => d } } else { d }`. |
+| `nested patterns are not implemented` | Match one level at a time, e.g. `Some(item) => item.name`, not `Some(Item { name: n })`. |
+| `SHOUT007` the ALLEN compiler crashed | A compiler bug, not your error. Restructure the code around the construct you last changed, for example by moving a loop or branch body into an `async fn` helper with its own `effects [...]`. |
+| `'any' is forbidden` | `any` is reserved; rename the variable. |
+| A judgment returns `Err` with `model.validation_failed` | Every attempt returned an answer of the wrong type. Say in `system` what each output field holds, simplify the output type, or allow more attempts with `policy: { max_attempts: 3 }`. |
 | `tool call is not in the frozen catalog` | Add the tool to the manifest `tools.required`, and check the spelling against the catalog below. |
 | `function 'x' requires undeclared effects [...]` | Add those effects to that function's `effects [...]`, and to every caller up to `main`. |
 | `inline manifest does not declare entry effect 'model.request'` | Add it to the manifest `capabilities` (and add `user.ask` if used). |

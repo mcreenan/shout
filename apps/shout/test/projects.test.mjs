@@ -21,11 +21,11 @@ async function tempDir(t, prefix = 'shout-projects-') {
   t.after(() => rm(dir, { recursive: true, force: true }));
   return dir;
 }
-// Replies at once, except that a message starting with "wait" holds its turn until `release()`.
+// Replies at once, except that a message starting with "wait" holds its turn until `release()` (from then on, none wait).
 function gatedAgent() {
-  const gates = [];
-  const agent = new ScriptedAgent(async ({ text, say }) => { if (text.startsWith('wait')) await new Promise(resolve => gates.push(resolve)); say(`echo: ${text}`); });
-  return { agent, release: () => { for (const resolve of gates.splice(0)) resolve(); } };
+  let release; const gate = new Promise(resolve => { release = resolve; });
+  const agent = new ScriptedAgent(async ({ text, say }) => { if (text.startsWith('wait')) await gate; say(`echo: ${text}`); });
+  return { agent, release };
 }
 async function openStore(t, dir, options = {}) {
   const store = await new SessionStore({ stateRoot: dir, agent: new ScriptedAgent(), ...options }).init();

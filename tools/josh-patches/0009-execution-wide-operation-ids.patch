@@ -1,0 +1,175 @@
+SHOUT JOSH/ALLEN patch 0009-execution-wide-operation-ids: one operation-id counter per execution
+Base: mcreenan/josh-allen abb8a9782fc438d1b87e8aa2fdaea65e5db633c3 plus the earlier patches in this directory.
+Generated from branch shout/effect-origin of .worktrees/josh-allen:
+  git diff --binary --src-prefix=a/ --dst-prefix=b/ f581f77 16b1999
+Commits:
+  16b1999 Number provider operations once per execution across all families
+
+diff --git a/crates/allen-runtime/src/lib.rs b/crates/allen-runtime/src/lib.rs
+index 1e67607..1e9c442 100644
+--- a/crates/allen-runtime/src/lib.rs
++++ b/crates/allen-runtime/src/lib.rs
+@@ -2506,10 +2506,10 @@ struct BrokerEffects<'provider> {
+     enum_types: Vec<allen_bytecode::EnumType>,
+     tool_deadline: Option<Instant>,
+     transcript_bytes: usize,
+-    next_tool_operation: u64,
+-    next_agent_operation: u64,
++    /// One operation counter for every provider family, so an operation ID
++    /// names exactly one provider operation in the execution.
++    next_operation: u64,
+     next_agent_interaction: u64,
+-    next_permission_operation: u64,
+     pending_agent_operations: HashSet<u64>,
+     pending_agents: HashMap<PendingEffectId, PendingAgent>,
+     pending_tools: HashMap<PendingEffectId, PendingTool>,
+@@ -2580,10 +2580,8 @@ impl<'provider> BrokerEffects<'provider> {
+             enum_types,
+             tool_deadline: Instant::now().checked_add(tool_deadline),
+             transcript_bytes,
+-            next_tool_operation: 1,
+-            next_agent_operation: 1,
++            next_operation: 1,
+             next_agent_interaction: 1,
+-            next_permission_operation: 1,
+             pending_agent_operations: HashSet::new(),
+             pending_agents: HashMap::new(),
+             pending_tools: HashMap::new(),
+@@ -2839,14 +2837,7 @@ impl<'provider> BrokerEffects<'provider> {
+     }
+ 
+     fn next_agent_operation(&mut self) -> Result<u64, VmError> {
+-        let operation_id = self.next_agent_operation;
+-        self.next_agent_operation =
+-            self.next_agent_operation
+-                .checked_add(1)
+-                .ok_or(VmError::ResourceLimit {
+-                    resource: "agent_operations",
+-                })?;
+-        Ok(operation_id)
++        take_operation(&mut self.next_operation, "agent_operations")
+     }
+ 
+     fn next_agent_interaction(&mut self) -> Result<u64, VmError> {
+@@ -3254,13 +3245,7 @@ impl<'provider> BrokerEffects<'provider> {
+         };
+         let pending_target_id = self.next_pending_target;
+         self.next_pending_target = self.next_pending_target.saturating_add(1);
+-        let operation_id = self.next_permission_operation;
+-        self.next_permission_operation =
+-            self.next_permission_operation
+-                .checked_add(1)
+-                .ok_or(VmError::ResourceLimit {
+-                    resource: "permission_operations",
+-                })?;
++        let operation_id = take_operation(&mut self.next_operation, "permission_operations")?;
+         let request = ExternalGrantRequest {
+             execution_id: self.execution_id,
+             operation_id,
+@@ -3524,13 +3509,7 @@ impl EffectProvider for BrokerEffects<'_> {
+                 return Self::permission_retention_error(&error).map(allen_vm::EffectPoll::Ready);
+             }
+         };
+-        let operation_id = self.next_permission_operation;
+-        self.next_permission_operation =
+-            self.next_permission_operation
+-                .checked_add(1)
+-                .ok_or(VmError::ResourceLimit {
+-                    resource: "permission_operations",
+-                })?;
++        let operation_id = take_operation(&mut self.next_operation, "permission_operations")?;
+         let pending_target_id = self.next_pending_target;
+         self.next_pending_target = self.next_pending_target.saturating_add(1);
+         let request = ExternalGrantRequest {
+@@ -3739,13 +3718,7 @@ impl EffectProvider for BrokerEffects<'_> {
+                 .input_schema
+                 .validate(&input_json, &SchemaLimits::default())
+                 .map_err(|_| VmError::ToolSchemaError)?;
+-            let operation_id = self.next_tool_operation;
+-            self.next_tool_operation =
+-                self.next_tool_operation
+-                    .checked_add(1)
+-                    .ok_or(VmError::ResourceLimit {
+-                        resource: "tool_operations",
+-                    })?;
++            let operation_id = take_operation(&mut self.next_operation, "tool_operations")?;
+             let deadline = self.tool_deadline.map_or(Duration::MAX, |deadline| {
+                 deadline.saturating_duration_since(Instant::now())
+             });
+@@ -5929,6 +5902,16 @@ pub fn schema_descriptor(
+     }
+ }
+ 
++/// Allocate the next execution-wide provider operation ID. Overflow keeps the
++/// family's registered resource name.
++fn take_operation(counter: &mut u64, resource: &'static str) -> Result<u64, VmError> {
++    let operation_id = *counter;
++    *counter = counter
++        .checked_add(1)
++        .ok_or(VmError::ResourceLimit { resource })?;
++    Ok(operation_id)
++}
++
+ fn truncate_utf8(value: &str, maximum_bytes: usize) -> &str {
+     if value.len() <= maximum_bytes {
+         return value;
+diff --git a/crates/josh/tests/tool_roundtrip.rs b/crates/josh/tests/tool_roundtrip.rs
+index bc82659..abe7ea7 100644
+--- a/crates/josh/tests/tool_roundtrip.rs
++++ b/crates/josh/tests/tool_roundtrip.rs
+@@ -2885,6 +2885,7 @@ export async fn main() returns String effects [model.request, user.ask, tool.exa
+     };
+     send(&mut stdin, "h-4", "execution/start", &start);
+     let mut origins = Vec::new();
++    let mut operation_ids = Vec::new();
+     let output = loop {
+         match receive(&mut reader) {
+             WireMessage::Request { id, method, params } => {
+@@ -2894,6 +2895,7 @@ export async fn main() returns String effects [model.request, user.ask, tool.exa
+                     "user/ask" => json!({"value":"asked"}),
+                     other => panic!("unexpected provider request {other}"),
+                 };
++                operation_ids.push(params["operation_id"].as_str().unwrap().to_owned());
+                 origins.push((method, params["origin"].clone()));
+                 send_message(
+                     &mut stdin,
+@@ -2919,6 +2921,8 @@ export async fn main() returns String effects [model.request, user.ask, tool.exa
+     );
+     drop(stdin);
+     assert!(child.wait().unwrap().success());
++    // Operation IDs are unique across provider families within an execution.
++    assert_eq!(operation_ids, ["op-1", "op-2", "op-3", "op-4"]);
+ 
+     let summary = origins
+         .iter()
+diff --git a/docs/agents/reference/josh-protocol.md b/docs/agents/reference/josh-protocol.md
+index 64d71d4..24daeeb 100644
+--- a/docs/agents/reference/josh-protocol.md
++++ b/docs/agents/reference/josh-protocol.md
+@@ -384,7 +384,9 @@ independent providers. The host may supply either in attached or unattended
+ mode.
+ 
+ Each request has an operation ID, prompt, response schema, attempt, validation
+-issues, and deadline. Valid output returns the ordinary typed result. Expected
++issues, and deadline. Operation IDs are unique within an execution across all
++provider families; a retry repeats the operation and interaction IDs with the
++next attempt. Valid output returns the ordinary typed result. Expected
+ denial, unavailability, and exhausted validation use the source-visible closed
+ error type. Late or malformed responses are protocol violations.
+ 
+diff --git a/docs/implementation-spec.md b/docs/implementation-spec.md
+index fd15185..bf0c5ee 100644
+--- a/docs/implementation-spec.md
++++ b/docs/implementation-spec.md
+@@ -538,7 +538,10 @@ request/protocol state errors.
+ 
+ The protocol routes invoking-agent messages, typed agent questions, transcript
+ snapshots, model and user prompts, sub-agent creation/run/message/ask, permission
+-decisions, and typed tool invocation. Attached operations carry the initialized
++decisions, and typed tool invocation. Every provider request carries an
++`operation_id` (`op-<n>`) that is unique within its execution across all
++provider families. A typed-response retry repeats the operation ID and
++`interaction_id` with the next `attempt`. Attached operations carry the initialized
+ session identity. Unattended execution cannot use invoking-agent operations but
+ may use separately supplied model, user, sub-agent, and tool providers.
+ 

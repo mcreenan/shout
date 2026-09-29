@@ -13,6 +13,7 @@ path = "@SHOUT_SRC@/main.rs"
 allen-bytecode = { path = "@ALLEN_SRC@/crates/allen-bytecode" }
 allen-compiler = { path = "@ALLEN_SRC@/crates/allen-compiler" }
 allen-schema = { path = "@ALLEN_SRC@/crates/allen-schema" }
+josh-host = { path = "@ALLEN_SRC@/crates/josh-host" }
 josh-protocol = { path = "@ALLEN_SRC@/crates/josh-protocol" }
 serde_json = "1.0"
 

@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs/promises';
+import * as fsSync from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { Workspace, scenarios, createScenario } from '../src/workspace.mjs';
@@ -191,4 +193,38 @@ test('already-cancelled patches never mutate files', async t => {
   controller.abort();
   await assert.rejects(workspace.apply([{ path: 'new.mjs', before: '', after: 'change' }], { signal: controller.signal }));
   assert.deepEqual(await fs.readdir(directory), []);
+});
+
+test('reading a FIFO is refused at once instead of blocking a file-system worker', async t => {
+  const directory = await temporary(t);
+  const fifo = path.join(directory, 'pipe.txt');
+  execFileSync('mkfifo', [fifo]);
+  await fs.writeFile(path.join(directory, 'ok.txt'), 'fine\n');
+  const workspace = await new Workspace(directory).init();
+  const within = promise => Promise.race([promise, new Promise((_, reject) => setTimeout(() => reject(new Error('blocked')), 2000))]);
+  try {
+    // More reads than libuv has workers: blocking opens would stall every later file operation.
+    const reads = await within(Promise.allSettled(Array.from({ length: 6 }, () => workspace.read('pipe.txt'))));
+    for (const read of reads) { assert.equal(read.status, 'rejected'); assert.match(read.reason.message, /Not a bounded text file/); }
+    assert.equal(await within(workspace.read('ok.txt')), 'fine\n');
+    await assert.rejects(within(workspace.planEdits([{ path: 'pipe.txt', find: 'a', replace: 'b' }])), /Not a bounded text file/);
+    await assert.rejects(within(workspace.apply([{ path: 'pipe.txt', before: '', after: 'x' }])), /Not a bounded text file/);
+  } finally {
+    // Releases readers an unfixed read left blocked (synchronously: the worker pool may be exhausted).
+    try { fsSync.closeSync(fsSync.openSync(fifo, fsSync.constants.O_WRONLY | fsSync.constants.O_NONBLOCK)); } catch {}
+  }
+});
+
+test('a UTF-8 byte order mark is kept through reads, edits and writes', async t => {
+  const directory = await temporary(t);
+  await fs.writeFile(path.join(directory, 'data.csv'), '﻿name,amount\nalpha,1\n');
+  const workspace = await new Workspace(directory).init();
+  assert.equal(await workspace.read('data.csv'), '﻿name,amount\nalpha,1\n');
+  const changes = await workspace.planEdits([{ path: 'data.csv', find: 'alpha,1', replace: 'alpha,2' }]);
+  assert.deepEqual(await workspace.apply(changes), { changed: ['data.csv'] });
+  const bytes = await fs.readFile(path.join(directory, 'data.csv'));
+  assert.deepEqual([...bytes.subarray(0, 3)], [0xef, 0xbb, 0xbf]);
+  assert.equal(bytes.toString('utf8'), '﻿name,amount\nalpha,2\n');
+  await workspace.apply([{ path: 'data.csv', before: await workspace.read('data.csv'), after: '﻿name,amount\n' }]);
+  assert.equal(await fs.readFile(path.join(directory, 'data.csv'), 'utf8'), '﻿name,amount\n');
 });

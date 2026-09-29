@@ -29,6 +29,15 @@ test('an unclosed fence runs to the end so streamed replies render as code', () 
   ]);
 });
 
+test('fenced code keeps its tabs verbatim, at the top level and inside a list; tabs still indent structure', () => {
+  const recipe = 'all:\n\techo "hi"\n\t\tmake -C sub';
+  assert.equal(parseBlocks(`\`\`\`make\n${recipe}\n\`\`\``)[0].text, recipe);
+  const [list] = parseBlocks(`- build:\n\n  \`\`\`make\n  all:\n  \techo "hi"\n  \`\`\``);
+  assert.deepEqual(list.items[0].children.at(-1), { type: 'code', lang: 'make', text: 'all:\n\techo "hi"' });
+  const [outer] = parseBlocks('- a\n\t- nested');
+  assert.deepEqual(types(outer.items[0].children), ['paragraph', 'list']);
+});
+
 test('inline emphasis, code and line breaks', () => {
   assert.deepEqual(parseInline('**bold `a*b`** and _em_ in snake_case_name ~~gone~~\nnext'), [
     { type: 'strong', children: [{ type: 'text', text: 'bold ' }, { type: 'code', text: 'a*b' }] },

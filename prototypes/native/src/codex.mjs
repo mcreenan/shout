@@ -33,6 +33,19 @@ export class CodexClient extends EventEmitter {
     this.child.stderr.on("data", (b) => {
       this.stderr = (this.stderr + b.toString()).slice(-8192);
     });
+    const child = this.child;
+    // "exit" fires once, and not at all for a failed spawn; a signal exit leaves
+    // exitCode null. Shutdown waits on this instead of on a later "exit" event.
+    this.exited = new Promise((resolve) => {
+      const done = () => {
+        this.hasExited = true;
+        resolve();
+      };
+      child.once("exit", done);
+      child.once("error", () => {
+        if (child.pid === undefined) done();
+      });
+    });
     this.child.stdin.on("error", (e) => this.fail(e));
     this.child.on("error", (e) => this.fail(e));
     this.child.on("exit", () => this.fail(Error("Codex app-server exited")));
@@ -106,6 +119,13 @@ export class CodexClient extends EventEmitter {
     }
     const p = m.params || {},
       t = this.threads.get(p.threadId);
+    // Notifications belong to the thread's active turn. A turn the thread already
+    // moved past (a timed-out or interrupted one finishing late) is ignored.
+    const turnId = p.turn?.id ?? p.turnId;
+    if (t && turnId) {
+      if (t.retired.has(turnId) || (t.turnId && t.turnId !== turnId)) return;
+      t.turnId ??= turnId;
+    }
     if (m.method === "item/started" && t) {
       this.emit("trace", {
         type: "codex.item",
@@ -199,7 +219,12 @@ export class CodexClient extends EventEmitter {
         "Complete only the supplied bounded task. Do not inspect files, call tools, or access network.",
       ...(dynamicTools ? { dynamicTools } : {}),
     });
-    this.threads.set(r.thread.id, { text: "", turnId: null });
+    this.threads.set(r.thread.id, {
+      text: "",
+      turnId: null,
+      status: null,
+      retired: new Set(),
+    });
     return r.thread.id;
   }
   async turn(
@@ -209,6 +234,11 @@ export class CodexClient extends EventEmitter {
   ) {
     const t = this.threads.get(threadId);
     if (!t) throw Error("Unknown Codex thread");
+    if (t.resolve) throw Error("Codex thread already has an active turn");
+    // A reused thread starts a new turn: forget the previous turn's identity and status.
+    if (t.turnId) t.retired.add(t.turnId);
+    t.turnId = null;
+    t.status = "running";
     t.text = "";
     t.onTool = onTool;
     let timer;
@@ -285,21 +315,21 @@ export class CodexClient extends EventEmitter {
       this.fail(Error("Codex client closed"));
       this.child?.stdin.end();
       const child = this.child;
-      if (child && child.exitCode === null) {
-        await new Promise((resolve) => {
-          let escalation;
-          const timer = setTimeout(() => {
-            child.kill("SIGTERM");
-            escalation = setTimeout(() => {
-              child.kill("SIGKILL");
-            }, 300);
-          }, 1000);
-          child.once("exit", () => {
-            clearTimeout(timer);
-            clearTimeout(escalation);
-            resolve();
-          });
-        });
+      if (child && !this.hasExited) {
+        const exited = (ms) => {
+          let timer;
+          return Promise.race([
+            this.exited.then(() => true),
+            new Promise((r) => (timer = setTimeout(() => r(false), ms))),
+          ]).finally(() => clearTimeout(timer));
+        };
+        if (!(await exited(1000))) {
+          child.kill("SIGTERM");
+          if (!(await exited(300))) {
+            child.kill("SIGKILL");
+            await exited(1000);
+          }
+        }
       }
     })();
     return this.closing;
