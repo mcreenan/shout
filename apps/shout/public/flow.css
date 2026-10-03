@@ -6,7 +6,11 @@
 .fl-world{position:absolute;left:0;top:0;transform-origin:0 0;will-change:transform}
 .fl-edges{position:absolute;left:0;top:0;width:1px;height:1px;overflow:visible}
 .le{fill:none;stroke:color-mix(in srgb,var(--text-3) 50%,transparent);stroke-width:1.5}
+.le.spine{stroke:color-mix(in srgb,var(--text-3) 85%,transparent);stroke-width:2.25}
+.le.side,.le.turn{stroke:color-mix(in srgb,var(--text-3) 35%,transparent);stroke-width:1.25}
+.le.idle:not(.hot){stroke-dasharray:1 5;stroke-linecap:round;stroke-width:2.25}
 .le.hot{stroke:var(--accent);stroke-width:2;stroke-dasharray:6 6;animation:le-flow .8s linear infinite}
+.le.hot.spine{stroke-width:2.5}
 .le.hot.model{stroke:var(--model)}.le.hot.tool{stroke:var(--tool)}.le.hot.vm{stroke:var(--vm)}.le.hot.waiting{stroke:var(--warn)}
 @keyframes le-flow{to{stroke-dashoffset:-12}}
 .le-knot{fill:var(--bg-subtle);stroke:color-mix(in srgb,var(--text-3) 60%,transparent);stroke-width:1.5}
@@ -32,6 +36,10 @@
 .fl-card.hub{border-color:color-mix(in srgb,var(--c) 35%,var(--border));background:color-mix(in srgb,var(--c) 6%,var(--surface))}
 .fl-card.msg.user{background:var(--bg-sunken);box-shadow:var(--shadow-sm)}
 .fl-card.msg.harness{border-color:color-mix(in srgb,var(--harness) 30%,var(--border))}
+/* Primary cards (tier 1) stand a little firmer than the rest; structure keeps its own look. Kept at the
+   specificity of a state class (and before them), so selection, failure and the live glow still win. */
+.fl-card.tier-1:where(:not(.group,.stack,.track)){border-color:color-mix(in srgb,var(--c) 40%,var(--border-strong));box-shadow:0 6px 22px light-dark(#00000016,#00000080),0 1px 3px light-dark(#00000010,#0000)}
+.fl-card.tier-1:where(.msg.user){border-color:var(--border-strong)}
 .fl-card.selectable{cursor:pointer}
 .fl-card.selectable:hover{border-color:var(--border-strong)}
 .fl-card.hub.selectable:hover{border-color:color-mix(in srgb,var(--c) 60%,var(--border))}
@@ -70,7 +78,8 @@
 .fl-code{margin-top:4px;font:var(--fs-sm)/1.5 var(--mono);color:var(--text-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .fl-md{font-size:var(--fs-md);line-height:1.6;overflow-wrap:anywhere}
 .fl-md>:last-child{margin-bottom:0}
-.fl-md.clamped{max-height:10em;overflow:hidden;-webkit-mask-image:linear-gradient(to bottom,#000 62%,transparent)}
+.fl-md.clamped{max-height:10em;overflow:hidden}
+.fl-md.clamped.clipped{-webkit-mask-image:linear-gradient(to bottom,#000 62%,transparent);mask-image:linear-gradient(to bottom,#000 62%,transparent)}
 .fl-card.final .fl-md{font-size:var(--fs-md)}
 .fl-card.msg.user .fl-text{margin-top:0}
 /* The branch taken to reach a card sits on its top edge, where the incoming edge arrives. */
@@ -110,10 +119,12 @@
 .fl-state.active{border:2px solid color-mix(in srgb,var(--vm) 30%,transparent);border-top-color:var(--vm);animation:spin .8s linear infinite}
 .fl-state.waiting{--c:var(--warn);width:9px;height:9px;margin:0 2.5px;background:var(--warn);animation:fl-ping 1.4s ease-out infinite}
 .fl-state.stale{border:1.5px dashed var(--text-3)}
+.fl-state.declined{background:var(--bg-sunken);color:var(--text-2)}
 .fl-pips{display:flex;gap:2px;height:4px;margin-top:6px}
 .fl-pips i{flex:1;min-width:2px;border-radius:2px;background:var(--bg-sunken)}
 .fl-card.stack .fl-pips i{max-width:16px}
 .fl-pips i.m{background:var(--model)}.fl-pips i.t{background:var(--tool)}.fl-pips i.w{background:var(--warn)}.fl-pips i.x{background:var(--danger)}
+.fl-pips i.a{background:color-mix(in srgb,var(--text-3) 45%,transparent)}.fl-pips i.ok{background:var(--ok)}
 .fl-pips i.live{animation:pulse 1.2s infinite}
 .fl-rows{list-style:none;display:grid;gap:1px;margin:8px -6px 0;padding:0}
 .fl-card.stack .fl-rows{display:block;columns:2 260px;column-gap:8px}
@@ -132,6 +143,73 @@
 .fl-row .fl-time{padding:0;font-size:var(--fs-xs)}
 .fl-row .fl-state.ok{background:none;color:color-mix(in srgb,var(--ok) 65%,var(--text-3))}
 .fl-row .fl-state.active{width:12px;height:12px}
+
+/* Secondary and ambient cards, once settled: one line sized to its content (a compact call, a note, an
+   answered approval). The live card is always full size. */
+.fl-card.compact{display:flex;align-items:center;gap:7px;width:max-content;min-width:160px;max-width:min(420px,var(--row-width,980px));padding:6px 10px 6px 7px;border-radius:10px;box-shadow:var(--shadow-sm);font-size:var(--fs-sm);white-space:nowrap}
+.fl-card.compact.note{padding-left:12px}
+.fl-kind{display:grid;place-items:center;width:20px;height:20px;border-radius:6px;flex-shrink:0;background:color-mix(in srgb,var(--tool) 13%,var(--surface));color:color-mix(in srgb,var(--tool) 80%,var(--text))}
+.fl-kind.ambient{background:var(--bg-sunken);color:var(--text-3)}
+.fl-kind svg{width:12px;height:12px;stroke-width:2}
+.fl-cmp-verb{flex-shrink:0;font:600 var(--fs-sm) var(--mono);color:var(--text-2)}
+.fl-cmp-title{flex-shrink:0;font-weight:600}
+.fl-cmp-arg{flex:1 1 auto;min-width:0;font:var(--fs-sm) var(--mono);color:var(--text);overflow:hidden;text-overflow:ellipsis}
+.fl-cmp-arg.muted,.fl-card.answered .fl-cmp-arg{font-family:var(--font);color:var(--text-2)}
+.fl-cmp-res{flex-shrink:0;font:var(--fs-xs) var(--mono);color:var(--text-3)}
+.fl-card.compact .fl-time{padding-left:2px}
+.fl-card.compact .fl-state.ok{background:none;color:color-mix(in srgb,var(--ok) 70%,var(--text-3))}
+.fl-card.compact .fl-icon{width:16px;height:16px}
+.fl-card.compact.selected{box-shadow:0 0 0 1px var(--accent),0 0 0 4px var(--ring)}
+.fl-card.answered{background:var(--bg-subtle)}
+
+/* Inputs: the reads a judgment consumed, a quiet footer inside its card under a hairline. */
+.fl-inputs{display:flex;flex-wrap:wrap;gap:2px 4px;margin:8px -14px -3px;padding:5px 10px 0;border-top:1px solid color-mix(in srgb,var(--c) 16%,var(--border))}
+.fl-in{display:inline-flex;align-items:center;gap:4px;min-width:0;max-width:100%;height:20px;padding:0 6px 0 4px;border-radius:var(--radius-xs);font:var(--fs-xs) var(--mono);color:var(--text-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fl-in svg{width:11px;height:11px;stroke-width:2}
+.fl-in:hover{background:color-mix(in srgb,var(--c) 9%,transparent);color:var(--text)}
+.fl-in.selected,.fl-in.selected:hover{background:var(--accent-soft);color:var(--accent-text)}
+
+/* Bursts: consecutive calls as one card, a row per call while open, one line when folded. */
+.fl-card.burst{width:420px}
+.fl-card.burst>.fl-head{gap:8px}
+.fl-card.burst .fl-toggle .fl-chevron{margin:0 0 0 -3px}
+.fl-mix{min-width:0;color:var(--text-3);font-size:var(--fs-sm);overflow:hidden;text-overflow:ellipsis}
+.fl-rows.burst{margin-top:7px}
+.fl-rows.burst .fl-row{grid-template-columns:18px 40px minmax(0,1fr) auto auto 14px;gap:7px;padding:2px 6px;border:1px solid transparent}
+.fl-rows.burst .fl-kind{width:18px;height:18px}
+.fl-rows.burst .fl-row.active{background:color-mix(in srgb,var(--tool) 10%,var(--surface));border-color:color-mix(in srgb,var(--tool) 45%,transparent)}
+.fl-rows.burst .fl-row.active .fl-time{color:color-mix(in srgb,var(--tool) 85%,var(--text));font-weight:600}
+.fl-rows.burst .fl-state.active{border-color:color-mix(in srgb,var(--tool) 30%,transparent);border-top-color:var(--tool)}
+.fl-row-err{margin:1px 0 2px 31px;color:var(--danger);font-size:var(--fs-xs);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fl-card.burst.collapsed{width:max-content;max-width:var(--row-width,980px);padding:6px 12px 6px 8px;border-radius:10px;box-shadow:var(--shadow-sm);font-size:var(--fs-sm)}
+.fl-card.burst>.fl-head[data-act]{cursor:pointer}
+.fl-card.burst.collapsed:hover{border-color:var(--border-strong)}
+.fl-card.burst.collapsed .fl-pips{flex-shrink:0;margin:0;height:6px;gap:2px}
+.fl-card.burst.collapsed .fl-pips i{width:6px;flex:none}
+.fl-xchip,.fl-wchip{display:inline-flex;align-items:center;flex-shrink:0;gap:4px;height:20px;padding:0 8px 0 5px;border-radius:10px;font:var(--fs-xs) var(--mono);white-space:nowrap}
+.fl-xchip{border:1px solid var(--danger-border);background:var(--danger-soft);color:var(--danger);font-weight:600}
+.fl-wchip{border:1px solid color-mix(in srgb,var(--tool) 35%,var(--border));background:color-mix(in srgb,var(--tool) 7%,var(--surface));color:var(--text)}
+.fl-xchip span,.fl-wchip span{display:grid}
+.fl-xchip svg,.fl-wchip svg{width:11px;height:11px;stroke-width:2.4}
+.fl-wchip svg{color:color-mix(in srgb,var(--tool) 80%,var(--text))}
+.fl-wchip em{font-style:normal;color:var(--text-3)}
+
+/* An approval docks flush under the action it gates: one unit, no edge between. */
+.fl-card.dock-top{border-bottom-left-radius:0;border-bottom-right-radius:0}
+.fl-card.docked{border-top-left-radius:0;border-top-right-radius:0}
+.fl-card.docked.waiting{background:var(--warn-soft)}
+
+/* A retried request: the earlier attempts as a small pile of sheets behind the card. */
+.fl-card.pile{--sheet:color-mix(in srgb,var(--c) 6%,var(--surface));--edge:color-mix(in srgb,var(--c) 30%,var(--border-strong));
+  --pile:0 5px 0 -3px var(--sheet),0 5px 0 -2px var(--edge),0 10px 0 -7px var(--sheet),0 10px 0 -6px var(--edge);box-shadow:var(--pile),var(--shadow-md)}
+.fl-card.pile:is(.active,.waiting){box-shadow:var(--pile),0 0 0 4px color-mix(in srgb,var(--c) 18%,transparent),0 14px 36px color-mix(in srgb,var(--c) 24%,transparent)}
+.fl-card.pile.selected{box-shadow:var(--pile),0 0 0 1px var(--accent),0 0 0 5px var(--ring)}
+
+/* A long pause between rows: a quiet marker in the gap. */
+.fl-marks{position:absolute;left:0;top:0}
+.fl-gap{position:absolute;left:0;top:0;display:flex;align-items:center;gap:5px;height:20px;padding:0 9px 0 7px;border:1px dashed var(--border-strong);border-radius:10px;background:var(--bg-subtle);color:var(--text-3);font:var(--fs-xs) var(--mono);white-space:nowrap;pointer-events:none}
+.fl-gap span{display:grid}
+.fl-gap svg{width:11px;height:11px;stroke-width:2}
 
 /* Flow mode: the canvas fills the pane and the composer floats over its bottom edge. */
 .conversation.flow-mode .composer-area{position:absolute;left:0;right:0;bottom:0;z-index:4;padding-top:28px;background:linear-gradient(to top,var(--bg-subtle) 55%,transparent);pointer-events:none}

@@ -97,3 +97,51 @@ test('the detail lists every attempt with each issue as its path and a short lab
   assert.deepEqual(attempts.querySelector('fd-issues').children.map((line) => line.textContent), ['/levelunknown variant', '/scorewrong type']);
 });
 
+
+test('a folded burst keeps what matters on one line; open, it lists a row per call that selects its step', () => {
+  const run = 'run-b';
+  const call = (i, tool, input, value) => [at(i * 10, 'tool.started', { run, effectId: `b-${i}`, tool, input }), at(i * 10 + 5, 'tool.completed', { run, effectId: `b-${i}`, tool, value })];
+  const steps = buildFlow([at(0, 'run.started', { run }), ...call(1, 'workspace.read', { path: 'a.mjs' }, {}), ...call(2, 'workspace.edit', { path: 'src/a.mjs' }, { changed: ['src/a.mjs', 'src/b.mjs'] }), ...call(3, 'tests.run', { command: 'npm test' }, { passed: false, output: 'not ok 1 - a' })])[0].steps;
+  const node = { type: 'burst', kind: 'tool', status: 'ok', steps, start: steps[0].start, end: steps[2].end, failed: 1, mix: { read: 1, edit: 1, test: 1, run: 0, other: 0 }, fails: [{ label: 'tests.run', count: 1 }], writes: ['a.mjs', 'b.mjs'], pips: ['a', 't', 'x'], current: false, open: false };
+  const card = new FakeNode('div');
+  NODE_TYPES.burst.render(card, node, ctx());
+  assert.ok(card.classList.contains('collapsed'));
+  assert.deepEqual(['fl-title', 'fl-mix', 'fl-xchip', 'fl-wchip'].map((name) => card.querySelector(name).textContent), ['3 calls', '1 read, 1 edit, 1 test', 'tests.run · 1 failed', 'a.mjs +1']);
+  assert.deepEqual(card.querySelector('fl-pips').children.map((pip) => pip.className), ['a', 't', 'x']);
+  assert.equal(card.querySelector('fl-head').dataset.act, 'toggle', 'clicking the line pins it open');
+  const open = new FakeNode('div');
+  NODE_TYPES.burst.render(open, { ...node, open: true, pinned: true }, ctx());
+  const rows = open.querySelectorAll('fl-row');
+  assert.deepEqual(rows.map((row) => [row.dataset.step, row.dataset.act, row.querySelector('fl-cmp-verb').textContent]), steps.map((step, i) => [step.id, 'row', ['read', 'edit', 'test'][i]]));
+  assert.equal(open.querySelector('fl-row-err').textContent, 'not ok 1 - a');
+  const live = new FakeNode('div');
+  NODE_TYPES.burst.render(live, { ...node, open: true, current: true }, ctx());
+  assert.equal(live.querySelector('fl-head').dataset.act, undefined, 'while it is live it is not a toggle');
+});
+
+test('a settled call is one line, a judgment lists its inputs inside its card, an answered approval is one line', () => {
+  const steps = buildFlow([
+    at(0, 'tool.started', { effectId: 'c-1', tool: 'tests.run', input: { command: 'npm test' } }), at(5, 'tool.completed', { effectId: 'c-1', tool: 'tests.run', value: { passed: true } }),
+    at(6, 'tool.started', { effectId: 'c-2', tool: 'workspace.search', input: { query: 'retry' } }), at(7, 'tool.completed', { effectId: 'c-2', value: { matches: [1] } }),
+    at(8, 'tool.started', { effectId: 'c-3', tool: 'workspace.read_many', input: { paths: ['src/a.mjs', 'src/b.mjs', 'src/c.mjs'] } }), at(9, 'tool.completed', { effectId: 'c-3', value: {} }),
+    at(10, 'model.started', { effectId: 'm-1', prompt: { system: 'You are a planner. Plan it.' } }), at(20, 'model.completed', { effectId: 'm-1', value: { summary: 'Plan: **retry**.' } }),
+    at(30, 'user.question', { effectId: 'q-1', host: true, title: 'Apply these changes?' }), at(90_000, 'user.answered', { effectId: 'q-1', value: { accept: true } }),
+  ])[0].steps;
+  const [tests, search, read, model, approval] = steps;
+  const compact = new FakeNode('div');
+  NODE_TYPES.tool.render(compact, { type: 'tool', kind: 'tool', status: 'ok', tier: 2, step: tests }, ctx());
+  assert.ok(compact.classList.contains('compact') && compact.classList.contains('pass'), 'one line, and a passing test still shows its check');
+  assert.deepEqual([compact.querySelector('fl-cmp-verb').textContent, compact.querySelector('fl-cmp-arg').textContent], ['test', 'npm test']);
+  const full = new FakeNode('div');
+  NODE_TYPES.tool.render(full, { type: 'tool', kind: 'tool', status: 'ok', tier: 1, step: tests }, ctx());
+  assert.ok(!full.classList.contains('compact'));
+  const hub = new FakeNode('div');
+  NODE_TYPES.hub.render(hub, { type: 'hub', kind: 'model', status: 'ok', step: model, outcome: 'Plan: retry.', inputs: [search, read] }, ctx());
+  assert.equal(hub.querySelector('fl-text').textContent, 'Plan: retry.');
+  assert.deepEqual(hub.querySelectorAll('fl-in').map((chip) => [chip.textContent, chip.dataset.step, chip.dataset.act]), [['"retry"', search.id, 'row'], ['a.mjs +2', read.id, 'row']]);
+  const answered = new FakeNode('div');
+  NODE_TYPES.approval.render(answered, { type: 'approval', kind: 'user', status: 'ok', step: approval }, ctx());
+  assert.ok(answered.classList.contains('answered'));
+  assert.deepEqual(['fl-cmp-title', 'fl-cmp-arg'].map((name) => answered.querySelector(name).textContent), ['Approved', 'Apply these changes?']);
+  assert.ok(answered.querySelector('fl-time'), 'how long it waited');
+});

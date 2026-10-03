@@ -2,15 +2,34 @@
 // Each instance owns its stage and is fed by its own source (the chat's Flow mode; sub-agent tabs can
 // mount more). Leaf cards are selected, and their detail shows elsewhere through `onSelect`; only
 // structure expands in place: a loop group shows one iteration's cards in a frame, a stack lists its steps.
-import { phases } from './flow-graph.js';
+import { phases, toolKind } from './flow-graph.js';
 import { renderMarkdown } from './markdown-dom.js';
 import { buildFlow, formatDuration, modelTask, modelOutput, toolResult, stepFailed, failureLine, plural, tokens, clip, issueLabel } from './flow.js';
 
 const MAX_ROW = 980; // rows wrap past this width (or the stage width, if narrower)
-const GAP_X = 18, GAP_Y = 16, ROW_GAP = 46, MIN_CARD = 230;
+const GAP_X = 18, GAP_Y = 16, MIN_CARD = 230;
+// Space above a row: tight within a causal chain, more where edges fan out or in, loose at a new turn.
+// It is never proportional to time; a long pause gets a marker (IDLE_PAD above and below it) instead.
+const GAP = { chain: 18, fan: 36, turn: 70 };
+const IDLE_PAD = 12, PILE = 9; // PILE: the retry sheets showing under a card
 const FRAME = { head: { run: 34, loop: 34, group: 14 }, foot: 16, side: 20, nest: 14 };
 const TOP_INSET = 58; // by default the Chat/Flow switch and the Inspector button float over the stage's top edge
 const ICON = { ok: 'M5 12.5l4.5 4.5L19 7.5', no: 'M6.5 6.5l11 11M17.5 6.5l-11 11', chevron: 'M9 6l6 6-6 6', prev: 'M14.5 6l-6 6 6 6' };
+// What a call does (toolKind), drawn on compact cards, burst rows and input chips.
+const KIND_ICON = {
+  search: '<circle cx="11" cy="11" r="6"/><path d="M20 20l-4.6-4.6"/>',
+  read: '<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4M9 12h6M9 16h6"/>',
+  list: '<path d="M3 7.5a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/>',
+  edit: '<path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M13.5 6.5l4 4"/>',
+  write: '<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4M12 11v6M9 14h6"/>',
+  test: '<path d="M7 4h10M9 4v5l-4.5 8.5A2 2 0 006.3 20.5h11.4a2 2 0 001.8-3L15 9V4"/><path d="M7 15h10"/>',
+  git: '<circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="7" r="2"/><path d="M6 7v10M18 9c0 5-7 3-11.5 8.5"/>',
+  agent: '<circle cx="12" cy="5" r="2.4"/><circle cx="5" cy="19" r="2.4"/><circle cx="19" cy="19" r="2.4"/><path d="M12 7.4V12M12 12l-6.2 4.8M12 12l6.2 4.8"/>',
+  run: '<path d="M5 7l5 5-5 5M12.5 17H19"/>',
+  tool: '<circle cx="12" cy="12" r="3.5"/>',
+  clock: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>',
+};
+const AMBIENT = new Set(['search', 'read', 'list', 'git']);
 const TILE_LIMIT = 12; // more iterations than this draw as numbered cells
 const PIP_LIMIT = 80;
 
@@ -25,6 +44,16 @@ function svgIcon(path, className = 'fl-icon') {
   span.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${path}"/></svg>`;
   return span;
 }
+function kindIcon(kind, className = `fl-kind${AMBIENT.has(kind) ? ' ambient' : ''}`) {
+  const span = el('span', className);
+  span.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">${KIND_ICON[kind] || KIND_ICON.tool}</svg>`;
+  return span;
+}
+// The verb a call reads as: its kind, or the tool's own name when it has none.
+const verbOf = (label) => (toolKind(label) === 'tool' ? label : toolKind(label));
+const basename = (path) => String(path).split('/').filter(Boolean).pop() || String(path);
+// Retried requests show the attempts behind them as a pile of sheets.
+const piled = (node) => node.step?.attempts?.length > 1;
 function button(className, act, ...children) {
   const node = el('button', className);
   node.type = 'button';
@@ -50,6 +79,13 @@ function timer(start, end) {
   Object.assign(span, { start, end: end ?? null });
   span.title = new Date(start).toLocaleTimeString();
   return span;
+}
+// A pause between rows, roughly: `18m`, `2h 5m`, `3d`.
+function idleText(ms) {
+  const minutes = Math.round(ms / 60_000);
+  if (minutes < 60) return `${minutes}m`;
+  if (minutes < 1440) return `${Math.floor(minutes / 60)}h${minutes % 60 ? ` ${minutes % 60}m` : ''}`;
+  return `${Math.round(minutes / 1440)}d`;
 }
 function head(title, ...extra) {
   const row = el('div', 'fl-head');
@@ -77,7 +113,7 @@ function outcome(e, ok, tone = ok ? 'pass' : 'fail') {
 function stateMark(status) {
   const mark = el('i', `fl-state ${status}`);
   if (status === 'ok') mark.append(svgIcon(ICON.ok, ''));
-  if (status === 'failed') mark.append(svgIcon(ICON.no, ''));
+  if (status === 'failed' || status === 'declined') mark.append(svgIcon(ICON.no, ''));
   return mark;
 }
 function failCount(count) {
@@ -86,7 +122,7 @@ function failCount(count) {
   return mark;
 }
 // One pip per step, coloured by kind; long strips merge neighbours, keeping the most telling one.
-const RANK = { x: 4, w: 3, m: 2, t: 1 };
+const RANK = { x: 4, w: 3, m: 2, t: 1, ok: 1, a: 0 };
 function pips(list) {
   const bar = el('span', 'fl-pips');
   const size = Math.ceil(list.length / PIP_LIMIT);
@@ -123,10 +159,44 @@ function renderHub(e, node) {
   if (failed) e.append(el('div', 'fl-text error clamp2', failed.error?.message || failed.message || 'Failed'));
   else if (rejected) { const issues = step.attempts.findLast((attempt) => attempt.issues.length)?.issues || []; if (issues.length) e.append(el('div', 'fl-text error clamp2', issueText(issues))); }
   else if (isLive(node.status)) { const { task } = modelTask(eventOf(step, 'model.started')?.prompt); if (task) e.append(el('div', 'fl-text muted clamp1', task)); }
-  else if (out.text) e.append(el('div', 'fl-text clamp2', plain(out.text)));
+  else if (node.outcome || out.text) e.append(el('div', 'fl-text clamp2', plain(node.outcome || out.text)));
   else if (out.items[0]) e.append(el('div', 'fl-text clamp1', out.items[0].title));
+  if (node.inputs?.length) e.append(inputsRow(node.inputs));
+}
+// The reads a judgment consumed: a quiet footer of chips inside its card. Each selects its step.
+function inputName(step) {
+  const input = eventOf(step, 'tool.started')?.input || {};
+  const kind = toolKind(step.label);
+  if (kind === 'search') return `"${clip(input.query ?? input.pattern ?? step.detail, 24)}"`;
+  if (Array.isArray(input.paths) && input.paths.length > 1) return `${basename(input.paths[0])} +${input.paths.length - 1}`;
+  if (!step.detail) return step.label.split('.').pop();
+  return clip(kind === 'read' && !/\s/.test(step.detail) ? basename(step.detail) : step.detail, 32);
+}
+function inputsRow(steps) {
+  const row = el('div', 'fl-inputs');
+  for (const step of steps) {
+    const chip = button(`fl-in${stepFailed(step) ? ' fail' : ''}`, 'row', kindIcon(toolKind(step.label), ''), inputName(step));
+    chip.dataset.step = step.id;
+    chip.title = `${step.label}${fullArg(step) ? ` ${fullArg(step)}` : ''}`;
+    row.append(chip);
+  }
+  return row;
+}
+// A settled secondary or ambient call: one line, sized to its content.
+function renderCompact(e, node) {
+  const { step } = node;
+  const value = eventOf(step, 'tool.completed')?.value || {};
+  const tested = typeof value.passed === 'boolean' && !value.skipped;
+  const result = toolResult(step);
+  // A call with no argument reads as its tool's name.
+  const arg = el('span', 'fl-cmp-arg', step.detail || step.label);
+  arg.title = `${step.label}${fullArg(step) ? ` ${fullArg(step)}` : ''}`;
+  e.classList.add('compact');
+  e.append(...[kindIcon(toolKind(step.label)), step.detail && el('span', 'fl-cmp-verb', verbOf(step.label)), arg, result && !['passed', 'failed'].includes(result) && el('span', 'fl-cmp-res', result),
+    timer(step.start, step.end), tested ? outcome(e, value.passed) : stateMark(step.status === 'stale' ? 'stale' : 'ok')].filter(Boolean));
 }
 function renderTool(e, node) {
+  if (node.tier > 1) return renderCompact(e, node);
   const { step } = node;
   const value = eventOf(step, 'tool.completed')?.value || {};
   const failure = eventOf(step, 'tool.failed');
@@ -142,6 +212,15 @@ function renderApproval(e, node) {
   const { step } = node;
   const asked = eventOf(step, 'user.question') || {};
   const value = eventOf(step, 'user.answered')?.value;
+  if (step.label === 'Approval' && value && !isLive(node.status)) {
+    // Answered: one line, what you decided and how long it waited.
+    const question = asked.title || asked.command || asked.summary;
+    const text = question && el('span', 'fl-cmp-arg', question);
+    if (text) text.title = question;
+    e.classList.add('compact', 'answered');
+    e.append(...[stateMark(value.accept === false ? 'declined' : 'ok'), el('strong', 'fl-cmp-title', value.accept === false ? 'Declined' : value.accept === true ? 'Approved' : 'Answered'), text, timer(step.start, step.end)].filter(Boolean));
+    return;
+  }
   const icon = value?.accept === true ? outcome(e, true) : value?.accept === false ? outcome(e, false, 'declined') : null;
   e.append(head(step.label, icon, attemptChip(node), timer(step.start, step.end)));
   const text = asked.title || asked.command || asked.prompt?.system || asked.summary;
@@ -149,6 +228,11 @@ function renderApproval(e, node) {
 }
 function renderNote(e, node) {
   const { step } = node;
+  if (node.tier > 1) {
+    e.classList.add('compact');
+    e.append(...[el('i', 'fl-dot'), el('strong', 'fl-cmp-title', step.label), step.detail && el('span', 'fl-cmp-arg muted', step.detail)].filter(Boolean));
+    return;
+  }
   e.append(head(step.label));
   if (step.detail) e.append(el('div', `fl-text clamp2${step.status === 'failed' ? ' error' : ''}`, step.detail));
 }
@@ -201,15 +285,17 @@ function renderGroup(e, node) {
   }
   e.append(grid);
 }
-function stepRow(step, bare) {
+// `kinded` rows (a burst's) lead with what the call does: an icon and a verb, then its argument.
+function stepRow(step, bare, kinded = false) {
   const status = step.status === 'active' && step.pair === 'user' ? 'waiting' : step.status;
   const row = button(`fl-row ${status}${stepFailed(step) ? ' fail' : ''}`, 'row');
   row.dataset.step = step.id;
-  const label = bare ? step.detail || step.label : step.pair === 'model' ? 'Model' : `${step.label}${step.detail ? ` ${step.detail}` : ''}`;
+  const label = kinded ? step.detail || step.label : bare ? step.detail || step.label : step.pair === 'model' ? 'Model' : `${step.label}${step.detail ? ` ${step.detail}` : ''}`;
   const result = step.pair === 'tool' && !stepFailed(step) ? toolResult(step) : step.attempts?.length > 1 ? `${step.attempts.length} attempts` : '';
   const arg = el('span', 'fl-row-arg', label);
-  arg.title = fullArg(step) || label;
-  row.append(el('i', `fl-row-dot ${step.pair === 'user' ? 'user' : step.kind}`), arg, el('span', 'fl-row-result', ['passed', 'failed'].includes(result) ? '' : result), timer(step.start, step.end), stateMark(isLive(status) || status === 'stale' ? status : stepFailed(step) ? 'failed' : 'ok'));
+  arg.title = kinded ? `${step.label}${fullArg(step) ? ` ${fullArg(step)}` : ''}` : fullArg(step) || label;
+  const lead = kinded ? [kindIcon(toolKind(step.label)), el('span', 'fl-cmp-verb', verbOf(step.label))] : [el('i', `fl-row-dot ${step.pair === 'user' ? 'user' : step.kind}`)];
+  row.append(...lead, arg, el('span', 'fl-row-result', ['passed', 'failed'].includes(result) ? '' : result), timer(step.start, step.end), stateMark(isLive(status) || status === 'stale' ? status : stepFailed(step) ? 'failed' : 'ok'));
   const item = el('li');
   item.append(row);
   return item;
@@ -234,6 +320,49 @@ function renderTrack(e, node) {
   const list = el('ol', 'fl-rows');
   for (const step of node.steps) list.append(stepRow(step, false));
   e.append(list);
+}
+/* Bursts: consecutive calls as one card. Open (a row per call) while it holds the live step or you pin it;
+   otherwise one line keeping what matters: the count, the kinds, failures and files written as chips, the strip. */
+const MIX = [['read', 'reads'], ['edit', 'edits'], ['test', 'tests'], ['run', 'commands'], ['other', 'other calls']];
+const mixText = (mix) => MIX.filter(([key]) => mix[key]).map(([key, noun]) => plural(mix[key], noun)).join(', ');
+function burstChips(node) {
+  const chips = node.fails.map(({ label, count }) => { const chip = el('span', 'fl-xchip'); chip.append(svgIcon(ICON.no, ''), `${label} · ${count} failed`); return chip; });
+  if (node.writes.length) {
+    const chip = el('span', 'fl-wchip');
+    chip.title = node.writes.join('\n');
+    chip.append(kindIcon('edit', ''), node.writes[0]);
+    if (node.writes.length > 1) chip.append(el('em', '', ` +${node.writes.length - 1}`));
+    chips.push(chip);
+  }
+  return chips;
+}
+function renderBurst(e, node) {
+  const count = node.steps.length;
+  const top = el('div', 'fl-head');
+  const title = el('strong', 'fl-title', plural(count, 'calls'));
+  if (node.current) top.append(el('i', 'fl-dot'), title);
+  else {
+    // Folded or pinned, the header is the toggle.
+    top.dataset.act = 'toggle';
+    const toggle = button('fl-toggle', 'toggle', svgIcon(ICON.chevron, 'fl-chevron'), title);
+    toggle.setAttribute('aria-expanded', String(node.open));
+    top.append(toggle);
+  }
+  if (!node.current) top.append(el('span', 'fl-mix', mixText(node.mix)));
+  if (!node.open) {
+    top.append(...burstChips(node), pips(node.pips), timer(node.start, node.end));
+    e.classList.add('collapsed');
+    e.append(top);
+    return;
+  }
+  top.append(timer(node.start, node.end));
+  const list = el('ol', 'fl-rows burst');
+  for (const step of node.steps) {
+    list.append(stepRow(step, false, true));
+    const problem = stepFailed(step) && (eventOf(step, 'tool.failed')?.error?.message || failureLine(step));
+    if (problem) list.append(el('li', 'fl-row-err', problem));
+  }
+  e.append(top, list);
 }
 /* Sub-agents: a fan-out is one fleet card with a tile per agent (Flow B of the sub-agent design). */
 const AGENT_STATE = { queued: 'queued', running: 'active', completed: 'ok', failed: 'failed', cancelled: 'stale', interrupted: 'stale' };
@@ -298,6 +427,7 @@ export const NODE_TYPES = {
   group: { render: renderGroup, sig: (node) => [node.status, node.open, node.ended, node.failed, node.title, node.iterations.map((it) => [it.index, it.status, it.pips.join(), it.activity, it.end])] },
   stack: { render: renderStack, sig: (node) => [node.status, node.open, node.ended, node.failed, node.title, node.activity, node.open ? stepsSig(node.steps) : node.pips.join()] },
   track: { render: renderTrack, sig: (node) => [node.status, node.title, node.failed, stepsSig(node.steps)] },
+  burst: { render: renderBurst, sig: (node) => [node.status, node.open, node.current, stepsSig(node.steps)] },
   // Tiles open their agent (the canvas's `openAgent` option).
   fleet: {
     render: renderFleet,
@@ -327,8 +457,10 @@ export function createFlowCanvas(stage, options = {}) {
   const edgesLayer = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
   edgesLayer.setAttribute('class', 'fl-edges');
   const nodesLayer = el('div', 'fl-nodes');
-  // Frames sit above the edges so an edge passes under a frame's label rather than through its text.
-  world.append(edgesLayer, framesLayer, nodesLayer);
+  const marksLayer = el('div', 'fl-marks');
+  // Frames sit above the edges so an edge passes under a frame's label rather than through its text;
+  // so do the markers of long pauses.
+  world.append(edgesLayer, framesLayer, marksLayer, nodesLayer);
   const followButton = el('button', 'fl-follow');
   followButton.type = 'button';
   followButton.hidden = true;
@@ -338,9 +470,9 @@ export function createFlowCanvas(stage, options = {}) {
 
   const anchorTarget = () => Math.max(0, typeof anchor === 'function' ? anchor() : anchor);
   const s = {
-    anchor: anchorTarget(), sim: new Map(), frames: new Map(), rows: [], rowOf: new Map(), edges: [], index: new Map(), focus: null,
+    anchor: anchorTarget(), sim: new Map(), frames: new Map(), marks: new Map(), rows: [], rowOf: new Map(), edges: [], index: new Map(), focus: null,
     follow: true, locked: null, snap: true, cam: { x: 0, y: 0, z: 1 }, sig: '', last: 0, top: 0, rowWidth: MAX_ROW, session: null, now: Date.now(),
-    ui: { open: new Map(), stacks: new Set() }, uiRev: 0, selected: null, selectionSig: '', dirty: true, moving: true, paint: true, edgesDirty: true, ticking: new Set(),
+    ui: { open: new Map(), stacks: new Set(), bursts: new Set() }, uiRev: 0, selected: null, selectionSig: '', dirty: true, moving: true, paint: true, edgesDirty: true, ticking: new Set(),
   };
   let source = null;
   let raf = 0;
@@ -357,13 +489,19 @@ export function createFlowCanvas(stage, options = {}) {
       if (!entry || (entry.w === record.target.offsetWidth && entry.h === record.target.offsetHeight)) continue;
       entry.w = record.target.offsetWidth;
       entry.h = record.target.offsetHeight;
+      fade(entry);
       s.dirty = true;
     }
   });
+  // An earlier reply is clamped; it fades out only where its text is actually cut off.
+  function fade(entry) {
+    const body = entry.node?.type === 'msg' && entry.el.querySelector('.fl-md.clamped');
+    if (body) body.classList.toggle('clipped', body.scrollHeight > body.clientHeight + 1);
+  }
   // Natural sizes: every width is cleared before any is read, so a whole batch costs one reflow.
   function measure(entries) {
     for (const entry of entries) entry.el.style.width = '';
-    for (const entry of entries) Object.assign(entry, { natural: entry.el.offsetWidth, w: entry.el.offsetWidth, h: entry.el.offsetHeight });
+    for (const entry of entries) { Object.assign(entry, { natural: entry.el.offsetWidth, w: entry.el.offsetWidth, h: entry.el.offsetHeight }); fade(entry); }
   }
   function paintTimers(entry, now) {
     for (const time of entry.timers) {
@@ -387,7 +525,9 @@ export function createFlowCanvas(stage, options = {}) {
     const focused = e.contains(document.activeElement) ? focusKey(document.activeElement, e) : null;
     const pick = selectable(node);
     const expanded = node.open !== undefined && node.open !== null && node.open !== false;
-    e.className = `fl-card ${node.type} ${node.kind} ${node.status}${node.final ? ' final' : ''}${pick ? ' selectable' : ''}${expanded ? ' expanded' : ''}${s.selected === node.id ? ' selected' : ''}${entry.placed ? '' : ' enter'}`;
+    // Docked: an approval flush under the action it gates (`docked`), and that action (`dock-top`).
+    const place = `${node.tier ? ` tier-${node.tier}` : ''}${node.dock ? ' docked' : ''}${node.docked ? ' dock-top' : ''}${piled(node) ? ' pile' : ''}`;
+    e.className = `fl-card ${node.type} ${node.kind} ${node.status}${place}${node.final ? ' final' : ''}${pick ? ' selectable' : ''}${expanded ? ' expanded' : ''}${s.selected === node.id ? ' selected' : ''}${entry.placed ? '' : ' enter'}`;
     if (pick) { e.tabIndex = 0; e.setAttribute('role', 'button'); e.setAttribute('aria-pressed', String(s.selected === node.id)); }
     else { e.removeAttribute('tabindex'); e.removeAttribute('role'); e.removeAttribute('aria-pressed'); }
     e.replaceChildren();
@@ -406,7 +546,7 @@ export function createFlowCanvas(stage, options = {}) {
     for (const entry of s.sim.values()) {
       const on = entry.node.id === s.selected;
       if (entry.el.classList.contains('selected') !== on) { entry.el.classList.toggle('selected', on); if (entry.el.hasAttribute('aria-pressed')) entry.el.setAttribute('aria-pressed', String(on)); }
-      if (entry.node.steps) markRows(entry);
+      if (entry.node.steps || entry.node.inputs) markRows(entry);
     }
   }
   // Tells the listener about the selection when it changes or its step records something new.
@@ -440,7 +580,7 @@ export function createFlowCanvas(stage, options = {}) {
         s.sim.set(node.id, entry);
       }
       entry.node = node;
-      const sig = JSON.stringify([node.type, node.kind, node.chip?.label, typeOf(node).sig?.(node, ctx)]);
+      const sig = JSON.stringify([node.type, node.kind, node.chip?.label, node.tier, node.dock, node.docked, node.outcome, node.inputs && stepsSig(node.inputs), typeOf(node).sig?.(node, ctx)]);
       if (sig !== entry.sig) { entry.sig = sig; renderNode(entry, node); rendered.push(entry); }
     }
     measure(rendered);
@@ -472,6 +612,21 @@ export function createFlowCanvas(stage, options = {}) {
       }
     }
     for (const [key, box] of s.frames) if (!keys.has(key)) { box.el.remove(); s.frames.delete(key); }
+    // A long pause before a row: a quiet marker in the gap, not space in proportion to the time.
+    const pauses = new Set();
+    for (const row of graph.rows) {
+      if (!row.idle) continue;
+      pauses.add(row.key);
+      let mark = s.marks.get(row.key);
+      if (!mark) { mark = { el: el('div', 'fl-gap'), text: '', y: 0, ty: 0, placed: false, transform: '' }; marksLayer.append(mark.el); s.marks.set(row.key, mark); }
+      const text = `${idleText(row.idle)} later`;
+      if (text !== mark.text) {
+        mark.text = text;
+        mark.el.replaceChildren(kindIcon('clock', ''), text);
+        Object.assign(mark, { w: mark.el.offsetWidth, h: mark.el.offsetHeight });
+      }
+    }
+    for (const [key, mark] of s.marks) if (!pauses.has(key)) { mark.el.remove(); s.marks.delete(key); }
     s.rows = graph.rows;
     s.rowOf = new Map(graph.rows.flatMap((row) => row.ids.map((id) => [id, row.key])));
     s.edges = graph.edges.filter((edge) => s.sim.has(edge.from) && s.sim.has(edge.to));
@@ -487,19 +642,34 @@ export function createFlowCanvas(stage, options = {}) {
     const tops = new Map();
     const bottoms = new Map();
     // Siblings share one line where they can: cards narrow (to a floor) rather than wrap, and only as far
-    // as the siblings that will actually share a line need. All widths are written, then all sizes read.
-    const resized = [];
-    for (const row of s.rows) {
+    // as the siblings that will actually share a line need. A docked approval and the card above it share
+    // one width. All widths are written, then all sizes read.
+    const widths = new Map();
+    s.rows.forEach((row, r) => {
       const entries = row.ids.map((id) => s.sim.get(id)).filter(Boolean);
       const perLine = Math.min(entries.length, Math.max(1, Math.floor((s.rowWidth + GAP_X) / (MIN_CARD + GAP_X))));
       const fit = perLine > 1 ? Math.floor((s.rowWidth - GAP_X * (perLine - 1)) / perLine) : null;
-      for (const entry of entries) {
-        const width = fit && fit < entry.natural ? `${fit}px` : '';
-        if (entry.el.style.width !== width) { entry.el.style.width = width; resized.push(entry); }
-      }
+      for (const entry of entries) widths.set(entry, fit && fit < entry.natural ? fit : null);
+      const above = row.gap === 'dock' && s.sim.get(s.rows[r - 1]?.ids[0]);
+      if (above && entries.length === 1) { const width = Math.min(s.rowWidth, Math.max(above.natural, entries[0].natural)); widths.set(above, width); widths.set(entries[0], width); }
+    });
+    const resized = [];
+    for (const [entry, width] of widths) {
+      const value = width ? `${width}px` : '';
+      if (entry.el.style.width !== value) { entry.el.style.width = value; resized.push(entry); }
     }
     for (const entry of resized) { entry.w = entry.el.offsetWidth; entry.h = entry.el.offsetHeight; }
+    let prev = null;
     for (const row of s.rows) {
+      if (prev && row.gap === 'dock') y -= 1; // flush: the two borders overlap
+      else if (prev) {
+        let gap = Math.max(GAP[row.gap] ?? GAP.chain, row.ids.length > 1 || prev.ids.length > 1 ? GAP.fan : 0);
+        if (prev.ids.some((id) => piled(s.sim.get(id)?.node || {}))) gap += PILE;
+        const mark = row.idle && s.marks.get(row.key);
+        if (mark) { gap = Math.max(gap, mark.h + IDLE_PAD * 2); mark.ty = y + (gap - mark.h) / 2; }
+        y += gap;
+      }
+      prev = row;
       for (const key of row.open) { tops.set(key, y); y += FRAME.head[s.frames.get(key)?.frame.kind] ?? FRAME.head.group; }
       const entries = row.ids.map((id) => s.sim.get(id)).filter(Boolean);
       if (entries.length) {
@@ -516,7 +686,6 @@ export function createFlowCanvas(stage, options = {}) {
         y -= GAP_Y;
       }
       for (const key of row.close) { y += FRAME.foot; bottoms.set(key, y); }
-      y += ROW_GAP;
     }
     // Frames wrap their members sideways (wider for each frame nested inside) and their rows vertically.
     for (const [key, box] of s.frames) {
@@ -550,6 +719,10 @@ export function createFlowCanvas(stage, options = {}) {
       if (!box.box) { box.box = { ...box.target }; moving = true; continue; }
       for (const side of ['x0', 'x1', 'y0', 'y1']) box.box[side] = step(box.box[side], box.target[side]);
     }
+    for (const mark of s.marks.values()) {
+      if (!mark.placed) { Object.assign(mark, { y: mark.ty, placed: true }); moving = true; continue; }
+      mark.y = step(mark.y, mark.ty);
+    }
     s.moving = moving;
     s.edgesDirty = true;
   }
@@ -568,18 +741,20 @@ export function createFlowCanvas(stage, options = {}) {
       groups.get(key).push(edge);
     }
     const paths = [];
-    const cls = (b) => `le ${b.node.kind}${isLive(b.node.status) ? ` hot ${b.node.status}` : ''}`;
+    // Weight: the spine is firm, a branch to a secondary card beside others quiet, a pause dotted.
+    const cls = (edge) => { const b = s.sim.get(edge.to); return `le ${b.node.kind} ${edge.weight || 'spine'}${edge.idle ? ' idle' : ''}${isLive(b.node.status) ? ` hot ${b.node.status}` : ''}`; };
     for (const edges of groups.values()) {
       const sources = [...new Set(edges.map((edge) => edge.from))].map((id) => s.sim.get(id));
-      const targets = [...new Set(edges.map((edge) => edge.to))].map((id) => s.sim.get(id));
+      const targets = [...new Set(edges.map((edge) => edge.to))];
       if (sources.length > 1 && targets.length > 1) {
         const bottom = Math.max(...sources.map((a) => a.y + a.h / 2));
-        const top = Math.min(...targets.map((b) => b.y - b.h / 2));
-        const knot = { x: (Math.min(...targets.map((b) => b.x)) + Math.max(...targets.map((b) => b.x))) / 2, y: (bottom + top) / 2, w: 0, h: 0 };
+        const top = Math.min(...targets.map((id) => s.sim.get(id).y - s.sim.get(id).h / 2));
+        const xs = targets.map((id) => s.sim.get(id).x);
+        const knot = { x: (Math.min(...xs) + Math.max(...xs)) / 2, y: (bottom + top) / 2, w: 0, h: 0 };
         for (const a of sources) paths.push(`<path d="${edgePath(a, knot)}" class="le"/>`);
-        for (const b of targets) paths.push(`<path d="${edgePath(knot, b)}" class="${cls(b)}"/>`);
+        for (const id of targets) paths.push(`<path d="${edgePath(knot, s.sim.get(id))}" class="${cls(edges.find((edge) => edge.to === id))}"/>`);
         paths.push(`<circle cx="${knot.x}" cy="${knot.y}" r="4" class="le-knot"/>`);
-      } else for (const edge of edges) { const b = s.sim.get(edge.to); paths.push(`<path d="${edgePath(s.sim.get(edge.from), b)}" class="${cls(b)}"/>`); }
+      } else for (const edge of edges) paths.push(`<path d="${edgePath(s.sim.get(edge.from), s.sim.get(edge.to))}" class="${cls(edge)}"/>`);
     }
     return paths;
   }
@@ -657,6 +832,10 @@ export function createFlowCanvas(stage, options = {}) {
       box.el.hidden = !b;
       if (b) Object.assign(box.el.style, { transform: `translate(${px(b.x0)}px,${px(b.y0)}px)`, width: `${px(b.x1 - b.x0)}px`, height: `${px(b.y1 - b.y0)}px` });
     }
+    if (s.paint) for (const mark of s.marks.values()) {
+      const transform = `translate(${px(-mark.w / 2)}px,${px(mark.y)}px)`;
+      if (mark.transform !== transform) { mark.transform = transform; mark.el.style.transform = transform; }
+    }
     // When the focus changes the canvas scrolls once to the new card, then locks to it again.
     const focus = s.sim.get(s.focus);
     if (s.follow && focus) {
@@ -711,6 +890,8 @@ export function createFlowCanvas(stage, options = {}) {
     switch (target.dataset.act) {
       case 'toggle':
         if (node.type === 'stack') { if (stacks.has(node.id)) stacks.delete(node.id); else stacks.add(node.id); }
+        // A burst pins open, and a second click lets it fold again.
+        else if (node.type === 'burst') { if (s.ui.bursts.has(node.id)) s.ui.bursts.delete(node.id); else s.ui.bursts.add(node.id); }
         else open.set(node.id, node.open === null ? fallback() : null);
         break;
       case 'iter': { const index = Number(target.dataset.index); open.set(node.id, node.open === index ? null : index); break; }
@@ -777,11 +958,13 @@ export function createFlowCanvas(stage, options = {}) {
     reset() {
       for (const entry of s.sim.values()) { cardSizes.unobserve(entry.el); entry.el.remove(); }
       for (const box of s.frames.values()) box.el.remove();
+      for (const mark of s.marks.values()) mark.el.remove();
       s.sim.clear();
       s.frames.clear();
+      s.marks.clear();
       s.ticking.clear();
       s.index = new Map();
-      s.ui = { open: new Map(), stacks: new Set() };
+      s.ui = { open: new Map(), stacks: new Set(), bursts: new Set() };
       s.sig = '';
       s.snap = true; // the first frame jumps straight to the focus rather than scrolling from the origin
       select(null);
