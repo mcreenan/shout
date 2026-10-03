@@ -192,10 +192,12 @@ export async function startServer({ port = Number(process.env.PORT || 4310), hos
   const url = `http://127.0.0.1:${server.address().port}`;
   const endStreams = () => { for (const stream of [...streams, ...lists.keys()]) stream.end(); streams.clear(); lists.clear(); clearTimeout(listTimer); };
   // Stopping: no new connections or requests, open streams end, sessions close, then any connection left is closed.
-  const close = async () => {
+  // `suspend` (a signal or a desktop disconnect, so a restart) suspends running programs to resume on the next
+  // start; otherwise they are cancelled.
+  const close = async ({ suspend = false } = {}) => {
     closing = true;
     const stopped = new Promise(resolveClosed => server.close(resolveClosed));
-    endStreams(); await store.close(); endStreams(); server.closeAllConnections();
+    endStreams(); await (suspend ? store.suspend() : store.close()); endStreams(); server.closeAllConnections();
     await stopped;
   };
   return { server, store, url, urls: accessUrls(hosts, server.address().port, host), close };
@@ -205,7 +207,8 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const app = await startServer();
   console.log(`\nSHOUT is running. Open one of these addresses:\n${app.urls.map(url => `  ${url}`).join('\n')}\nCtrl+C stops the app.\n`);
   let stopping = false;
-  const stop = async () => { if (stopping) return; stopping = true; await app.close(); process.exit(0); };
+  // A stop is usually a restart (watch mode, the service, the desktop app), so running programs suspend and resume on the next start.
+  const stop = async () => { if (stopping) return; stopping = true; await app.close({ suspend: true }); process.exit(0); };
   process.on('SIGINT', stop); process.on('SIGTERM', stop);
   // A launcher with an IPC channel (the desktop app) learns the bound URLs, and SHOUT stops if that launcher goes away.
   if (process.send) { process.send({ type: 'ready', url: app.url, urls: app.urls }); process.on('disconnect', stop); }

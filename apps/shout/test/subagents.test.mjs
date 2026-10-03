@@ -196,14 +196,15 @@ test('cancelling the session stops every child and leaves no running or queued a
   assert.ok(!session.data.messages.some(message => message.content === 'never'));
 });
 
-test('a restart marks unfinished agents interrupted', async t => {
+test('a restart (a suspend) marks unfinished agents interrupted', async t => {
   const { store, session, stateRoot } = await setup(t, {
     parent: async ({ call }) => { await call('spawn_agents', { purpose: 'long', agents: briefs('a', 'b', 'c', 'd', 'e') }).catch(() => {}); },
     child: async (name, { signal, say }) => { if (name === 'a') return say('quick report'); await untilAbort(signal); },
   });
   store.send(session.data.id, 'Go');
   await waitFor(() => count(session, 'completed') === 1 && count(session, 'running') === 4);
-  await session.persist();
+  await store.suspend();
+  assert.deepEqual([session.data.status, session.data.messages.at(-1).content], ['interrupted', 'Interrupted by restart.']);
   const restored = await new SessionStore({ stateRoot, agent: new ScriptedAgent() }).init();
   const copy = restored.get(session.data.id);
   assert.equal(copy.data.status, 'interrupted');

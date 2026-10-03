@@ -140,17 +140,24 @@ test('a missing workspace folder is reported, then created on request', async t 
   await assert.rejects(store.create({ workspace: resolve(dir, 'a-file'), createWorkspace: true }), /must be a directory/);
 });
 
-test('restart invalidates waiting questions instead of pretending the VM resumed', async t => {
+test('restart asks the pending approval again', async t => {
   const { store, dir } = await setup(t);
   const session = await store.create({ scenario: 'validation' });
   store.send(session.data.id, session.data.suggestedPrompt); await waitFor(() => session.data.question);
-  await session.persist();
-  const restored = await new SessionStore({ stateRoot: dir, agent: new ScriptedAgent() }).init();
+  const changes = session.data.question.prompt.data.value.changes;
+  await store.suspend();
+  assert.deepEqual([session.data.status, session.data.question, session.data.runs[0].state], ['suspended', null, 'suspended']);
+  const restored = await new SessionStore({ stateRoot: dir, agent: new ScriptedAgent(), providerFactory }).init();
+  t.after(() => restored.close());
   const copy = restored.get(session.data.id);
-  assert.equal(copy.data.status, 'interrupted'); assert.equal(copy.data.question, null);
-  assert.equal(copy.data.runs[0].state, 'interrupted');
-  assert.deepEqual([copy.data.messages.at(-1).role, copy.data.messages.at(-1).content], ['system', 'Interrupted by restart.']);
-  await restored.close();
+  assert.equal(copy.data.status, 'resuming');
+  await waitFor(() => copy.data.question);
+  assert.equal(copy.data.status, 'waiting_user');
+  assert.deepEqual(copy.data.question.prompt.data.value.changes, changes, 'the same approval, asked again');
+  assert.equal(copy.data.messages.at(-1).content, 'Resuming `/code` after a restart…');
+  copy.answer(copy.data.question.id, { accept: true }); await copy.task;
+  // The agent started this run, so its turn is over: the session is idle with the result in chat.
+  assert.deepEqual([copy.data.status, copy.data.runs[0].state, copy.data.runs[0].result.output.passed], ['idle', 'completed', true]);
 });
 
 test('HTTP session routes, SSE snapshot, export and local-origin protections work together', async t => {

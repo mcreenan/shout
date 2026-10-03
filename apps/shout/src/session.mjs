@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { readFile, writeFile, mkdir, readdir, rename, rm } from 'node:fs/promises';
+import { rmSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Run } from '../../../prototypes/owned/src/kernel.mjs';
@@ -15,6 +16,8 @@ import { SkillRegistry, commands, buildInput, renderOutput, skillGuide, builtinS
 import { Workspace, scenarios, createScenario } from './workspace.mjs';
 import { ProjectStore } from './projects.mjs';
 import { JoshHost } from './josh-host.mjs';
+import { PROTOCOL } from '../../../prototypes/owned/src/connection.mjs';
+import { JournalWriter, ReplayCursor, readJournal, reconcileIntent, writeIntent, sha256, MAX_RESUMES } from './journal.mjs';
 
 export const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const MAX_AGENT_TOOL_CALLS = 60;
@@ -90,7 +93,19 @@ const budgetHint = (outcome, limits) => {
 };
 // An answer's value in its chat echo: as given, or cut to 500 characters of text (its JSON unless it is a string).
 const echoValue = value => { const json = JSON.stringify(value); return json.length <= 500 ? { value } : { value: `${(typeof value === 'string' ? value : json).slice(0, 499)}…`, truncated: true }; };
-const active = status => ['thinking', 'running', 'waiting_user'].includes(status);
+const active = status => ['thinking', 'running', 'waiting_user', 'resuming'].includes(status);
+// Run states a restart can find a run in: still going, or suspended by a graceful stop.
+const UNFINISHED_RUN = new Set(['starting', 'running', 'waiting_user', 'resuming', 'suspended']);
+const journalPath = (stateRoot, runId) => resolve(stateRoot, 'runs', runId, 'journal.jsonl');
+const RUN_ID = /^run-[A-Za-z0-9-]{1,100}$/;
+// A bounded wait that doesn't keep Node running.
+const delay = ms => new Promise(resolveDelay => setTimeout(resolveDelay, ms).unref());
+// What the agent is told at the start of its next turn about a run it started that resumed after a restart.
+const agentNote = (item, outcome) => {
+  const name = item.skill ? `The /${item.skill} skill` : 'The program you wrote';
+  const end = outcome.state === 'completed' ? `completed. Its result, as shown to the user:\n\n${renderOutput(outcome.result?.output)}` : `${outcome.state}: ${failure(outcome)}`;
+  return clip(`[SHOUT restarted during your previous turn, which was interrupted. ${name} you started then resumed after the restart and ${end}]`);
+};
 const approvalSchema = record({ accept: { type: 'boolean' } });
 const isApprovalSchema = schema => schema?.type === 'object' && JSON.stringify(Object.keys(schema.properties ?? {})) === '["accept"]' && schema.properties.accept.type === 'boolean';
 /** `/name rest` → { name, args }; anything else is conversation. */
@@ -269,9 +284,12 @@ export class CodingSession extends EventEmitter {
     };
     think();
     const thread = { cwd: this.data.workspace, instructions: agentInstructions(this.providerId), context: this.data.threadContext ?? '', tools: agentTools };
+    // A run the agent started before a restart finished without it; it hears how once, with this message.
+    let turnText = text;
+    if (this.data.agentNote) { turnText = `${this.data.agentNote}\n\n${text}`; delete this.data.agentNote; }
     let result; let failed = null;
     try {
-      result = await this.agent.turn(this.data.threadId, text, { signal: controller.signal, model: this.data.model, effort: this.data.effort, thread,
+      result = await this.agent.turn(this.data.threadId, turnText, { signal: controller.signal, model: this.data.model, effort: this.data.effort, thread,
         onEvent: event => {
           if (!current()) return;
           if (event.type === 'message') this.messageRecord('assistant', event.text);
@@ -325,12 +343,13 @@ export class CodingSession extends EventEmitter {
       if (!skill.ok) throw new Error(`The ${skill.name} skill does not compile, so it can't run.`);
       this.event('command.routed', { command: skill.name, args: input.args, routed: true });
       label = `/${skill.name}`;
-      outcome = await this.runSkill(skill, input.args, controller, current, { after: 'thinking' });
+      outcome = await this.runSkill(skill, input.args, controller, current, { after: 'thinking', launch: { by: 'agent' } });
     } else {
       label = 'The program';
       outcome = await this.runGenerated(input.program, input.args || text, controller, current);
     }
     if (!outcome) throw new Error('The task was cancelled');
+    if (outcome.state === 'suspended') throw new Error('SHOUT is restarting; the program will resume after the restart');
     if (outcome.state !== 'completed') {
       // The agent can fix its own program from the failing line, like the compile diagnostics above.
       const line = this.data.runs.find(run => run.id === outcome.id)?.failedAt?.line;
@@ -476,13 +495,17 @@ export class CodingSession extends EventEmitter {
     }
     this.event('tool.completed', { id, tool: 'allen.check', value: { ok: true } });
     const input = buildInput(checked.entry?.input, { args, history: this.history(12), workspace: this.data.workspace, test_command: this.data.testCommand ?? '' });
-    return this.runProgram({ source, input, generated: true, tools: shoutTools, limits: checked.limits, toolHandler: this.skillTools(current), format: output => renderOutput(output), after: 'thinking' }, controller, current);
+    return this.runProgram({ source, input, generated: true, tools: shoutTools, limits: checked.limits, toolHandler: this.skillTools(current), format: output => renderOutput(output), after: 'thinking', launch: { by: 'agent' } }, controller, current);
   }
-  // The tools every skill and generated program gets: host-enforced approvals for writes and shell.
+  // The tools every skill and generated program gets: host-enforced approvals for writes and shell. A program's
+  // calls carry its run's journal `intents` (see runProgram), recorded after approval and before anything changes.
   skillTools(current) {
     return createToolHandler({ workspace: this.workspace,
       approve: request => this.approve(request, current),
-      changed: (changes, changed) => { if (current()) { this.data.changes = changes; this.event('workspace.changed', { run: this.run?.id, changed }); } },
+      // A write finishing while SHOUT suspends is still reported.
+      changed: (changes, changed) => { if (current() || this.suspending) { this.data.changes = changes; this.event('workspace.changed', { run: this.run?.id, changed }); } },
+      beforeApply: (changes, context) => context.intents?.beforeApply(changes, context),
+      beforeRun: (command, context) => context.intents?.beforeRun(command, context),
       checkSkill: text => this.skills.validate(text), listSkills: () => this.skills.list(this.data.workspace), skillGuide });
   }
   async executeCommand({ name, args }, controller, current) {
@@ -509,31 +532,59 @@ export class CodingSession extends EventEmitter {
     }
     await this.runSkill(skill, args, controller, current);
   }
-  async runSkill(skill, args, controller, current, { after } = {}) {
+  async runSkill(skill, args, controller, current, { after, launch } = {}) {
     const { source, limits } = await this.skills.load(skill, { withSource: true });
     if (!current()) return;
     const input = buildInput(skill.entry?.input, { args, history: this.history(12), workspace: this.data.workspace, test_command: this.data.testCommand ?? '' });
-    return this.runProgram({ source, input, skill: skill.name, tools: shoutTools, limits: limits ?? skill.limits ?? RUN_LIMIT_DEFAULTS, toolHandler: this.skillTools(current), format: output => renderOutput(output), after }, controller, current);
+    return this.runProgram({ source, input, skill: skill.name, tools: shoutTools, limits: limits ?? skill.limits ?? RUN_LIMIT_DEFAULTS, toolHandler: this.skillTools(current), format: output => renderOutput(output), after, launch }, controller, current);
   }
   /**
    * Runs a program to its end and reports it in the conversation. `limits` are its budgets (the skill header's, see
    * resolveLimits); "No time limits" overrides `minutes`. `after` is the session status to take afterwards (default: the run's state).
+   * `launch.by` says who started it (`command` or `agent`).
+   *
+   * Every response the run sends JOSH is journaled first (journal.mjs), so a restart can resume it. `resume`
+   * (`{ item, journal, cursor, elapsedMs }`, from resume()) continues an earlier run under its own id and item:
+   * the cursor answers from the journal, then the run goes on live.
    */
-  async runProgram({ source: programSource, input, skill, generated = false, tools, toolHandler, limits = RUN_LIMIT_DEFAULTS, format, after }, controller, current) {
-    this.data.status = 'running';
-    const run = new Run({ provider: this.provider, source: programSource, input, scratchRoot: resolve(this.stateRoot, 'runs'), wallMs: this.data.timeBudgetsEnabled === false ? null : limits.minutes * 60 * 1000, tools,
+  async runProgram({ source: programSource, input, skill, generated = false, tools, toolHandler, limits = RUN_LIMIT_DEFAULTS, format, after, launch = { by: 'command' }, resume = null }, controller, current) {
+    this.data.status = resume ? 'resuming' : 'running';
+    const wallMs = resume ? resume.journal.header.wallMs ?? null : this.data.timeBudgetsEnabled === false ? null : limits.minutes * 60 * 1000;
+    const id = resume?.item.id ?? `run-${randomUUID()}`;
+    const item = resume?.item ?? { id, state: 'starting', source: programSource, counters: {}, limits: { ...limits }, ...(skill ? { skill } : {}), ...(generated ? { generated: true } : {}),
+      input, launch: { by: launch.by, skill: skill ?? null, generated }, resumable: false, resumes: 0 };
+    const journal = this.openJournal(item, { input, limits, wallMs, resume });
+    item.resumable = Boolean(journal);
+    // Writes and commands past their approval, by effect id: a suspend lets them finish so their results are recorded.
+    const underway = new Set();
+    const intents = journal && {
+      beforeApply: async (changes, context) => {
+        if (!context.effectKey) return;
+        const recorded = journal.intent({ key: context.effectKey, digest: context.effectDigest, tool: context.name, changes: await writeIntent(this.workspace, changes) });
+        if (recorded) underway.add(context.effectId);
+      },
+      beforeRun: async (command, context) => {
+        if (context.effectKey && journal.intent({ key: context.effectKey, digest: context.effectDigest, tool: context.name, command })) underway.add(context.effectId);
+      },
+    };
+    const run = new Run({ id, provider: this.provider, source: programSource, input, scratchRoot: resolve(this.stateRoot, 'runs'), wallMs, tools,
       maxModelJudgments: limits.judgments, maxToolCalls: limits.tools, maxUserQuestions: limits.questions,
       ...(this.josh ? { connection: () => this.josh.acquire() } : {}),
+      ...(journal ? { journal } : {}),
+      ...(resume ? { replay: resume.cursor, effectPrefix: `r${item.resumes}-`, elapsedMs: resume.elapsedMs } : {}),
       toolHandler: (name, toolInput, context) => {
-        const operation = Promise.resolve().then(() => toolHandler(name, toolInput, context));
+        const operation = Promise.resolve().then(() => toolHandler(name, toolInput, { ...context, intents }));
         this.pendingTools.add(operation);
         operation.then(() => this.pendingTools.delete(operation), () => this.pendingTools.delete(operation));
         return operation;
       } });
+    run.underway = underway;
     this.run = run;
-    const item = { id: run.id, state: 'starting', source: programSource, counters: {}, limits: { ...limits }, ...(skill ? { skill } : {}), ...(generated ? { generated: true } : {}) }; this.data.runs.push(item);
+    if (!resume) this.data.runs.push(item);
+    // While SHOUT suspends, the run's last events (a write finishing) are still recorded.
+    const live = () => current() || (this.suspending && this.run === run);
     run.on('event', event => {
-      if (!current()) return;
+      if (!live()) return;
       Object.assign(item, run.snapshot());
       if (event.type === 'user.question') {
         this.data.status = 'waiting_user';
@@ -547,25 +598,82 @@ export class CodingSession extends EventEmitter {
       } else if (event.type === 'effect.cancelled' && this.data.question?.id === event.id && this.pendingApproval?.id !== event.id) {
         // The runtime withdrew the program's question (a sibling task stopped the program, say), so it can no longer be answered.
         this.data.question = null; this.data.status = 'running';
-      }
+      } else if (event.type === 'run.resumed' && this.data.status === 'resuming') this.data.status = 'running';
       this.event(event.type, event);
     });
     void run.start();
     const outcome = await run.done;
+    // A suspended run keeps its journal for the next start; any other end deletes it.
+    if (outcome.state === 'suspended') journal?.close();
+    else { try { journal?.discard(); } catch (error) { console.error(`Could not delete the journal of ${id}: ${error.message}`); } }
     // `this.run` is the program running now (they run one at a time), so answers and cancels reach only it.
     if (this.run === run) this.run = null;
-    if (!current()) return;
+    if (outcome.state === 'suspended') { Object.assign(item, outcome); return outcome; }
+    if (!current() && !this.suspending) return;
     Object.assign(item, outcome);
     // A failure inside the program names its line; the message links to it in the Program tab.
     const span = outcome.state === 'failed' ? failureSpan(outcome) : null;
     const line = span && span.line >= 1 && span.line <= programSource.split('\n').length ? span.line : null;
     if (line) item.failedAt = { line, column: span.column, end_line: span.end_line, end_column: span.end_column };
-    this.data.question = null; this.data.status = after ?? outcome.state;
+    // A run that ends while SHOUT suspends (its last write finished) ends the agent's turn too.
+    this.data.question = null; this.data.status = this.suspending ? (launch.by === 'agent' ? 'idle' : outcome.state) : after ?? outcome.state;
     const output = outcome.result?.output;
     if (outcome.state === 'completed') this.messageRecord('assistant', format(output));
     else this.messageRecord('assistant', `${skill ? `\`/${skill}\`` : generated ? 'The program' : 'Workflow'} ${outcome.state}${line ? ` at line ${line}` : ''}: ${failure(outcome)}${skill ? budgetHint(outcome, limits) : ''}`, line ? { failure: { run: run.id, line } } : {});
     this.changed();
     return outcome;
+  }
+  // The run's journal: a new one (written once the program loads) or, resuming, the existing one. Null if it can't be
+  // opened; the run then can't resume after a restart.
+  openJournal(item, { input, limits, wallMs, resume }) {
+    const onStop = error => {
+      console.error(`The journal of ${item.id} stopped, so this run can't resume after a restart: ${error?.message ?? 'unknown error'}`);
+      item.resumable = false; this.changed();
+    };
+    try {
+      if (resume) return new JournalWriter(journalPath(this.stateRoot, item.id), { existing: resume.journal, elapsedMs: resume.elapsedMs, onStop });
+      return new JournalWriter(journalPath(this.stateRoot, item.id), { onStop, header: { run: item.id, session: this.data.id, protocol: PROTOCOL,
+        sourceSha256: sha256(item.source), input, limits, wallMs, launch: item.launch } });
+    } catch (error) {
+      console.error(`Could not open the journal of ${item.id}, so this run can't resume after a restart: ${error.message}`);
+      return null;
+    }
+  }
+  /**
+   * Continues a run a restart cut off (see SessionStore.init): the same source and input on a fresh JOSH
+   * connection, answered from its journal, then live. Approvals and questions that were open are asked again.
+   * A run the agent started posts its result in chat and leaves the agent a note for its next turn.
+   */
+  resume(item, journal) {
+    item.resumes = (item.resumes ?? 0) + 1; item.state = 'resuming';
+    const launch = journal.header.launch ?? item.launch ?? { by: 'command' };
+    this.data.status = 'resuming'; this.data.question = null; this.data.changes = [];
+    this.messageRecord('system', `Resuming ${item.skill ? `\`/${item.skill}\`` : 'the program'} after a restart…`);
+    const controller = new AbortController(); this.controller = controller; const generation = ++this.generation;
+    const current = () => !controller.signal.aborted && generation === this.generation;
+    this.task = this.resumeRun(item, journal, launch, controller, current);
+    return this.task;
+  }
+  async resumeRun(item, journal, launch, controller, current) {
+    try {
+      // The resume count is on disk before anything runs again, so a run that crashes SHOUT is given up on.
+      await this.persist();
+      if (!current()) return;
+      const elapsedMs = journal.entries.reduce((max, entry) => (Number.isInteger(entry.t) && entry.t > max ? entry.t : max), 0);
+      const cursor = new ReplayCursor({ entries: journal.entries, reconcile: intent => reconcileIntent(intent, this.workspace) });
+      const byAgent = launch.by === 'agent';
+      const outcome = await this.runProgram({ source: item.source, input: journal.header.input, skill: item.skill, generated: item.generated === true, tools: shoutTools,
+        toolHandler: this.skillTools(current), limits: journal.header.limits ?? item.limits ?? RUN_LIMIT_DEFAULTS, format: output => renderOutput(output),
+        after: byAgent ? 'idle' : undefined, launch, resume: { item, journal, cursor, elapsedMs } }, controller, current);
+      if (outcome && outcome.state !== 'suspended' && byAgent && current()) { this.data.agentNote = agentNote(item, outcome); this.changed(); }
+    } catch (error) {
+      if (!current()) return;
+      this.data.status = 'failed'; this.data.question = null;
+      this.event('session.error', { message: error.message }); this.messageRecord('assistant', `Stopped: ${error.message}`);
+    } finally {
+      if (this.controller === controller) this.controller = null;
+      try { await this.persist(); } catch (error) { this.emit('storageError', error); }
+    }
   }
   /**
    * Host-enforced approval for tool effects (writes, shell). Resolves true/false; rejects if the run is cancelled.
@@ -632,7 +740,44 @@ export class CodingSession extends EventEmitter {
     return this.snapshot();
   }
   async close() {
+    // A suspended session is saved as it stopped: closing it later must not save over what the next start sees.
+    if (this.suspended) return;
     this.cancel(); this.closed = true; await this.task; await Promise.allSettled([...this.pendingTools]);
+    try { await this.persist(); } catch (error) { this.emit('storageError', error); }
+  }
+  /**
+   * SHOUT is stopping (a signal, a desktop disconnect): a running program is suspended to resume on the next
+   * start, instead of cancelled. The agent's turn and any sub-agents can't resume; a task with no program
+   * running is interrupted. Writes and commands already past their approval get up to 5 s to finish.
+   */
+  async suspend() {
+    if (this.closed) return;
+    const run = this.run;
+    const item = run && this.data.runs.find(candidate => candidate.id === run.id);
+    if (active(this.data.status)) {
+      this.suspending = true;
+      // Ends the agent's turn and sub-agents; the run's own events still reach the session while it suspends.
+      this.generation++; this.controller?.abort();
+      const time = new Date().toISOString();
+      for (const agent of this.data.agents ?? []) if (agent.status === 'queued' || agent.status === 'running') Object.assign(agent, { status: 'interrupted', activity: '', endedAt: time });
+      const snapshot = run && item ? await run.suspend({ keep: effect => run.underway?.has(effect.id) }) : null;
+      this.pendingApproval = null;
+      if (snapshot?.state === 'suspended') {
+        Object.assign(item, snapshot);
+        this.data.status = 'suspended'; this.data.question = null;
+      } else {
+        // The run ended while it suspended, and reported itself; otherwise there was nothing to resume.
+        await Promise.race([this.task, delay(2000)]);
+        if (active(this.data.status)) {
+          this.data.status = 'interrupted'; this.data.question = null;
+          if (item && UNFINISHED_RUN.has(item.state)) item.state = 'interrupted';
+          this.messageRecord('system', 'Interrupted by restart.');
+        }
+      }
+      this.changed();
+    }
+    this.closed = true; this.suspended = true;
+    await Promise.race([Promise.allSettled([this.task, ...this.pendingTools]), delay(3000)]);
     try { await this.persist(); } catch (error) { this.emit('storageError', error); }
   }
 }
@@ -651,9 +796,13 @@ const pickModel = ({ model, effort }, base) => {
  * New threads start on `defaultModel`, or on their project's default model when `modelAvailable(model)` allows it.
  */
 export class SessionStore extends EventEmitter {
-  /** An injected `agent` serves every provider, `agents` ({ codex, claude }) some of them; `providerFactory(data)` replaces the model.request providers. */
-  constructor({ stateRoot, defaultWorkspace = process.cwd(), providerFactory, agent, agents = {}, defaultModel: startModel = defaultModel, modelAvailable = () => true } = {}) {
+  /**
+   * An injected `agent` serves every provider, `agents` ({ codex, claude }) some of them; `providerFactory(data)` replaces the model.request providers.
+   * `resumeRuns` (default true) resumes the programs a restart cut off; false marks them interrupted.
+   */
+  constructor({ stateRoot, defaultWorkspace = process.cwd(), providerFactory, agent, agents = {}, defaultModel: startModel = defaultModel, modelAvailable = () => true, resumeRuns = true } = {}) {
     super();
+    this.resumeRuns = resumeRuns;
     this.stateRoot = resolve(stateRoot ?? resolve(appRoot, '../../.runs/shout'));
     this.defaultWorkspace = resolve(defaultWorkspace); this.providerFactory = providerFactory;
     this.agent = agent ?? null; this.agents = { ...agents };
@@ -678,18 +827,20 @@ export class SessionStore extends EventEmitter {
   async init() {
     await mkdir(resolve(this.stateRoot, 'sessions'), { recursive: true, mode: 0o700 });
     await this.projects.init();
-    const restored = [];
+    const restored = []; const resumes = [];
     for (const name of await readdir(resolve(this.stateRoot, 'sessions'))) {
       if (!/^session-[a-f0-9-]+\.json$/.test(name)) continue;
       try {
         const data = JSON.parse(await readFile(resolve(this.stateRoot, 'sessions', name), 'utf8'));
-        if (active(data.status)) {
-          data.status = 'interrupted'; data.question = null;
-          for (const run of data.runs) if (['starting', 'running', 'waiting_user'].includes(run.state)) run.state = 'interrupted';
-          data.messages.push({ id: randomUUID(), role: 'system', content: 'Interrupted by restart.', time: new Date().toISOString() });
-        }
         for (const agent of data.agents ?? []) if (agent.status === 'queued' || agent.status === 'running') Object.assign(agent, { status: 'interrupted', activity: '', endedAt: agent.endedAt ?? new Date().toISOString() });
-        restored.push(await this.attach(data));
+        const session = await this.attach(data);
+        // A task a restart cut off: its program resumes if it can, and anything else is interrupted.
+        if (active(data.status) || data.status === 'suspended') {
+          const plan = this.resumePlan(data);
+          if (plan?.journal) resumes.push([session, plan]);
+          else this.interrupt(data, plan?.reason);
+        }
+        restored.push(session);
       } catch (error) { console.error(`Could not restore ${name}: ${error.message}`); }
     }
     await this.adoptProjects(restored);
@@ -697,7 +848,36 @@ export class SessionStore extends EventEmitter {
       this.follow(session);
       try { await session.persist(); } catch (error) { console.error(`Could not save ${session.data.id}: ${error.message}`); }
     }
+    for (const [session, { item, journal }] of resumes) void session.resume(item, journal);
     return this;
+  }
+  /**
+   * Whether a session's last run can resume: `{ item, journal }`, `{ reason }` when it was resumable but can't
+   * be resumed now, or null. It must have been unfinished and journaled, with its workspace there, fewer than
+   * MAX_RESUMES resumes so far, and a journal whose header matches the run, its source and the JOSH protocol.
+   */
+  resumePlan(data) {
+    if (!this.resumeRuns) return null;
+    const item = data.runs?.at(-1);
+    if (!item || !UNFINISHED_RUN.has(item.state) || item.resumable !== true || !RUN_ID.test(item.id ?? '')) return null;
+    const name = item.skill ? `\`/${item.skill}\`` : 'The program';
+    if (data.unavailable) return { reason: `${name} could not resume because the workspace folder is missing.` };
+    if ((item.resumes ?? 0) >= MAX_RESUMES) return { reason: `${name} was not resumed again: it had already been resumed ${MAX_RESUMES} times.` };
+    let journal = null;
+    try { journal = readJournal(journalPath(this.stateRoot, item.id)); } catch {}
+    const header = journal?.header;
+    if (!header || header.run !== item.id || header.protocol !== PROTOCOL || header.sourceSha256 !== sha256(item.source ?? '')) return { reason: `${name} could not resume: its journal is missing or does not match the run.` };
+    return { item, journal };
+  }
+  // Today's restart behaviour: the task and its unfinished run are interrupted, and their journals deleted.
+  interrupt(data, reason) {
+    data.status = 'interrupted'; data.question = null;
+    for (const run of data.runs) {
+      if (!UNFINISHED_RUN.has(run.state)) continue;
+      run.state = 'interrupted';
+      if (RUN_ID.test(run.id ?? '')) rmSync(journalPath(this.stateRoot, run.id), { force: true });
+    }
+    data.messages.push({ id: randomUUID(), role: 'system', content: reason ? `Interrupted by restart. ${reason}` : 'Interrupted by restart.', time: new Date().toISOString() });
   }
   // Threads saved before projects (or whose project is gone) join the project for their folder, made on
   // first sight; a scenario's scratch copy becomes a sample project. The latest thread's test command wins.
@@ -796,7 +976,9 @@ export class SessionStore extends EventEmitter {
     await Promise.all(sessions.map(async session => {
       await session.saveQueue.catch(() => {});
       const file = resolve(this.stateRoot, 'sessions', `${session.data.id}.json`);
-      await Promise.all([rm(file, { force: true }), rm(`${file}.tmp`, { force: true })]);
+      // Its runs' directories (journals) go with it.
+      const runs = (session.data.runs ?? []).filter(run => RUN_ID.test(run.id ?? '')).map(run => rm(resolve(this.stateRoot, 'runs', run.id), { recursive: true, force: true }));
+      await Promise.all([rm(file, { force: true }), rm(`${file}.tmp`, { force: true }), ...runs]);
       session.emit('deleted', { id: session.data.id });
     }));
   }
@@ -842,6 +1024,12 @@ export class SessionStore extends EventEmitter {
   list() { return [...this.sessions.values()].map(s => s.summary()).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)); }
   async close() {
     await Promise.all([...this.sessions.values()].map(s => s.close()));
+    for (const agent of [this.agent, ...Object.values(this.agents)]) agent?.close?.();
+    this.josh.close();
+  }
+  /** Stops for a restart: running programs are suspended to resume on the next start (see CodingSession.suspend), then everything closes. */
+  async suspend() {
+    await Promise.all([...this.sessions.values()].map(s => s.suspend()));
     for (const agent of [this.agent, ...Object.values(this.agents)]) agent?.close?.();
     this.josh.close();
   }
