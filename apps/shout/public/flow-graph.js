@@ -6,6 +6,13 @@ import { buildFlow, LOOPS, loopTitle, stepFailed, toolResult, branchLabel, spanT
 
 const READ_TOOL = /read|inspect|search|list|git\.run|find|guide|check/;
 const isContext = (step) => step.kind === 'tool' && READ_TOOL.test(step.label) && !/edit|apply|write|test|commit/.test(step.label);
+const isWrite = (step) => /edit|apply|patch|write|create/.test(step.label);
+/** What a tool call does, as the verb its compact card or burst row shows (and picks its icon by). */
+export function toolKind(label = '') {
+  if (label === 'agents.spawn') return 'agent';
+  for (const [kind, pattern] of [['test', /test/], ['edit', /edit|apply|patch/], ['write', /write|create/], ['search', /search|find|grep/], ['list', /list/], ['git', /^git\./], ['read', /read|inspect|guide|check/], ['run', /shell|command|exec|run/]]) if (pattern.test(label)) return kind;
+  return 'tool';
+}
 const isHub = (step) => step.pair === 'model' || step.pair === 'chat';
 const shown = (message) => message.role === 'user' || message.role === 'assistant';
 const taskOf = (step) => step.events.find((event) => event.type === 'model.started')?.prompt?.system?.slice(0, 120) || step.pair;
@@ -154,13 +161,13 @@ function messageNode(message, actor) {
 }
 const chipOf = (entry, ctx) => entry && { ...branchLabel(entry, ctx), line: entry.line };
 // What a step came to, in a few words: a tool's result or argument, a judgment's summary, a question's title.
-function outcomeOf(step) {
+function outcomeOf(step, max = 90) {
   if (!step) return '';
   if (step.pair === 'model') {
     // Only the latest attempt's answer: a retry in progress has none yet.
     const value = (step.attempts?.at(-1)?.events ?? step.events).findLast((event) => event.type === 'model.completed')?.value;
     const text = [value?.summary, value?.markdown, value?.text].find((candidate) => typeof candidate === 'string' && candidate.trim());
-    return text ? clip(text.replace(/\*\*|`/g, ''), 90) : '';
+    return text ? clip(text.replace(/\*\*|`/g, ''), max) : '';
   }
   return (step.pair === 'tool' && toolResult(step)) || step.detail || '';
 }
@@ -181,6 +188,48 @@ function summary(steps, { any = true } = {}) {
   const current = steps.find((step) => isLive(statusOf(step))) || steps.at(-1);
   return { start, end, status, failed, activity: activity(current), outcome: outcomeOf(current), pips: steps.map(pip) };
 }
+
+/* Importance. Size is information density: tier 1 (messages, judgments, questions, failures, whatever is live)
+   is a full card; tier 2 (calls with side effects, fan-outs to sub-agents) and tier 3 (reads, notes) settle to
+   one line once done. Structure (groups, stacks, tracks) keeps its card. */
+function tierOf(node) {
+  if (['msg', 'hub', 'approval'].includes(node.type) || isLive(node.status) || (node.step && stepFailed(node.step))) return 1;
+  if (node.type === 'tool') return isContext(node.step) ? 3 : 2;
+  return node.type === 'note' ? 3 : node.type === 'fleet' || node.type === 'burst' ? 2 : 1;
+}
+// A burst's strip: reads are quiet, passing tests green, failures red.
+function burstPip(step) {
+  const passed = step.events.findLast((event) => event.type === 'tool.completed')?.value?.passed === true;
+  const kind = stepFailed(step) ? 'x' : isContext(step) ? 'a' : passed ? 'ok' : 't';
+  return isLive(statusOf(step)) ? `${kind} live` : kind;
+}
+const basename = (path) => String(path).split('/').filter(Boolean).pop() || String(path);
+// The files a write touched: what it reported changing, else what it was asked to change.
+function writtenFiles(step) {
+  const changed = step.events.findLast((event) => event.type === 'tool.completed')?.value?.changed;
+  if (Array.isArray(changed)) return changed;
+  const input = step.events.find((event) => event.type === 'tool.started')?.input || {};
+  return [input.path, ...(input.paths || []), ...[...(input.changes || []), ...(input.edits || [])].map((change) => change?.path)].filter((path) => typeof path === 'string');
+}
+/** A burst folded to one line: counts by kind, failures by tool, and the files written. */
+function burstSummary(steps) {
+  const mix = { read: 0, edit: 0, test: 0, run: 0, other: 0 };
+  for (const step of steps) mix[isContext(step) ? 'read' : isWrite(step) ? 'edit' : toolKind(step.label) === 'test' ? 'test' : toolKind(step.label) === 'run' ? 'run' : 'other']++;
+  const fails = new Map();
+  for (const step of steps) if (stepFailed(step)) fails.set(step.label, (fails.get(step.label) || 0) + 1);
+  const writes = [...new Set(steps.filter(isWrite).flatMap(writtenFiles).map(basename))];
+  return { mix, fails: [...fails].map(([label, count]) => ({ label, count })), writes, pips: steps.map(burstPip) };
+}
+// When a row's work happened. A question's span ends when it was asked: the wait for you is idle time.
+function spanOfNode(node) {
+  if (node.message) { const at = Date.parse(node.message.time); return [at, at]; }
+  if (node.step) {
+    const start = Math.min(node.step.start, ...(node.inputs || []).map((step) => step.start));
+    return [start, node.step.pair === 'user' ? node.step.start : node.step.end ?? node.step.start];
+  }
+  return [node.start, node.end ?? node.start];
+}
+const IDLE = 5 * 60_000; // a pause this long between rows gets a marker
 
 // The prose older sessions recorded for an answer (session.mjs `answer`).
 const ECHO_PROSE = /^(?:Apply these changes(?: and run the configured tests)?\.|Decline these changes\.|Decline this command\.|Run `[\s\S]+`\.|Answered: [\s\S]+)$/;
@@ -209,21 +258,30 @@ function timeline(session, segments, now) {
 }
 
 /**
- * Phases: the session as rows of nodes. Without control-flow data, reads fan in to the judgment they
- * inform and edits, approvals and tests fan out of it; consecutive same-task judgments share a row.
- * With it, steps follow their program: loops become stacks (one step per iteration) or groups (tiles,
- * one iteration expanded in a frame), await blocks become parallel tracks, branches become chips.
- * `ui` holds the canvas's choices: `open` (group id → iteration index, or null once closed by hand)
- * and `stacks` (ids of stacks listing their steps). `actor` ({ name, kind }) says whose replies these
- * are when the canvas shows a sub-agent. A fan-out to sub-agents (`agents.spawn`) is a fleet node alone in its row.
- * Returns { rows: [{ key, kind, ids, open, close }], nodes, edges, frames, focus, index } where rows
- * name the frames that start before / end after them and `index` maps step and message ids to
- * { step | message, segment, node } (node: the id of the card showing it).
+ * Phases: the session as rows of nodes. Consecutive tool calls with nothing between them are one burst
+ * (a single call stays a plain card); reads that end at a judgment are its `inputs`, drawn inside its card;
+ * an approval of the action just before it docks under that action's card (`dock` / `docked`), with no
+ * edge between. Without control-flow data consecutive same-task judgments share a row. With it, steps
+ * follow their program: loops become stacks (one step per iteration) or groups (tiles, one iteration
+ * expanded in a frame), await blocks become parallel tracks, branches become chips; bursts form within
+ * one container. `ui` holds the canvas's choices: `open` (group id → iteration index, or null once closed
+ * by hand), `stacks` (ids of stacks listing their steps) and `bursts` (ids of bursts pinned open; a burst
+ * is open anyway while it is current: it holds the live step, or is the newest node of a live session).
+ * `actor` ({ name, kind }) says whose replies these are when the canvas shows a sub-agent. A fan-out to
+ * sub-agents (`agents.spawn`) is a fleet node alone in its row. Every node has a `tier` (tierOf).
+ * Returns { rows: [{ key, kind, ids, open, close, gap, idle }], nodes, edges, frames, focus, index } where
+ * rows name the frames that start before / end after them, `gap` says how far a row sits from the one
+ * before ('chain', 'turn' before your message or a run, 'dock' flush) and `idle` the ms of a pause of
+ * IDLE or more before it; edges carry `weight` ('spine', 'side' into a secondary card beside others,
+ * 'turn' into your message) and `idle`; `index` maps step and message ids to { step | message, segment,
+ * node } (node: the id of the card showing it).
  */
 export function phases({ session, events, now = Date.now(), live = false, ui = {}, actor = null }) {
   const choices = ui.open || new Map();
   const stacks = ui.stacks || new Set();
+  const pinned = ui.bursts || new Set();
   const nodes = [];
+  const byId = new Map();
   const edges = [];
   const rows = [];
   const frames = [];
@@ -236,6 +294,7 @@ export function phases({ session, events, now = Date.now(), live = false, ui = {
   const row = (kind, extra = {}) => { close(); open = { key: `row${rows.length}`, kind, ids: [], from: anchors, open: opening, close: [], ...extra }; opening = []; rows.push(open); return open; };
   const add = (node, target) => {
     nodes.push(node);
+    byId.set(node.id, node);
     target.ids.push(node.id);
     for (const frame of filling) frame.members.push(node.id);
     for (const source of target.from) edges.push({ from: source, to: node.id });
@@ -254,19 +313,71 @@ export function phases({ session, events, now = Date.now(), live = false, ui = {
     rows.at(-1).close.push(frame.key);
     if (filling.length) filling.at(-1).below = Math.max(filling.at(-1).below, frame.below + 1);
   };
+  // The card in the row still accepting nodes, when it is a burst (or the single call that may become one).
+  const openBurst = () => (open?.kind === 'burst' ? byId.get(open.ids[0]) : null);
+  const callsOf = (node) => (node.type === 'burst' ? node.steps : [node.step]);
+  // A node changing identity (a call becoming a burst) keeps its row, frames, incoming edges and index entries.
+  const swap = (old, node) => {
+    nodes[nodes.indexOf(old)] = node;
+    byId.delete(old.id);
+    byId.set(node.id, node);
+    open.ids[0] = node.id;
+    for (const edge of edges) if (edge.to === old.id) edge.to = node.id;
+    for (const frame of filling) frame.members = frame.members.map((id) => (id === old.id ? node.id : id));
+    for (const step of callsOf(old)) index.get(step.id).node = node.id;
+  };
+  // Takes the open burst back off the canvas (its reads become a judgment's inputs): the next row is fed
+  // by what fed it and opens the frames it opened.
+  const unplace = (node) => {
+    const gone = open;
+    open = null;
+    rows.pop();
+    nodes.splice(nodes.indexOf(node), 1);
+    byId.delete(node.id);
+    for (let i = edges.length - 1; i >= 0; i--) if (edges[i].to === node.id) edges.splice(i, 1);
+    for (const frame of filling) frame.members = frame.members.filter((id) => id !== node.id);
+    anchors = gone.from;
+    opening = [...gone.open, ...opening];
+  };
+  // A call joins the burst before it unless it enters a branch (its chip would be lost inside).
+  const call = (node) => {
+    const prev = !node.chip && openBurst();
+    if (!prev) return add(node, row('burst'));
+    let burst = prev;
+    if (prev.type !== 'burst') { burst = { id: `burst:${prev.id}`, type: 'burst', kind: 'tool', status: prev.status, steps: [prev.step], ...(prev.chip && { chip: prev.chip }) }; swap(prev, burst); }
+    burst.steps.push(node.step);
+    index.get(node.step.id).node = burst.id;
+    return burst;
+  };
   const leaf = (step, segment, chip, heuristic) => {
     const node = stepNode(step);
     if (chip) node.chip = chip;
     index.set(step.id, { step, segment, node: node.id });
-    if (!heuristic || node.type === 'fleet') return add(node, row(node.type === 'fleet' ? 'fleet' : 'step'));
-    if (isHub(step)) {
+    if (node.type === 'fleet') return add(node, row('fleet'));
+    if (node.type === 'tool') return call(node);
+    const prev = openBurst();
+    if (node.type === 'approval' && step.label === 'Approval' && prev && !opening.length) {
+      // It gates the action just before it: one unit, the approval flush under the action's card.
+      Object.assign(node, { dock: prev.id });
+      prev.docked = node.id;
+      const target = row('dock');
+      target.from = [];
+      return add(node, target);
+    }
+    if (node.type === 'hub' && prev && callsOf(prev).every((input) => isContext(input) && !stepFailed(input))) {
+      // The reads that led straight to this judgment are its inputs, inside its card. A failed one stays a card.
+      unplace(prev);
+      node.inputs = callsOf(prev);
+      for (const input of node.inputs) index.get(input.id).node = node.id;
+      if (prev.chip && !node.chip) node.chip = prev.chip;
+    }
+    if (node.type === 'hub' && step.pair === 'model') node.outcome = outcomeOf(step, 280);
+    if (heuristic && node.type === 'hub') {
       const task = taskOf(step);
-      // Another batch of the same judgment joins its siblings' row, fed by the same inputs.
+      // Another batch of the same judgment joins its siblings' row.
       return add(node, open?.kind === 'hub' && open.task === task ? open : row('hub', { task }));
     }
-    if (isContext(step)) return add(node, open?.kind === 'context' ? open : row('context'));
-    // Actions fan out of the same judgment until something else happens.
-    return add(node, open?.kind === 'action' ? open : row('action'));
+    return add(node, row('step'));
   };
   const hide = (steps, ctx, id) => { for (const step of steps) index.set(step.id, { step, segment: ctx.segment, node: id }); };
   const single = (items) => items.length === 1 && items[0].type === 'step';
@@ -359,6 +470,34 @@ export function phases({ session, events, now = Date.now(), live = false, ui = {
   // SHOUT's closing reply, once the run is over, is the answer: it renders in full.
   const last = nodes.at(-1);
   if (!live && last?.type === 'msg' && last.message.role === 'assistant') last.final = true;
+  for (const node of nodes) {
+    if (node.type === 'burst') {
+      const { start, end, status, failed } = summary(node.steps);
+      const current = node.steps.some((step) => isLive(statusOf(step))) || (live && node === last);
+      Object.assign(node, { start, end, failed, ...burstSummary(node.steps), current, pinned: pinned.has(node.id), open: current || pinned.has(node.id),
+        // Its failures show as chips; the card itself is not a failure.
+        status: isLive(status) || status === 'stale' ? status : 'ok' });
+    }
+    node.tier = tierOf(node);
+  }
+  // Spacing: tight within a turn, loose before your next message or a run, flush under a dock; a long pause gets a marker.
+  const rowOf = new Map();
+  let before = null;
+  for (const item of rows) {
+    const members = item.ids.map((id) => byId.get(id));
+    for (const node of members) rowOf.set(node.id, item);
+    const spans = members.map(spanOfNode);
+    const span = [Math.min(...spans.map(([start]) => start)), Math.max(...spans.map(([, end]) => end))];
+    const turn = (item.kind === 'message' && members[0].kind === 'user') || item.open.some((key) => key.startsWith('run:'));
+    item.gap = !before ? null : item.kind === 'dock' ? 'dock' : turn ? 'turn' : 'chain';
+    item.idle = before && item.gap !== 'dock' && span[0] - before[1] >= IDLE ? span[0] - before[1] : 0;
+    before = span;
+  }
+  for (const edge of edges) {
+    const to = byId.get(edge.to);
+    const side = to.tier > 1 && (rowOf.get(edge.to).ids.length > 1 || rowOf.get(edge.from).ids.length > 1);
+    Object.assign(edge, { weight: to.type === 'msg' && to.kind === 'user' ? 'turn' : side ? 'side' : 'spine', idle: rowOf.get(edge.to).idle > 0 });
+  }
   const active = nodes.filter((node) => isLive(node.status));
-  return { rows: rows.map(({ key, kind, ids, open: starts, close: ends }) => ({ key, kind, ids, open: starts, close: ends })), nodes, edges, frames, focus: (active.at(-1) || nodes.at(-1))?.id, index };
+  return { rows: rows.map(({ key, kind, ids, open: starts, close: ends, gap, idle }) => ({ key, kind, ids, open: starts, close: ends, gap, idle })), nodes, edges, frames, focus: (active.at(-1) || nodes.at(-1))?.id, index };
 }

@@ -79,8 +79,10 @@ test('a loop of single steps is a stack; a loop of several steps is a group of t
   const open = graph(s, undefined, { ui: { open: new Map([[group.id, 2]]), stacks: new Set([stack.id]) } });
   const frame = open.frames.find((candidate) => candidate.kind === 'group');
   assert.equal(open.nodes.find((node) => node.id === stack.id).open, true);
-  assert.deepEqual(frame.members.map((id) => open.nodes.find((node) => node.id === id).type), ['group', 'tool', 'hub']);
-  assert.equal(open.index.get(frame.members[1]).node, frame.members[1]);
+  assert.deepEqual(frame.members.map((id) => open.nodes.find((node) => node.id === id).type), ['group', 'hub'], 'the iteration\'s read is its judgment\'s input');
+  const hub = open.nodes.find((node) => node.id === frame.members[1]);
+  assert.deepEqual(hub.inputs.map((step) => step.label), ['workspace.read']);
+  assert.equal(open.index.get(hub.inputs[0].id).node, hub.id);
   const rows = open.rows.filter((row) => row.open.includes(frame.key) || row.close.includes(frame.key));
   assert.deepEqual(rows.map((row) => row.kind), ['group', 'step'], 'the frame opens at the group row and closes after the iteration');
 });
@@ -103,9 +105,10 @@ test('a loop that ran once reads as its framed body', () => {
   const s = script().run('run');
   s.call('run', 'workspace.read', { origin: at([loop(1)]) }).call('run', 'model', { origin: at([loop(1)]) }).call('run', 'tests.run', { origin: at([loop(1)]) }).end('run');
   const g = graph(s);
-  assert.deepEqual(g.nodes.map((node) => node.type), ['tool', 'hub', 'tool']);
+  assert.deepEqual(g.nodes.map((node) => node.type), ['hub', 'tool']);
   const frame = g.frames.find((candidate) => candidate.kind === 'loop');
-  assert.deepEqual([frame.label, frame.count, frame.ended, frame.members.length], ['for attempt in 0..3', 1, true, 3]);
+  assert.deepEqual([frame.label, frame.count, frame.ended, frame.members.length], ['for attempt in 0..3', 1, true, 2]);
+  assert.deepEqual(g.rows[0].open, ['run:run', frame.key], 'the judgment\'s row opens the frames its inputs opened');
   assert.equal(g.frames.find((candidate) => candidate.kind === 'run').below, 1, 'the run frame pads around the loop frame inside it');
 });
 
@@ -175,16 +178,16 @@ test('a construct compiled twice (an or-pattern arm) groups by its span, not its
   assert.deepEqual(shape(scopeTree(stepsOf(s))), [{ loop: '/for100-180#1', iterations: [['git.run'], ['git.run']] }]);
 });
 
-test('without control-flow data, reads share a row; with it, sequential steps never fan out', () => {
+test('without control-flow data, consecutive calls are one burst; with it, sequential steps never fan out', () => {
   const plain = script().run('run');
   for (const query of ['TODO', 'FIXME', 'HACK']) plain.call('run', 'workspace.search', { input: { query } });
   plain.end('run');
-  assert.deepEqual(graph(plain).rows.map((row) => [row.kind, row.ids.length]), [['context', 3]]);
+  assert.deepEqual(graph(plain).rows.map((row) => [row.kind, row.ids.length]), [['burst', 1]]);
   const traced = script().run('run');
   ['TODO', 'FIXME', 'HACK'].forEach((query, i) => traced.call('run', 'workspace.search', { input: { query }, origin: at([loop(i + 1)]) }));
   traced.call('run', 'workspace.list', { origin: at([]) }).call('run', 'workspace.read', { origin: at([]) });
   traced.end('run');
-  assert.deepEqual(graph(traced).rows.map((row) => [row.kind, row.ids.length]), [['stack', 1], ['step', 1], ['step', 1]]);
+  assert.deepEqual(graph(traced).rows.map((row) => [row.kind, row.ids.length]), [['stack', 1], ['burst', 1]]);
 });
 
 test('steps without an origin stay where the step before them was', () => {
@@ -255,21 +258,21 @@ test('messages stamped inside a run follow it', () => {
   const s = script().run('run').call('run', 'workspace.read', { ms: 50 }).call('run', 'workspace.list').end('run');
   const inside = new Date(Date.parse(s.events.find((event) => event.type === 'tool.started').time) + 5).toISOString();
   const g = graph(s, undefined, { messages: [{ id: 'm', role: 'assistant', content: 'Working', time: inside }] });
-  assert.deepEqual(g.nodes.map((node) => node.type), ['tool', 'tool', 'msg']);
+  assert.deepEqual(g.nodes.map((node) => node.type), ['burst', 'msg']);
 });
 
 // Sessions captured from the real skills on the real JOSH VM (scripted agent and judgments), trimmed.
 const fixture = (name) => JSON.parse(readFileSync(new URL(`./fixtures/${name}`, import.meta.url), 'utf8'));
 const LATER = Date.parse('2027-01-01T00:00:00Z');
 const runNodes = (g, data, name) => { const run = data.runs.find((item) => (item.skill || (item.generated ? 'program' : '')) === name); const frame = g.frames.find((item) => item.key === `run:${run.id}`); return frame.members.map((id) => g.nodes.find((node) => node.id === id)); };
-const describeNode = (node) => (node.type === 'group' || node.type === 'stack' ? `${node.type} ${node.title} ×${node.iterations?.length ?? node.steps.length}${node.failed ? ` ✗${node.failed}` : ''}` : node.type === 'track' ? `track ${node.title}` : `${node.step.label}${node.chip ? ` [${node.chip.label}]` : ''}`);
+const describeNode = (node) => (node.type === 'group' || node.type === 'stack' ? `${node.type} ${node.title} ×${node.iterations?.length ?? node.steps.length}${node.failed ? ` ✗${node.failed}` : ''}` : node.type === 'track' ? `track ${node.title}` : node.type === 'burst' ? `burst ×${node.steps.length}` : `${node.step.label}${node.chip ? ` [${node.chip.label}]` : ''}${node.inputs ? ` ← ${node.inputs.map((step) => step.label).join(', ')}` : ''}`);
 
 test('captured runs of the real skills draw their loops, branches and parallel tasks', () => {
   const data = fixture('flow-real-skills.json');
   const g = phases({ session: data, events: data.events, now: LATER, live: false });
   assert.deepEqual(runNodes(g, data, 'todo').map(describeNode), ['stack workspace.search ×3']);
   assert.deepEqual(runNodes(g, data, 'find').map(describeNode), ['workspace.search']);
-  assert.deepEqual(runNodes(g, data, 'review').map(describeNode), ['git.run', 'git.run', 'git.run', 'workspace.read_many', 'git.run [then]', 'stack git.run ×36', 'stack Model ×12']);
+  assert.deepEqual(runNodes(g, data, 'review').map(describeNode), ['burst ×4', 'git.run [then]', 'stack git.run ×36', 'stack Model ×12'], 'a call entering a branch starts its own card');
   const program = runNodes(g, data, 'program');
   assert.deepEqual(program.map(describeNode), ['track size_of("a.mjs")', 'track size_of("b.mjs")', 'track size_of("c.mjs")', 'track count("HACK")', 'track count("NOTE")', 'group for folder in ["src", "test"] ×2', 'stack workspace.list ×3', 'Model [1..=99 | 100..=999]']);
   const whileLoop = program.find((node) => node.title === 'workspace.list');
@@ -287,7 +290,7 @@ test('a captured /code run on a scenario: three attempts, two failing, each thro
   const [inspect, group] = runNodes(g, data, 'code');
   assert.deepEqual([describeNode(inspect), describeNode(group), group.iterations.map((iteration) => iteration.status)], ['workspace.inspect', 'group for attempt in 0..3 ×3 ✗2', ['failed', 'failed', 'ok']]);
   const open = phases({ session: data, events: data.events, now: LATER, live: false, ui: { open: new Map([[group.id, 2]]) } });
-  assert.deepEqual(runNodes(open, data, 'code').slice(1).map(describeNode), ['group for attempt in 0..3 ×3 ✗2', 'workspace.inspect [then]', 'Model', 'workspace.edit', 'Approval', 'tests.run']);
+  assert.deepEqual(runNodes(open, data, 'code').slice(1).map(describeNode), ['group for attempt in 0..3 ×3 ✗2', 'Model [then] ← workspace.inspect', 'workspace.edit', 'Approval', 'tests.run'], 'the inspect is the judgment\'s input and its branch chip moves there');
 });
 
 test('a retried judgment inside a loop is one card and does not disturb the iterations, live or after', () => {
@@ -295,8 +298,8 @@ test('a retried judgment inside a loop is one card and does not disturb the iter
   const [group] = runNodes(phases({ session: data, events: data.events, now: LATER, live: false }), data, 'rate');
   const open = phases({ session: data, events: data.events, now: LATER, live: false, ui: { open: new Map([[group.id, 1]]) } });
   const inside = runNodes(open, data, 'rate').slice(1);
-  assert.deepEqual(inside.map((node) => [node.step.label, node.status, node.step.attempts?.length]), [['workspace.read', 'ok', undefined], ['Model', 'ok', 2]], 'a retry adds no card to its iteration');
-  assert.ok(inside[1].step.end - inside[1].step.start > 1500, 'its time covers both attempts');
+  assert.deepEqual(inside.map((node) => [node.step.label, node.status, node.step.attempts?.length, node.inputs.map((step) => step.label)]), [['Model', 'ok', 2, ['workspace.read']]], 'a retry adds no card to its iteration');
+  assert.ok(inside[0].step.end - inside[0].step.start > 1500, 'its time covers both attempts');
   // Live, the second attempt keeps its card active and its iteration open; the rejected answer is not quoted.
   const cut = data.events.findIndex((event) => event.type === 'model.started' && event.attempt === 2);
   const live = phases({ session: { ...data, runs: data.runs.map((item) => ({ ...item, state: 'running' })) }, events: data.events.slice(0, cut + 1), now: LATER, live: true });
@@ -334,4 +337,132 @@ test('a long session with a long loop stays quick to build', () => {
   const elapsed = performance.now() - started;
   assert.equal(g.nodes.length, 6);
   assert.ok(elapsed < 400, `built in ${Math.round(elapsed)}ms`);
+});
+
+/* Importance, bursts, inputs, docking and spacing. */
+const byLabel = (g) => Object.fromEntries(g.nodes.map((node) => [node.type === 'burst' ? `burst ×${node.steps.length}` : node.step?.label || node.message.content, node]));
+
+test('tiers: messages, judgments, approvals, failures and the live node are primary; calls secondary; reads and notes ambient', () => {
+  const s = script().run('run');
+  s.call('run', 'workspace.read').call('run', 'model').call('run', 'workspace.edit').approval('run');
+  s.call('run', 'tests.run', { value: { passed: false } }).call('run', 'model');
+  s.call('run', 'workspace.list').emit('session.cancelled', { run: 'run' });
+  s.call('run', 'model').call('run', 'workspace.edit', { open: true });
+  const g = graph(s, undefined, { live: true, messages: [{ id: 'm', role: 'user', content: 'Go', time: new Date(T0).toISOString() }] });
+  const tiers = g.nodes.map((node) => [node.type === 'msg' ? 'msg' : node.step.label, node.tier]);
+  assert.deepEqual(tiers, [['msg', 1], ['Model', 1], ['workspace.edit', 2], ['Approval', 1], ['tests.run', 1], ['Model', 1], ['workspace.list', 3], ['Cancelled', 3], ['Model', 1], ['workspace.edit', 1]]);
+  assert.equal(g.nodes.find((node) => node.step?.label === 'Model').inputs[0].label, 'workspace.read');
+  // Settled, the last edit falls to its tier.
+  s.emit('tool.completed', { run: 'run', effectId: 'r-9', value: {} }); s.emit('effect.resolved', { run: 'run', effectId: 'r-9' });
+  assert.equal(graph(s, undefined, { live: true }).nodes.at(-1).tier, 2);
+});
+
+test('consecutive calls are one burst; judgments, approvals and messages end it; every step maps to its card', () => {
+  const s = script().run('run');
+  s.call('run', 'workspace.read', { input: { path: 'test/helpers.mjs' } }).call('run', 'workspace.search', { input: { query: 'retry' } });
+  s.call('run', 'workspace.edit', { input: { path: 'src/josh/connection.mjs' }, value: { changed: ['src/josh/connection.mjs'] } });
+  s.call('run', 'workspace.write', { input: { path: 'test/retry.test.mjs' } });
+  s.call('run', 'tests.run', { value: { passed: false, output: 'not ok 1 - retry' } });
+  s.call('run', 'model');
+  s.call('run', 'workspace.edit', { input: { path: 'src/kernel.mjs' } }).approval('run').call('run', 'tests.run', { value: { passed: true } });
+  s.end('run');
+  const g = graph(s);
+  assert.deepEqual(g.nodes.map((node) => node.type), ['burst', 'hub', 'tool', 'approval', 'tool']);
+  const [burst] = g.nodes;
+  assert.equal(burst.id, `burst:${burst.steps[0].id}`);
+  assert.deepEqual(burst.mix, { read: 2, edit: 2, test: 1, run: 0, other: 0 });
+  assert.deepEqual(burst.fails, [{ label: 'tests.run', count: 1 }]);
+  assert.deepEqual(burst.writes, ['connection.mjs', 'retry.test.mjs'], 'what a write reported changing, else what it was asked to change');
+  assert.deepEqual(burst.pips, ['a', 'a', 't', 't', 'x']);
+  assert.deepEqual([burst.status, burst.tier, burst.failed], ['ok', 2, 1], 'its failures are chips, not a failed card');
+  for (const step of burst.steps) assert.equal(g.index.get(step.id).node, burst.id);
+  assert.equal(g.index.get(g.nodes[2].step.id).node, g.nodes[2].id, 'a single call is its own card');
+  assert.deepEqual(g.rows.map((row) => row.kind), ['burst', 'hub', 'burst', 'dock', 'burst']);
+});
+
+test('with control-flow data, bursts form only within one container; a call entering a branch starts its own', () => {
+  const branch = { kind: 'if', construct: 7, line: 8, column: 5, branch: 'then' };
+  const s = script().run('run');
+  s.call('run', 'workspace.list', { origin: at([]) }).call('run', 'workspace.read', { origin: at([]) });
+  for (let i = 1; i <= 3; i++) s.call('run', 'git.run', { origin: at([loop(i)]) });
+  s.call('run', 'workspace.read', { origin: at([]) }).call('run', 'workspace.edit', { origin: at([branch]) }).call('run', 'tests.run', { origin: at([branch]) });
+  s.end('run');
+  const g = graph(s);
+  assert.deepEqual(g.nodes.map(describeNode), ['burst ×2', 'stack git.run ×3', 'workspace.read', 'burst ×2']);
+  assert.equal(g.nodes.at(-1).chip.label, 'then', 'the burst carries the branch its first call entered');
+});
+
+test('a burst is open while it holds the live step, folds once the next node is live, and stays open when pinned', () => {
+  const s = script().run('run');
+  s.call('run', 'workspace.read').call('run', 'workspace.edit').call('run', 'tests.run', { open: true });
+  const live = graph(s, undefined, { live: true });
+  assert.deepEqual([live.nodes[0].type, live.nodes[0].current, live.nodes[0].open, live.nodes[0].status, live.focus], ['burst', true, true, 'active', live.nodes[0].id]);
+  s.emit('tool.completed', { run: 'run', effectId: 'r-3', value: { passed: true } }); s.emit('effect.resolved', { run: 'run', effectId: 'r-3' });
+  assert.equal(graph(s, undefined, { live: true }).nodes[0].open, true, 'between effects it is still the newest node');
+  s.call('run', 'model', { open: true });
+  const next = graph(s, undefined, { live: true });
+  const [burst, hub] = next.nodes;
+  assert.deepEqual([burst.current, burst.open, burst.tier, hub.status, next.focus], [false, false, 2, 'active', hub.id]);
+  const pinned = graph(s, undefined, { live: true, ui: { bursts: new Set([burst.id]) } });
+  assert.deepEqual([pinned.nodes[0].pinned, pinned.nodes[0].open], [true, true]);
+});
+
+test('reads that lead straight to a judgment become its inputs; mixed, failed or live reads stay a burst', () => {
+  const s = script().run('run');
+  s.call('run', 'workspace.search', { input: { query: 'reconnect' } }).call('run', 'workspace.read', { input: { path: 'src/kernel.mjs' } });
+  const reading = graph(s, undefined, { live: true });
+  assert.deepEqual(reading.nodes.map((node) => node.type), ['burst'], 'until the judgment starts they are a burst');
+  s.call('run', 'model', { open: true });
+  const g = graph(s, undefined, { live: true });
+  const [hub] = g.nodes;
+  assert.deepEqual([g.nodes.length, hub.type, hub.inputs.map((step) => step.label)], [1, 'hub', ['workspace.search', 'workspace.read']]);
+  for (const step of hub.inputs) assert.equal(g.index.get(step.id).node, hub.id, 'an input maps to the judgment card');
+  assert.deepEqual(g.edges, [], 'nothing draws into the inputs');
+  const mixed = script().run('run').call('run', 'workspace.read').call('run', 'workspace.edit').call('run', 'model');
+  assert.deepEqual(graph(mixed).nodes.map((node) => [node.type, node.inputs?.length]), [['burst', undefined], ['hub', undefined]]);
+  const failed = script().run('run').call('run', 'workspace.inspect', { failed: 'Too big' }).call('run', 'model');
+  assert.deepEqual(graph(failed).nodes.map((node) => node.type), ['tool', 'hub'], 'a failure is never folded away');
+});
+
+test('an approval docks under the action it gates: one unit, no edge into it, the next edge leaves from it', () => {
+  const s = script().run('run');
+  s.call('run', 'model').call('run', 'workspace.edit').approval('run').call('run', 'tests.run', { value: { passed: true } });
+  s.call('run', 'model').approval('run');
+  s.end('run');
+  const g = graph(s);
+  const [, edit, approval, tests, , late] = g.nodes;
+  assert.deepEqual([approval.dock, edit.docked], [edit.id, approval.id]);
+  assert.equal(g.rows.find((row) => row.ids.includes(approval.id)).gap, 'dock');
+  assert.ok(!g.edges.some((edge) => edge.to === approval.id));
+  assert.ok(g.edges.some((edge) => edge.from === approval.id && edge.to === tests.id));
+  assert.equal(late.dock, undefined, 'an approval after a judgment gates no action');
+});
+
+test('spacing: loose before your message or a run, tight within it; a long pause gets a marker and a dotted edge', () => {
+  const s = script();
+  s.emit('chat.started', { label: 'SHOUT agent' }); s.wait(10); s.emit('chat.completed', { tool: 'run_skill' });
+  s.wait(20).run('run').call('run', 'model').call('run', 'workspace.edit').approval('run');
+  s.wait(18 * 60_000).call('run', 'tests.run', { value: { passed: true } }).end('run');
+  const reply = new Date(T0 + 18 * 60_000 + 2_000).toISOString();
+  const g = graph(s, undefined, { messages: [
+    { id: 'm1', role: 'user', content: 'Go', time: new Date(T0).toISOString() },
+    { id: 'm2', role: 'assistant', content: 'Done.', time: reply },
+    { id: 'm3', role: 'user', content: 'Thanks', time: new Date(T0 + 30 * 60_000).toISOString() },
+  ] });
+  assert.deepEqual(g.rows.map((row) => [row.kind, row.gap, Math.round(row.idle / 60_000)]), [
+    ['message', null, 0], ['hub', 'chain', 0], ['hub', 'turn', 0], ['burst', 'chain', 0], ['dock', 'dock', 0], ['burst', 'chain', 18], ['message', 'chain', 0], ['message', 'turn', 12],
+  ], 'the wait for an answer counts as the pause');
+  const into = (kind) => g.edges.filter((edge) => g.rows.find((row) => row.ids.includes(edge.to)).kind === kind);
+  assert.deepEqual(into('burst').map((edge) => edge.idle), [false, true]);
+  assert.deepEqual(g.edges.filter((edge) => edge.weight === 'turn').map((edge) => edge.to), ['m3'], 'a turn edge leads into your message');
+});
+
+test('edges into a secondary card beside others are side branches; the chain is the spine', () => {
+  const s = script();
+  for (let i = 0; i < 2; i++) { s.emit('chat.started', { label: 'SHOUT agent' }); s.wait(10); s.emit('chat.completed', {}); }
+  s.call(null, 'workspace.edit');
+  s.emit('chat.started', { label: 'SHOUT agent' }); s.wait(10); s.emit('chat.completed', {});
+  const g = graph(s);
+  assert.deepEqual(g.rows.map((row) => [row.kind, row.ids.length]), [['hub', 2], ['burst', 1], ['hub', 1]]);
+  assert.deepEqual(g.edges.map((edge) => edge.weight), ['side', 'side', 'spine']);
 });
