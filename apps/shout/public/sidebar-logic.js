@@ -2,7 +2,7 @@
 // No DOM and no storage, so it runs under node:test as well as in the page.
 export const STATUS = { working: 'Working', approval: 'Approval', input: 'Input', failed: 'Failed', done: 'Done' };
 const PRIORITY = ['approval', 'input', 'working', 'failed', 'done'];
-const WORKING = new Set(['starting', 'thinking', 'running', 'waiting_user']);
+const WORKING = new Set(['starting', 'thinking', 'running', 'waiting_user', 'resuming', 'suspended']);
 const FINISHED = new Set(['completed', 'idle']);
 // Project monogram colours (Tailwind hues): 700 on light backgrounds, 400 on dark ones.
 export const PALETTE = [

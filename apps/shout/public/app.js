@@ -16,7 +16,8 @@ const state = { chatMode: localStorage.getItem('shout.chatMode') === 'flow' ? 'f
 const terminal = new Set(['completed', 'failed', 'cancelled', 'canceled', 'interrupted', 'idle', 'ready']);
 const VIEWS = { trace: { label: 'Events', icon: 'i-list' }, changes: { label: 'Changes', icon: 'i-diff' } };
 const PROGRAM = { label: 'Program', icon: 'i-code' };
-const ACTIVE_RUN = new Set(['starting', 'running', 'waiting_user']);
+// `resuming`: replaying its journal after a restart. `suspended`: stopped by a restart, to resume on the next start.
+const ACTIVE_RUN = new Set(['starting', 'running', 'waiting_user', 'resuming', 'suspended']);
 const LANES = [['You', 'user'], ['SHOUT', 'harness'], ['Model', 'model'], ['ALLEN', 'vm'], ['Tools', 'tool']];
 const SCOPE_LABEL = { workspace: 'Workspace', user: 'User', builtin: 'Built-in', command: 'Command' };
 // Panes for file and visualization tabs, keyed by tab ID. The chat pane is the static #chat-pane element.
@@ -135,6 +136,11 @@ function runCard(run) {
     at.addEventListener('click', () => showProgramLine(run.id, failure.line));
     card.append(at);
   } else if (['failed', 'interrupted', 'cancelled'].includes(run.state)) card.append(el('span', 'run-state', stateText(run.state)));
+  else if (run.state === 'resuming' || run.state === 'suspended') {
+    const pill = el('span', `run-state run-${run.state}`, run.state === 'resuming' ? 'resuming' : 'suspended');
+    pill.title = run.state === 'resuming' ? 'Resuming after a restart: replaying what this run already did' : 'Stopped by a restart; it resumes when SHOUT starts again';
+    card.append(pill);
+  }
   const all = runSteps(run);
   const actions = el('div', 'run-card-actions');
   if (all.length) {

@@ -15,11 +15,11 @@ const spanOf = (entry) => ({ line: entry.line, column: entry.column, endLine: en
 const shortName = (name) => String(name || '').split('::').pop();
 const isLive = (status) => status === 'active' || status === 'waiting';
 const statusOf = (step) => (step.status === 'active' && step.pair === 'user' ? 'waiting' : step.status);
-// Canvas-worthy steps: calls and questions, errors and cancellations. Effect placeholders, the agent
+// Canvas-worthy steps: calls and questions, errors, cancellations and resumes after a restart. Effect placeholders, the agent
 // thread's start, program loading, routing and workspace-change notes are noise or shown elsewhere.
 const visible = (step) => !step.orphan && (step.pair
   ? step.pair !== 'effect' && !(step.pair === 'chat' && step.events.some((event) => event.type === 'chat.completed' && event.thread))
-  : ['session.error', 'session.cancelled'].includes(step.instant));
+  : ['session.error', 'session.cancelled', 'run.resuming'].includes(step.instant));
 
 /* Control flow: a run's steps as a tree of loops (one container per iteration), parallel blocks (one
    track per task) and steps. Pure; everything degrades to a flat list when steps carry no origin. */

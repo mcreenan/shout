@@ -395,6 +395,9 @@ body.dragging-tab .resizer{pointer-events:none}
 .state-dot.completed{background:var(--ok)}.state-dot.failed,.state-dot.interrupted{background:var(--danger)}.state-dot.question{background:var(--warn)}
 .state-dot.active{background:var(--accent-text);animation:pulse 1.2s infinite}
 .run-state{font-size:var(--fs-sm);color:var(--danger);white-space:nowrap}
+/* A run picking up after a restart: a quiet pill, not an error. */
+.run-state.run-resuming,.run-state.run-suspended{color:var(--accent-text);background:var(--accent-soft);padding:1px 8px;border-radius:999px}
+.run-state.run-resuming{animation:pulse 1.2s infinite}
 /* "failed at line N" and a failure message's "line N" open the Program tab there; they read as links. */
 .run-failed-at,.message-line{border-radius:var(--radius-xs);text-underline-offset:3px}
 .run-failed-at:hover,.message-line:hover{text-decoration:underline}

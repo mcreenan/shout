@@ -1,6 +1,6 @@
 # SHOUT runtime improvements: implementation plan
 
-Status: planned 2026-10-03. Written against SHOUT `3cc3ebf`, JOSH `abb8a97` plus patches 0001–0009 (protocol `josh/1.8`). Every phase is host-side: **no JOSH patch is needed.**
+Status: implemented 2026-10-03, all four phases (phase 4 notes under "As built" below). Planned 2026-10-03, written against SHOUT `3cc3ebf`, JOSH `abb8a97` plus patches 0001–0009 (protocol `josh/1.8`). Every phase is host-side: **no JOSH patch is needed.**
 
 Four phases, implemented in order:
 
@@ -307,6 +307,16 @@ Also:
 3. The server comes back and the thread shows "Resuming `/code`…".
 4. No model call is repeated and the approval card appears once.
 5. Accepting completes the run.
+
+### As built
+
+- **Keys leave out task numbers and loop instances.** Both count across tasks, so they depend on how concurrent tasks interleave (a real run of two spawned tasks gave their loops instances 1 and 2 in arrival order). A task is named by its spawn chain instead (each `spawn` entry's function and instruction under its enclosing scope), and `call` entries keep their instruction. A scope JOSH truncated keeps the task and instances. ALLEN tasks share no mutable state, so with these keys only the order of requests depends on interleaving, and ordered release takes care of that.
+- **Entries are released synchronously.** The cursor calls the kernel to answer each entry as it releases it, so frames go to JOSH in recorded order and the budgets in `run.resumed` are exact.
+- **The catalog digest is JOSH's**, from the `catalog/set` result (descriptions are not part of it), kept on the connection as `catalogDigest`.
+- **Pending at the restart** also covers a request JOSH cancelled: it has no response entry, so it is held like an unknown one until JOSH cancels it again.
+- **A suspend that finds no program running** (the agent thinking, sub-agents) interrupts the task at once, rather than leaving it to the next start; `SessionStore.init` still interrupts any task it finds active without a resumable run.
+- **Watch mode.** Node 26's `--watch` sends SIGTERM and waits for the child to exit, with no timeout, also when the watcher itself is stopped, so watch restarts always get the whole suspend. The desktop app allows 5 s before SIGKILL; a longer suspend falls back to the crash path.
+- **No JOSH change was needed.**
 
 ---
 

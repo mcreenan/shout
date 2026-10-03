@@ -150,6 +150,23 @@ export function buildFlow(events, { live = false, now = Date.now() } = {}) {
     const type = event.type || '';
 
     if (type === 'run.started') { segment.start = ms(event); segment.events.push(event); continue; }
+    // A run resumed after a restart: what was open before it can't finish (open questions are asked again under
+    // new effect IDs), and a marker says where the run picked up and how much of it the journal replayed.
+    if (type === 'run.resuming') {
+      for (const [openKey, step] of open) {
+        if (step.run !== segment.run) continue;
+        Object.assign(step, { status: 'stale', end: ms(event) }); closeAttempt(step, 'stale'); open.delete(openKey);
+      }
+      segment.events.push(event);
+      addStep(segment, event, { kind: 'harness', label: 'Resumed after restart', detail: '', end: ms(event), status: 'instant', instant: type });
+      continue;
+    }
+    if (type === 'run.resumed') {
+      const marker = segment.steps.findLast((step) => step.instant === 'run.resuming');
+      if (marker) { marker.detail = `replayed ${plural(Number.isInteger(event.replayed) ? event.replayed : 0, 'steps')}`; record(marker, event); }
+      segment.events.push(event);
+      continue;
+    }
     if (type === 'run.terminal') { segment.end = ms(event); segment.state = event.state || 'completed'; segment.events.push(event); continue; }
     if (type === 'vm.event') { segment.events.push(event); continue; }
     if (type === 'program.loaded') segment.program = event;

@@ -275,3 +275,20 @@ test('a failed run fails at its recorded line, else at its result span in the pr
   for (const state of ['stopped', 'cancelled', 'interrupted']) assert.equal(runFailure({ state, source, failedAt, result: { error: { message: 'x', span } } }), null, state);
   assert.equal(runFailure(null), null);
 });
+
+test('a resumed run marks the steps open before the restart stale and adds a marker with the replayed count', () => {
+  const events = [at(0, 'run.started', { run }),
+    at(1, 'effect.requested', { run, effectId: 'r-1' }), at(2, 'tool.started', { run, effectId: 'r-1', tool: 'workspace.read' }), at(3, 'tool.completed', { run, effectId: 'r-1' }), at(4, 'effect.resolved', { run, effectId: 'r-1' }),
+    at(5, 'effect.requested', { run, effectId: 'r-2' }), at(6, 'tool.started', { run, effectId: 'r-2', tool: 'workspace.edit' }), at(7, 'user.question', { run, effectId: 'approval-1', host: true, title: 'Apply 1 file change?' }),
+    at(100, 'run.resuming', { run }), at(101, 'run.resumed', { run, replayed: 1 }),
+    at(102, 'effect.requested', { run, effectId: 'r1-r-2' }), at(103, 'tool.started', { run, effectId: 'r1-r-2', tool: 'workspace.edit' }), at(104, 'user.question', { run, effectId: 'approval-2', host: true, title: 'Apply 1 file change?' })];
+  const segments = buildFlow(events, { live: true });
+  assert.equal(segments.length, 1, 'the resumed run continues its segment');
+  const [segment] = segments;
+  assert.deepEqual(segment.steps.map((step) => [step.label, step.status]), [
+    ['workspace.read', 'ok'], ['workspace.edit', 'stale'], ['Approval', 'stale'], ['Resumed after restart', 'instant'], ['workspace.edit', 'active'], ['Approval', 'active']]);
+  assert.equal(segment.steps[1].end, Date.UTC(2026, 0, 1) + 100, 'a stale step ends at the restart');
+  assert.equal(segment.steps[3].detail, 'replayed 1 step');
+  assert.equal(segment.state, 'running');
+  assert.equal(buildFlow([...events.slice(0, 9), at(101, 'run.resumed', { run, replayed: 4 })])[0].steps[3].detail, 'replayed 4 steps');
+});

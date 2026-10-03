@@ -369,6 +369,16 @@ export fn main(args: String) returns Int {
   await page.screenshot({ path: resolve(screenshotDir, 'session-failed-line.png') });
   await page.getByRole('tab', { name: 'Chat' }).click();
   assert.ok(await page.locator('#messages .message').last().getByRole('button', { name: 'Open the program at line 3' }).isVisible());
+  // A run resuming after a restart has a "resuming" pill on its card while it replays its journal.
+  Object.assign(trapping.data.runs[0], { state: 'resuming' }); trapping.data.status = 'resuming'; trapping.changed();
+  const resumingPill = page.locator('.run-card .run-state.run-resuming');
+  await resumingPill.waitFor();
+  assert.equal(await resumingPill.innerText(), 'resuming');
+  assert.equal(await page.locator('#status-text').innerText(), 'resuming');
+  assert.ok(await page.getByRole('button', { name: 'Cancel run', exact: true }).isVisible(), 'a resuming run can be cancelled');
+  await page.screenshot({ path: resolve(screenshotDir, 'session-resuming.png') });
+  Object.assign(trapping.data.runs[0], { state: 'failed' }); trapping.data.status = 'failed'; trapping.changed();
+  await resumingPill.waitFor({ state: 'detached' });
   await page.setViewportSize({ width: 390, height: 844 }); await page.reload();
   await page.getByRole('button', { name: 'Toggle sidebar' }).click();
   await page.locator('#sidebar .sb-thread').first().waitFor();
