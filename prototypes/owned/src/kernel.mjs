@@ -13,9 +13,12 @@ const tool = { name: 'review_draft', version: '1.0.0', description: 'Write one s
   error_schema: record({ message: textField }), effects: [], idempotency: 'non_idempotent' };
 /** Thrown by a tool handler to return the tool's declared `{ message }` error to the program. */
 export class ToolError extends Error {}
+/** A resumed run that cannot continue (its replay diverged, or its program or catalog changed). The run ends `interrupted`. */
+export class ResumeError extends Error {}
 // Leaves room for the response envelope inside the negotiated max_frame_bytes.
 const maxToolResultBytes = limits.max_frame_bytes - 64 * 1024;
-const terminal = state => ['completed', 'failed', 'cancelled', 'stopped', 'interrupted'].includes(state);
+// `suspended` ends this process's part of a run that resumes after a restart (see suspend()).
+const terminal = state => ['completed', 'failed', 'cancelled', 'stopped', 'interrupted', 'suspended'].includes(state);
 // JOSH sends at most 16 validation issues with 256-byte paths; the events keep the same bound.
 const boundedIssues = issues => (Array.isArray(issues) ? issues : []).slice(0, 16)
   .map(issue => ({ path: String(issue?.path ?? '').slice(0, 256), code: String(issue?.code ?? '').slice(0, 64) }));
@@ -61,9 +64,24 @@ export class Run extends EventEmitter {
   /**
    * `connection`, if given, returns (a promise of) a handshaken JoshConnection for this run's tools, which
    * the run releases when it ends. Without it the run opens its own one-shot connection and closes it.
+   *
+   * Opt-in resume hooks (all default off):
+   * - `id`: the run (and JOSH execution) id, to resume a run under its own id.
+   * - `journal`: records every response before it is sent: `describe(method, params)` gives an effect its
+   *   `{ key, digest, at }`, `begin({ artifactDigest, catalogDigest })` binds it to the loaded program (it may
+   *   throw a ResumeError), and `append(entry)` records `response`, `error` and `cancelled` entries.
+   * - `replay`: a replay cursor (see apps/shout/src/journal.mjs) that answers requests from a journal first.
+   *   Replayed effects emit no events and VM events are not passed on until the replay is done.
+   * - `effectPrefix`: put before JOSH's wire id in effect ids, since a resumed execution numbers them from 1 again.
+   * - `elapsedMs`: wall time already used, before a restart.
    */
-  constructor({ provider, source, input, scratchRoot, wallMs = DEFAULT_RUN_WALL_MS, tools = [tool], toolHandler, maxModelJudgments = 3, maxToolCalls = 16, maxUserQuestions = 8, connection }) {
+  constructor({ provider, source, input, scratchRoot, wallMs = DEFAULT_RUN_WALL_MS, tools = [tool], toolHandler, maxModelJudgments = 3, maxToolCalls = 16, maxUserQuestions = 8, connection,
+    id, journal = null, replay = null, effectPrefix = '', elapsedMs = 0 }) {
     super();
+    if (id !== undefined && !/^run-[A-Za-z0-9-]{1,100}$/.test(id)) throw new Error('Invalid run id');
+    if (!Number.isInteger(elapsedMs) || elapsedMs < 0) throw new Error('Elapsed time must be a non-negative integer');
+    if (typeof effectPrefix !== 'string' || !/^[A-Za-z0-9-]*$/.test(effectPrefix)) throw new Error('Invalid effect prefix');
+    this.journal = journal; this.replay = replay; this.effectPrefix = effectPrefix; this.elapsedMs = elapsedMs; this.replaying = Boolean(replay);
     if (connection !== undefined && typeof connection !== 'function') throw new Error('Connection factory must be a function');
     this.connectionFactory = connection;
     if (wallMs !== null && (!Number.isInteger(wallMs) || wallMs < 1 || wallMs > 2 * 60 * 60 * 1000)) throw new Error('Wall-time budget must be 1–7200000 ms or null');
@@ -85,7 +103,7 @@ export class Run extends EventEmitter {
     if (toolHandler !== undefined && typeof toolHandler !== 'function') throw new Error('Tool handler must be a function');
     if (this.tools.some(definition => definition.name !== tool.name) && !toolHandler) throw new Error('Custom tools require a tool handler');
     this.toolHandler = toolHandler; this.maxModelJudgments = maxModelJudgments; this.maxToolCalls = maxToolCalls; this.maxUserQuestions = maxUserQuestions;
-    this.id = `run-${randomUUID()}`; this.state = 'starting'; this.provider = provider;
+    this.id = id ?? `run-${randomUUID()}`; this.state = 'starting'; this.provider = provider;
     this.source = source; this.input = input; this.wallMs = wallMs;
     this.scratch = resolve(scratchRoot, this.id); this.effects = new Map(); this.events = [];
     // interaction_id -> the effect of its latest attempt, to link JOSH's re-asks to rejected answers.
@@ -107,23 +125,29 @@ export class Run extends EventEmitter {
   async start() {
     if (this.started) throw new Error('A run may start only once');
     this.started = true;
-    this.event('run.started', { sourceBytes: Buffer.byteLength(this.source), wallMs: this.wallMs });
+    // A resumed run continues its run's events: it doesn't start again.
+    this.event(this.replay ? 'run.resuming' : 'run.started', { sourceBytes: Buffer.byteLength(this.source), wallMs: this.wallMs });
+    const remainingMs = this.wallMs === null ? null : Math.max(1, this.wallMs - this.elapsedMs);
     this.timer = this.wallMs === null ? null : setTimeout(() => this.finish('failed', {
       outcome: 'failed', error: `Host wall-time budget expired after ${this.wallMs} ms (${this.wallMs / 1000} seconds)`,
-    }), this.wallMs);
+    }), remainingMs);
     try {
       await mkdir(this.scratch, { recursive: true });
       if (terminal(this.state)) return;
-      const handlers = { executionId: this.id, onRequest: frame => this.dispatch(frame),
+      const handlers = { executionId: this.id, onRequest: frame => { this.replay?.activity(); return this.dispatch(frame); },
         onNotification: frame => {
+          this.replay?.activity();
           if (terminal(this.state)) return;
           if (frame.kind === 'cancel') {
-            const effect = this.effects.get(`${this.id}:${frame.id}`);
+            const effect = this.effects.get(`${this.id}:${this.effectPrefix}${frame.id}`);
             if (effect) {
-              effect.abort.abort(); this.effects.delete(effect.id); this.settleState();
-              this.event('effect.cancelled', { id: effect.id });
+              effect.abort.abort(); this.effects.delete(effect.id); this.replay?.withdraw(effect); this.settleState();
+              if (effect.announced) {
+                this.record(effect, { type: 'cancelled' });
+                this.event('effect.cancelled', { id: effect.id });
+              }
             }
-          } else this.event('vm.event', { method: frame.method, detail: frame.params });
+          } else if (!this.replaying) this.event('vm.event', { method: frame.method, detail: frame.params });
         }, onFailure: error => this.finish('interrupted', { outcome: 'interrupted', error: error.message }) };
       let connection;
       if (this.connectionFactory) {
@@ -139,14 +163,33 @@ export class Run extends EventEmitter {
       // With debug information JOSH also returns the program's static construct and effect-site
       // tables; `origin.scope[].construct` and `origin.site.id` refer to them.
       const tables = loaded.debug ? { sites: loaded.debug.effect_sites, constructs: loaded.debug.constructs } : {};
-      this.state = 'running'; this.event('program.loaded', { artifactDigest: loaded.artifact_digest, tools: loaded.required_tools, ...tables });
+      this.journal?.begin({ artifactDigest: loaded.artifact_digest, catalogDigest: connection.catalogDigest ?? null });
+      if (terminal(this.state)) return;
+      if (this.replay) {
+        this.state = 'resuming';
+        this.replay.start({
+          onDone: replayed => {
+            if (terminal(this.state)) return;
+            this.replaying = false; this.settleState();
+            this.event('run.resumed', { replayed, counters: { ...this.counters } });
+          },
+          onDiverge: error => this.finish('interrupted', { outcome: 'interrupted', error: error.message }),
+          release: (effect, entry) => this.replayEffect(effect, entry),
+        });
+      } else { this.state = 'running'; this.event('program.loaded', { artifactDigest: loaded.artifact_digest, tools: loaded.required_tools, ...tables }); }
       const result = await connection.start({ execution_id: this.id, program_id: loaded.program_id,
         artifact_digest: loaded.artifact_digest, entry: 'main', input: this.input, working_directory: null,
-        granted_capabilities: [], granted_tools: loaded.required_tools, allowed_http_origins: [], granted_exec: [], granted_exec_environment: [], limits: this.wallMs === null ? {} : { wall_ms: this.wallMs } });
+        granted_capabilities: [], granted_tools: loaded.required_tools, allowed_http_origins: [], granted_exec: [], granted_exec_environment: [], limits: remainingMs === null ? {} : { wall_ms: remainingMs } });
+      // A resumed execution that ends before its recording does took another path: its result can't stand.
+      if (this.replaying && !terminal(this.state)) {
+        this.finish('interrupted', { outcome: 'interrupted', error: 'Could not resume after the restart: the program ended before the recording did, so it took another path.' }, { clean: true });
+        return;
+      }
       const state = result.outcome === 'completed' ? 'completed' : result.outcome === 'cancelled' ? 'cancelled' : result.outcome === 'stopped' ? 'stopped' : 'failed';
       // JOSH finished the execution, so the connection can serve another run.
       this.finish(state, result, { clean: true });
     } catch (error) {
+      if (error instanceof ResumeError) { this.finish('interrupted', { outcome: 'interrupted', error: error.message }); return; }
       // A source program that does not compile fails program/load with the compiler's diagnostics.
       const diagnostics = error.wire?.data?.diagnostics;
       if (Array.isArray(diagnostics) && diagnostics.length) {
@@ -156,13 +199,27 @@ export class Run extends EventEmitter {
     }
   }
   async dispatch(frame) {
-    if (terminal(this.state)) return;
+    // A suspending run answers nothing new: JOSH is about to stop, and the request is asked again on resume.
+    if (terminal(this.state) || this.suspending) return;
     const { id: wireId, method, params } = frame;
     if (params.execution_id !== this.id) throw new Error('Cross-execution provider request');
-    const id = `${this.id}:${wireId}`;
+    const id = `${this.id}:${this.effectPrefix}${wireId}`;
     if (this.effects.has(id)) throw new Error('Duplicate provider request');
     const effect = { id, wireId, method, params, state: 'pending', abort: new AbortController() };
     this.effects.set(id, effect); this.counters.providerRequests++;
+    if (this.journal) Object.assign(effect, this.journal.describe(method, params));
+    // Resuming: the journal answers first. After the replay it still reconciles a write or command that was under way.
+    if (this.replay) {
+      let decision;
+      try { decision = await this.replay.offer(effect); }
+      catch (error) {
+        if (this.isPending(effect)) this.finish('interrupted', { outcome: 'interrupted', error: error.message, ...siteSpan(params.origin) });
+        return;
+      }
+      if (!this.isPending(effect) || decision?.replayed) return;
+      if (decision?.synthesized) effect.synthesized = decision.synthesized;
+    }
+    effect.announced = true;
     // Where the effect came from: its source site, enclosing loops (with iterations), branches, calls and task.
     const origin = params.origin && typeof params.origin === 'object' ? { origin: params.origin } : {};
     // Typed responses: JOSH validates each answer itself and, while the prompt's max_attempts allows,
@@ -206,7 +263,7 @@ export class Run extends EventEmitter {
         Object.assign(this.interactions.get(params.interaction_id), { unparseable, codec: effect.codec, answer: value });
         const valid = !unparseable && !schemaErrors(effect.schema, value);
         this.event('model.completed', { id, value: unparseable ? null : value, ...(valid ? {} : { valid: false }) });
-        this.respond(effect, { value: unparseable ? UNPARSEABLE : effect.codec.toWire(value) });
+        this.respond(effect, { value: unparseable ? UNPARSEABLE : effect.codec.toWire(value) }, { answer: unparseable ? undefined : value, valid, ...(unparseable ? { unparseable: true } : {}) });
       } else if (method === 'tool/invoke') {
         const definition = this.toolMap.get(params.tool);
         if (!definition) throw new Error('Unknown host tool');
@@ -215,8 +272,18 @@ export class Run extends EventEmitter {
         this.counters.nativeToolCalls++;
         this.event('tool.started', { id, tool: params.tool, input: params.input, ...origin });
         let value; let artifact;
-        if (this.toolHandler) {
-          try { value = await this.toolHandler(params.tool, params.input, { signal: effect.abort.signal, effectId: id }); }
+        if (effect.synthesized) {
+          // A write or command that was under way at a restart, reconciled from its intent (journal.mjs).
+          if (effect.synthesized.outcome === 'error') {
+            const declared = { message: String(effect.synthesized.error?.message ?? 'Tool failed').slice(0, 2048) };
+            validate(definition.error_schema, declared);
+            this.event('tool.failed', { id, tool: params.tool, error: declared, reconciled: true });
+            this.respond(effect, { outcome: 'error', error: declared });
+            return;
+          }
+          value = effect.synthesized.value;
+        } else if (this.toolHandler) {
+          try { value = await this.toolHandler(params.tool, params.input, { signal: effect.abort.signal, effectId: id, ...(effect.key ? { effectKey: effect.key, effectDigest: effect.digest } : {}) }); }
           catch (error) {
             // A declared tool error is ordinary program data (the generated Error.Declared
             // variant); any other handler failure still fails the run.
@@ -245,7 +312,7 @@ export class Run extends EventEmitter {
           this.respond(effect, { outcome: 'error', error: declared });
           return;
         }
-        this.event('tool.completed', { id, tool: params.tool, value, ...(artifact ? { artifact } : {}) });
+        this.event('tool.completed', { id, tool: params.tool, value, ...(artifact ? { artifact } : {}), ...(effect.synthesized ? { reconciled: true } : {}) });
         this.respond(effect, { outcome: 'ok', value });
       } else if (method === 'user/ask') {
         effect.codec = callbackCodec(params.response_schema.descriptor); effect.schema = effect.codec.schema;
@@ -265,16 +332,42 @@ export class Run extends EventEmitter {
     }
   }
   isPending(effect) { return !terminal(this.state) && this.effects.get(effect.id) === effect && !effect.abort.signal.aborted; }
-  // While any question is open the run waits for its user.
+  // While any question is open the run waits for its user; a resumed run is `resuming` until its replay is done.
   settleState() {
-    if (!terminal(this.state)) this.state = [...this.effects.values()].some(e => e.method === 'user/ask') ? 'waiting_user' : 'running';
+    if (!terminal(this.state)) this.state = this.replaying ? 'resuming' : [...this.effects.values()].some(e => e.method === 'user/ask' && e.announced) ? 'waiting_user' : 'running';
   }
   // The response frame is encoded before the effect leaves the pending set. One that cannot be
   // sent (larger than a JOSH frame) throws with the effect still pending: dispatch then fails the
   // run, and answer() leaves the question open for another answer.
-  respond(effect, result) {
+  respond(effect, result, extra = {}) {
     if (!this.isPending(effect)) return;
-    this.commit(effect, this.connection.encode({ kind: 'response', id: effect.wireId, result }));
+    const frame = this.connection.encode({ kind: 'response', id: effect.wireId, result });
+    this.record(effect, { type: 'response', result, ...extra });
+    this.commit(effect, frame);
+  }
+  // Journals an entry for an effect, before its frame is written.
+  record(effect, entry) {
+    if (this.journal && effect.key) this.journal.append({ ...entry, key: effect.key, digest: effect.digest, at: effect.at, method: effect.method });
+  }
+  // Answers an effect from the journal: the recorded frame is sent again and the budgets count it, with no events.
+  replayEffect(effect, entry) {
+    if (!this.isPending(effect)) return;
+    const { method, params } = effect;
+    const typed = method === 'model/request' || method === 'user/ask';
+    if (method === 'model/request') this.counters.modelJudgments++;
+    else if (method === 'tool/invoke') this.counters.nativeToolCalls++;
+    else if (method === 'user/ask') this.counters.userQuestions++;
+    // A live retry after the replay maps its issues through the answer it re-asks about.
+    if (typed && typeof params.interaction_id === 'string') {
+      let codec = null;
+      try { codec = callbackCodec(params.response_schema.descriptor); } catch {}
+      this.interactions.set(params.interaction_id, { id: effect.id, attempt: Number.isInteger(params.attempt) ? params.attempt : 1,
+        unparseable: entry.unparseable === true, codec, answer: entry.answer });
+    }
+    const frame = this.connection.encode({ kind: 'response', id: effect.wireId, ...(entry.type === 'error' ? { error: entry.error } : { result: entry.result }) });
+    this.effects.delete(effect.id); this.counters.automaticProviderReplies++;
+    this.connection.write(frame);
+    this.settleState();
   }
   commit(effect, frame) {
     this.effects.delete(effect.id); this.counters.automaticProviderReplies++;
@@ -286,6 +379,7 @@ export class Run extends EventEmitter {
     if (!this.isPending(effect)) return;
     const text = String(message).slice(0, 1024);
     const frame = this.connection.encode({ kind: 'response', id: effect.wireId, error: { code, message: text } });
+    this.record(effect, { type: 'error', error: { code, message: text } });
     this.effects.delete(effect.id);
     this.connection.write(frame);
     this.event('effect.rejected', { id: effect.id, code, message: text });
@@ -301,6 +395,7 @@ export class Run extends EventEmitter {
     catch (error) { throw new Error(`Answer not sent: ${error.message}. The question is still open.`); }
     const interaction = this.interactions.get(effect.params.interaction_id);
     if (interaction) Object.assign(interaction, { codec: effect.codec, answer: value });
+    this.record(effect, { type: 'response', result: { value: effect.codec ? effect.codec.toWire(value) : value }, answer: value });
     this.event('user.answered', { id, origin, value }); this.commit(effect, frame);
   }
   cancel() {
@@ -308,10 +403,29 @@ export class Run extends EventEmitter {
     this.finish('cancelled', { outcome: 'cancelled', reason: 'Cancelled by session owner' });
     return this.snapshot();
   }
+  /**
+   * Stops this process's part of the run so it can resume after a restart, without `run.terminal`: new
+   * requests go unanswered, effects that `keep(effect)` doesn't name (writes and commands already under way)
+   * are aborted, kept ones get up to `graceMs` to finish and be recorded, then JOSH is stopped. Resolves with
+   * the run's snapshot: state `suspended`, or the run's own end if it ended meanwhile.
+   */
+  async suspend({ keep = () => false, graceMs = 5000 } = {}) {
+    if (terminal(this.state)) return this.snapshot();
+    this.suspending = true;
+    for (const effect of this.effects.values()) if (!keep(effect)) effect.abort.abort();
+    const deadline = Date.now() + graceMs;
+    while (!terminal(this.state) && Date.now() < deadline && [...this.effects.values()].some(effect => !effect.abort.signal.aborted)) await new Promise(resolveWait => setTimeout(resolveWait, 20));
+    if (terminal(this.state)) return this.snapshot();
+    this.state = 'suspended'; clearTimeout(this.timer); this.abort.abort(); this.replay?.stop();
+    for (const effect of this.effects.values()) effect.abort.abort();
+    this.effects.clear(); this.connection?.release({ clean: false });
+    this.resolveDone(this.snapshot());
+    return this.snapshot();
+  }
   // `clean` only when JOSH returned the execution's result; every other end retires the connection.
   finish(state, result, { clean = false } = {}) {
     if (terminal(this.state)) return;
-    this.state = state; this.result = result; clearTimeout(this.timer); this.abort.abort();
+    this.state = state; this.result = result; clearTimeout(this.timer); this.abort.abort(); this.replay?.stop();
     for (const effect of this.effects.values()) effect.abort.abort();
     this.effects.clear(); this.connection?.release({ clean });
     this.event('run.terminal', { state, result, counters: { ...this.counters } });

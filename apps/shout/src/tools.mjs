@@ -178,7 +178,11 @@ function fitList(value, key) {
 
 /**
  * Builds the tool handler for one skill run. `host` supplies the workspace,
- * an approval gate, and skill checking/guide text.
+ * an approval gate, and skill checking/guide text. Two optional hooks run after
+ * the user's approval and before anything changes, so a restart can tell what
+ * was under way: `beforeApply(changes, context)` before a write or edit is
+ * applied, and `beforeRun(command, context)` before a shell command starts.
+ * `context` is the call's context with the tool's `name` added.
  */
 export function createToolHandler(host) {
   const { workspace } = host;
@@ -190,16 +194,20 @@ export function createToolHandler(host) {
     }
   };
   // Changes are checked (count, sizes, paths, current content) before the user is asked, and again when applied.
-  const applyApproved = async (summary, changes, signal) => {
+  const applyApproved = async (summary, changes, signal, context) => {
     if (!changes.length) return { accepted: true, changed: [] };
     await workspace.preflight(changes, { signal });
     const accepted = await host.approve({ title: `Apply ${changes.length} file change${changes.length === 1 ? '' : 's'}?`, summary, changes, signal });
     if (!accepted) return { accepted: false, changed: [] };
+    signal.throwIfAborted();
+    await host.beforeApply?.(changes, context);
     const result = await workspace.apply(changes, { signal });
     host.changed?.(changes, result.changed);
     return { accepted: true, changed: result.changed };
   };
-  return (name, input, { signal }) => guard(async () => {
+  return (name, input, callContext) => guard(async () => {
+    const { signal } = callContext;
+    const context = { ...callContext, name };
     signal.throwIfAborted();
     switch (name) {
       case 'workspace.list': return fitList(await workspace.list({ limit: 5000 }), 'files');
@@ -217,13 +225,13 @@ export function createToolHandler(host) {
       }
       case 'workspace.search': return fitList(await workspace.search(input.query, { maxResults: input.max_results }), 'matches');
       case 'workspace.inspect': return refuseLarge('The workspace snapshot', await workspace.inspect(), '. Use workspace.list and workspace.read_many instead.');
-      case 'workspace.write': return applyApproved(input.summary, input.changes, signal);
+      case 'workspace.write': return applyApproved(input.summary, input.changes, signal, context);
       case 'workspace.edit': {
         // Unmatched or unappliable edits are expected model mistakes; report them as data the program can feed back.
         let changes;
         try { changes = await workspace.planEdits(input.edits); if (changes.length) await workspace.preflight(changes, { signal }); }
         catch (error) { if (error.name === 'AbortError') throw error; return { accepted: false, changed: [], problem: error.message }; }
-        return { ...(await applyApproved(input.summary, changes, signal)), problem: '' };
+        return { ...(await applyApproved(input.summary, changes, signal, context)), problem: '' };
       }
       case 'tests.run': {
         const result = await workspace.test({ signal });
@@ -246,6 +254,8 @@ export function createToolHandler(host) {
       case 'shell.run': {
         const approved = await host.approve({ title: 'Run shell command?', summary: input.reason, command: input.command, signal });
         if (!approved) return { approved: false, exit_code: -1, output: 'The user declined this command.' };
+        signal.throwIfAborted();
+        await host.beforeRun?.(input.command, context);
         const result = await workspace.run(input.command, { signal, timeoutMs: 120_000 });
         return { approved: true, exit_code: clamp(result.exitCode), output: result.output };
       }

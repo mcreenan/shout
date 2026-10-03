@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { JoshTransport } from './transport.mjs';
 
 export const host = { name: 'owned-allen-prototype', version: '0.1.0' };
+export const PROTOCOL = 'josh/1.8';
 /** What this host asks JOSH for. JOSH grants the lower of each and its own ceiling (32 programs, 1,024 executions). */
 export const limits = Object.freeze({ max_frame_bytes: 1048576, max_active_requests: 64, max_loaded_programs: 1,
   max_total_executions: 1, max_catalog_tools: 1, max_catalog_bytes: 1048576 });
@@ -56,14 +57,16 @@ export class JoshConnection {
   }
   async handshake(negotiated, projectionId) {
     await this.transport.ready;
-    const initialized = await this.transport.request('initialize', { host, protocol_versions: ['josh/1.8'], language_versions: ['>=0.1.0, <0.2.0'],
+    const initialized = await this.transport.request('initialize', { host, protocol_versions: [PROTOCOL], language_versions: ['>=0.1.0, <0.2.0'],
       execution_mode: 'unattended', invoking_session_id: null, standard_capabilities: [], limits: negotiated, extensions: [] });
     this.limits = initialized?.limits ?? negotiated;
     const metadata = { source: host.name, source_revision: host.version, observed_at_unix_ms: Date.now(), freshness: 'current', complete: true };
     await this.transport.request('host/project', { profile: 'josh.host-projection/0.1', projection_id: projectionId,
       host, session_binding: 'none', sections: ['tools', 'resources', 'attachments', 'transcript', 'models', 'user_interaction', 'agents', 'roots', 'permissions', 'telemetry'].map(kind => ({
         kind, ...metadata, item_count: kind === 'tools' ? this.tools.length : 0 })) });
-    await this.transport.request('catalog/set', { schema_dialect: 'https://json-schema.org/draft/2020-12/schema', metadata, tools: this.tools });
+    const catalog = await this.transport.request('catalog/set', { schema_dialect: 'https://json-schema.org/draft/2020-12/schema', metadata, tools: this.tools });
+    // The frozen catalog's typed-contract digest (descriptions are not part of it).
+    this.catalogDigest = catalog?.catalog_digest ?? null;
   }
   /** `program/load`, cached by source: `{ program_id, artifact_digest, required_tools, debug, cached }`. */
   async load(source) {
