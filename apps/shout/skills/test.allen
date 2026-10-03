@@ -1,4 +1,5 @@
 // Run the session's configured test command. No model call, no edits.
+// limits: judgments=0 questions=0
 manifest {
   language: "0.1"
   entry: main

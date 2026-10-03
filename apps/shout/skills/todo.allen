@@ -1,4 +1,5 @@
 // List TODO, FIXME and HACK markers in the workspace, grouped by file with counts. Use when asked about outstanding todos or known hacks; no model call.
+// limits: judgments=0 questions=0 minutes=5
 manifest {
   language: "0.1"
   entry: main

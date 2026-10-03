@@ -1114,6 +1114,11 @@ async function loadSkillInto(tab) {
     pane.crumb.title = [SCOPE_LABEL[skill.scope] || skill.scope, skill.path].filter(Boolean).join(' · ');
     fact('Capabilities', chipList(skill.capabilities, (value) => (value.startsWith('model') ? 'model' : value.startsWith('user') ? 'user' : 'vm')));
     fact('Tools', chipList(skill.tools, () => 'tool'));
+    // The run's budgets: the defaults unless the header's `// limits:` line sets them.
+    const limits = skill.limits;
+    if (limits && typeof limits === 'object') {
+      fact('Limits', el('span', 'skill-limits', [`${limits.judgments} judgments`, `${limits.tools} tool calls`, `${limits.questions} questions`, `${limits.minutes} min`].join(' · ')));
+    }
     summary.append(facts);
     const lines = highlightLines(source, 'allen');
     if (lines.length > 1 && !lines.at(-1).length) lines.pop();

@@ -1,5 +1,6 @@
 // Explain a file or answer a question about how the code works, reading only the relevant files. Use for "explain X", "how does Y work", "what does this file do".
 // args: <path> [question] | <question>
+// limits: judgments=4 questions=0
 manifest {
   language: "0.1"
   entry: main

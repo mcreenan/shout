@@ -131,7 +131,7 @@ A skill is a repeatable workflow written as one ALLEN file and run as a slash co
 | `/code <goal>` | Selects files, proposes snippet edits for approval, runs tests and repairs | several |
 | `/new-skill <description>` | Writes a new skill, compile-checks it with up to 3 repairs and saves it after approval | 1–4 |
 
-A judgment that is asked again counts as another model call. Skills are discovered in `<workspace>/.shout/skills/`, then `<SHOUT_HOME>/skills/` (default `~/.config/shout/skills/`), then the built-ins in [`skills/`](skills/). Earlier scopes hide later ones with the same name. The file name is the command (`[a-z][a-z0-9-]*`, at most 40 characters). The leading `//` comment lines are the header: the first line is the description, and an `// args: <hint>` line gives the argument hint. Skills are recompiled on every use, and `/skills` marks any that don't compile.
+A judgment that is asked again counts as another model call. Skills are discovered in `<workspace>/.shout/skills/`, then `<SHOUT_HOME>/skills/` (default `~/.config/shout/skills/`), then the built-ins in [`skills/`](skills/). Earlier scopes hide later ones with the same name. The file name is the command (`[a-z][a-z0-9-]*`, at most 40 characters). The leading `//` comment lines are the header: the first line is the description, an `// args: <hint>` line gives the argument hint, and a `// limits: judgments=0 questions=0 minutes=5` line sets the run's budgets (model calls, tool calls, questions and minutes: defaults 16, 128, 8 and 30, at most 32, 256, 16 and 120). A bad limit, or a zero limit for an effect the skill uses, counts as a compile error. A program the agent writes may only lower its limits. The skill's tab shows its limits. Skills are recompiled on every use, and `/skills` marks any that don't compile.
 
 Writes and shell commands always go through a host approval, whatever the skill does. [`skills/GUIDE.md`](skills/GUIDE.md) is the authoring guide; the agent gets the same guide from `allen_guide`, and `/new-skill` gives it to the model with the generated tool catalog. To run a skill from the command line: `node tools/run-skill.mjs --workspace DIR [--approve|--decline] [--model ID] [--effort LEVEL] -- "/name args"`.
 
@@ -233,7 +233,7 @@ Server modules (`src/`):
 | `agent.mjs` | `CodexAgent`: one `codex app-server` process, a thread per session, SHOUT's dynamic tools |
 | `claude-agent.mjs` | `ClaudeAgent`: one Claude Code session per thread through the Agent SDK, and the isolation options |
 | `claude-provider.mjs` | `ClaudeProvider`: `model.request` judgments on Claude |
-| `skills.mjs` | Skill discovery, headers, compile checks with `shout-allen-check`, entry input, output rendering, the authoring guide with the generated catalog |
+| `skills.mjs` | Skill discovery, headers and run limits, compile checks with `shout-allen-check`, entry input, output rendering, the authoring guide with the generated catalog |
 | `tools.mjs` | The host tool catalog for skills and programs, and its handlers (approval gates, the per-subcommand `git` option lists and git environment, result size limits) |
 | `workspace.mjs` | Workspace confinement, reads, search, edit planning, checking change sets before approval, applying them, test and shell processes; the sample scenarios |
 | `network.mjs` | The allowed host set, request host/origin validation, the printed URLs |

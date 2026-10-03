@@ -11,7 +11,7 @@ import { CodexAgent } from './agent.mjs';
 import { ClaudeAgent } from './claude-agent.mjs';
 import { ClaudeProvider } from './claude-provider.mjs';
 import { shoutTools, createToolHandler } from './tools.mjs';
-import { SkillRegistry, commands, buildInput, renderOutput, skillGuide, builtinSkillsDir } from './skills.mjs';
+import { SkillRegistry, commands, buildInput, renderOutput, skillGuide, builtinSkillsDir, RUN_LIMIT_DEFAULTS, RUN_LIMIT_CEILINGS } from './skills.mjs';
 import { Workspace, scenarios, createScenario } from './workspace.mjs';
 import { ProjectStore } from './projects.mjs';
 
@@ -81,6 +81,12 @@ const failureSpan = outcome => {
   return span?.source === 'src/main.allen' && Number.isInteger(span.line) ? span : null;
 };
 const clip = text => (text.length > RESULT_CHARS ? `${text.slice(0, RESULT_CHARS)}\n[truncated at ${RESULT_CHARS} characters]` : text);
+// The header limit behind each budget the kernel can exhaust, for the hint in a skill's failure message.
+const budgetLimits = [[/^Model judgment budget exhausted/, 'judgments'], [/^Native tool budget exhausted/, 'tools'], [/^User question budget exhausted/, 'questions']];
+const budgetHint = (outcome, limits) => {
+  const key = budgetLimits.find(([pattern]) => pattern.test(String(outcome.result?.error ?? '')))?.[1];
+  return key && limits[key] < RUN_LIMIT_CEILINGS[key] ? `. Raise it with \`// limits: ${key}=N\` in the skill header (at most ${RUN_LIMIT_CEILINGS[key]}).` : '';
+};
 // An answer's value in its chat echo: as given, or cut to 500 characters of text (its JSON unless it is a string).
 const echoValue = value => { const json = JSON.stringify(value); return json.length <= 500 ? { value } : { value: `${(typeof value === 'string' ? value : json).slice(0, 499)}…`, truncated: true }; };
 const active = status => ['thinking', 'running', 'waiting_user'].includes(status);
@@ -457,7 +463,7 @@ export class CodingSession extends EventEmitter {
   async runGenerated(source, args, controller, current) {
     const id = `check-${randomUUID()}`;
     this.event('tool.started', { id, tool: 'allen.check', input: { lines: source.split('\n').length } });
-    const checked = await this.skills.validate(source);
+    const checked = await this.skills.validate(source, { generated: true });
     if (!current()) return;
     if (!checked.ok) {
       const problems = checked.diagnostics.slice(0, 12).map(d => `${d.line}:${d.column} ${d.code} ${d.message}\n  ${source.split('\n')[d.line - 1] ?? ''}`).join('\n');
@@ -466,7 +472,7 @@ export class CodingSession extends EventEmitter {
     }
     this.event('tool.completed', { id, tool: 'allen.check', value: { ok: true } });
     const input = buildInput(checked.entry?.input, { args, history: this.history(12), workspace: this.data.workspace, test_command: this.data.testCommand ?? '' });
-    return this.runProgram({ source, input, generated: true, tools: shoutTools, maxModelJudgments: 16, maxToolCalls: 128, toolHandler: this.skillTools(current), format: output => renderOutput(output), after: 'thinking' }, controller, current);
+    return this.runProgram({ source, input, generated: true, tools: shoutTools, limits: checked.limits, toolHandler: this.skillTools(current), format: output => renderOutput(output), after: 'thinking' }, controller, current);
   }
   // The tools every skill and generated program gets: host-enforced approvals for writes and shell.
   skillTools(current) {
@@ -500,15 +506,19 @@ export class CodingSession extends EventEmitter {
     await this.runSkill(skill, args, controller, current);
   }
   async runSkill(skill, args, controller, current, { after } = {}) {
-    const { source } = await this.skills.load(skill, { withSource: true });
+    const { source, limits } = await this.skills.load(skill, { withSource: true });
     if (!current()) return;
     const input = buildInput(skill.entry?.input, { args, history: this.history(12), workspace: this.data.workspace, test_command: this.data.testCommand ?? '' });
-    return this.runProgram({ source, input, skill: skill.name, tools: shoutTools, maxModelJudgments: 16, maxToolCalls: 128, toolHandler: this.skillTools(current), format: output => renderOutput(output), after }, controller, current);
+    return this.runProgram({ source, input, skill: skill.name, tools: shoutTools, limits: limits ?? skill.limits ?? RUN_LIMIT_DEFAULTS, toolHandler: this.skillTools(current), format: output => renderOutput(output), after }, controller, current);
   }
-  /** Runs a program to its end and reports it in the conversation. `after` is the session status to take afterwards (default: the run's state). */
-  async runProgram({ source: programSource, input, skill, generated = false, tools, toolHandler, maxModelJudgments, maxToolCalls, format, after }, controller, current) {
+  /**
+   * Runs a program to its end and reports it in the conversation. `limits` are its budgets (the skill header's, see
+   * resolveLimits); "No time limits" overrides `minutes`. `after` is the session status to take afterwards (default: the run's state).
+   */
+  async runProgram({ source: programSource, input, skill, generated = false, tools, toolHandler, limits = RUN_LIMIT_DEFAULTS, format, after }, controller, current) {
     this.data.status = 'running';
-    const run = new Run({ provider: this.provider, source: programSource, input, scratchRoot: resolve(this.stateRoot, 'runs'), wallMs: this.data.timeBudgetsEnabled === false ? null : 30 * 60 * 1000, tools, maxModelJudgments, maxToolCalls,
+    const run = new Run({ provider: this.provider, source: programSource, input, scratchRoot: resolve(this.stateRoot, 'runs'), wallMs: this.data.timeBudgetsEnabled === false ? null : limits.minutes * 60 * 1000, tools,
+      maxModelJudgments: limits.judgments, maxToolCalls: limits.tools, maxUserQuestions: limits.questions,
       toolHandler: (name, toolInput, context) => {
         const operation = Promise.resolve().then(() => toolHandler(name, toolInput, context));
         this.pendingTools.add(operation);
@@ -516,7 +526,7 @@ export class CodingSession extends EventEmitter {
         return operation;
       } });
     this.run = run;
-    const item = { id: run.id, state: 'starting', source: programSource, counters: {}, ...(skill ? { skill } : {}), ...(generated ? { generated: true } : {}) }; this.data.runs.push(item);
+    const item = { id: run.id, state: 'starting', source: programSource, counters: {}, limits: { ...limits }, ...(skill ? { skill } : {}), ...(generated ? { generated: true } : {}) }; this.data.runs.push(item);
     run.on('event', event => {
       if (!current()) return;
       Object.assign(item, run.snapshot());
@@ -548,7 +558,7 @@ export class CodingSession extends EventEmitter {
     this.data.question = null; this.data.status = after ?? outcome.state;
     const output = outcome.result?.output;
     if (outcome.state === 'completed') this.messageRecord('assistant', format(output));
-    else this.messageRecord('assistant', `${skill ? `\`/${skill}\`` : generated ? 'The program' : 'Workflow'} ${outcome.state}${line ? ` at line ${line}` : ''}: ${failure(outcome)}`, line ? { failure: { run: run.id, line } } : {});
+    else this.messageRecord('assistant', `${skill ? `\`/${skill}\`` : generated ? 'The program' : 'Workflow'} ${outcome.state}${line ? ` at line ${line}` : ''}: ${failure(outcome)}${skill ? budgetHint(outcome, limits) : ''}`, line ? { failure: { run: run.id, line } } : {});
     this.changed();
     return outcome;
   }

@@ -1,5 +1,6 @@
 // Find literal text in the workspace and list matching lines grouped by file. Use for "where is X used/defined" lookups; no model call.
 // args: <text>
+// limits: judgments=0 questions=0 minutes=5
 manifest {
   language: "0.1"
   entry: main

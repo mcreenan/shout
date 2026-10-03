@@ -1,5 +1,6 @@
 // Change, fix, or explain code in this workspace: proposes exact edits for your approval, runs the tests, and repairs failures.
 // args: <what to change>
+// limits: judgments=8 questions=0
 manifest {
   language: "0.1"
   entry: main

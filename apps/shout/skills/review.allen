@@ -1,5 +1,6 @@
 // Review uncommitted changes (git diff against HEAD plus new files) and report findings by severity. Use for "review my changes", "check this diff", "anything wrong before I commit?".
 // args: [focus]
+// limits: questions=0
 // Large changes are split per file into batches; each batch gets its own review and the findings are merged.
 manifest {
   language: "0.1"

@@ -33,18 +33,61 @@ export function skillRoots(workspacePath) {
   ];
 }
 
-/** Leading `//` comment lines: first line is the description; `args: …` gives an argument hint. */
+// A run's budgets: model judgments (every attempt counts), host tool calls, questions to the user, and
+// wall time. A skill header may set any of them up to the ceiling; a program the agent writes may only lower them.
+export const RUN_LIMIT_DEFAULTS = Object.freeze({ judgments: 16, tools: 128, questions: 8, minutes: 30 });
+export const RUN_LIMIT_CEILINGS = Object.freeze({ judgments: 32, tools: 256, questions: 16, minutes: 120 });
+const LIMIT_MINIMUMS = { judgments: 0, tools: 0, questions: 0, minutes: 1 };
+
+/**
+ * Leading `//` comment lines: first line is the description; `args: …` gives an argument hint, and
+ * `limits: judgments=4 tools=32 questions=0 minutes=10` (any subset) sets the run's budgets. `limits` holds
+ * the valid values given, `limitLines` the header line of each, and `limitErrors` `[{ line, message }]`.
+ */
 export function parseHeader(source) {
   const lines = [];
-  for (const line of source.split('\n')) {
-    const match = /^\s*\/\/\s?(.*)$/.exec(line);
-    if (match) lines.push(match[1].trimEnd());
-    else if (line.trim()) break;
+  const sourceLines = source.split('\n');
+  for (let index = 0; index < sourceLines.length; index++) {
+    const match = /^\s*\/\/\s?(.*)$/.exec(sourceLines[index]);
+    if (match) lines.push({ text: match[1].trimEnd(), line: index + 1 });
+    else if (sourceLines[index].trim()) break;
   }
-  const args = lines.find(line => /^args:/i.test(line))?.replace(/^args:\s*/i, '') ?? '';
-  const body = lines.filter(line => !/^args:/i.test(line));
-  return { description: body.find(line => line.trim()) ?? '', help: body.join('\n').trim(), args };
+  const args = lines.find(({ text }) => /^args:/i.test(text))?.text.replace(/^args:\s*/i, '') ?? '';
+  const limits = {}; const limitLines = {}; const limitErrors = [];
+  for (const { text, line } of lines.filter(({ text }) => /^limits:/i.test(text))) {
+    // `key=value` pairs, separated by spaces or commas; spaces around `=` are allowed.
+    const pairs = text.replace(/^limits:/i, '').replace(/\s*=\s*/g, '=').split(/[\s,]+/).filter(Boolean);
+    if (!pairs.length) limitErrors.push({ line, message: 'The limits line sets nothing. Write key=value pairs, e.g. // limits: judgments=4 minutes=10' });
+    for (const pair of pairs) {
+      const [, key, value] = /^([^=]*)=(.*)$/.exec(pair) ?? [];
+      if (key === undefined) { limitErrors.push({ line, message: `"${pair}" is not key=value. Write limits as judgments=4, tools=32, questions=0 or minutes=10` }); continue; }
+      if (!(key in RUN_LIMIT_DEFAULTS)) { limitErrors.push({ line, message: `Unknown limit "${key}". The limits are ${Object.keys(RUN_LIMIT_DEFAULTS).join(', ')}` }); continue; }
+      if (key in limitLines) { limitErrors.push({ line, message: `The ${key} limit is set twice` }); continue; }
+      limitLines[key] = line;
+      const number = /^\d{1,6}$/.test(value) ? Number(value) : NaN;
+      if (!(number >= LIMIT_MINIMUMS[key] && number <= RUN_LIMIT_CEILINGS[key])) {
+        limitErrors.push({ line, message: `The ${key} limit must be a whole number from ${LIMIT_MINIMUMS[key]} to ${RUN_LIMIT_CEILINGS[key]} (default ${RUN_LIMIT_DEFAULTS[key]}), not "${value}"` });
+        continue;
+      }
+      limits[key] = number;
+    }
+  }
+  const body = lines.map(({ text }) => text).filter(text => !/^(args|limits):/i.test(text));
+  return { description: body.find(text => text.trim()) ?? '', help: body.join('\n').trim(), args, limits, limitLines, limitErrors };
 }
+
+/** A run's budgets from a parsed header: the defaults, overridden by its limits. A generated program can only lower them. */
+export function resolveLimits(header, { generated = false } = {}) {
+  const limits = { ...RUN_LIMIT_DEFAULTS, ...header?.limits };
+  if (generated) for (const key of Object.keys(limits)) limits[key] = Math.min(limits[key], RUN_LIMIT_DEFAULTS[key]);
+  return limits;
+}
+// A zero limit for an effect the entry declares: the run could only fail there.
+const contradictions = [
+  ['judgments', effect => effect === 'model.request', 'makes model.request calls'],
+  ['questions', effect => effect === 'user.ask', 'asks the user (user.ask)'],
+  ['tools', effect => effect.startsWith('tool.'), 'calls host tools'],
+];
 
 export class SkillRegistry {
   constructor({ stateRoot, checker = process.env.SHOUT_ALLEN_CHECK } = {}) {
@@ -70,12 +113,25 @@ export class SkillRegistry {
     }
     return this.cache.get(key);
   }
-  /** Compiler check plus SHOUT's entry-input rules: exactly what loading a skill enforces. */
-  async validate(source) {
+  /**
+   * Compiler check plus SHOUT's entry-input and header-limit rules: exactly what loading a skill enforces.
+   * A valid result carries the run's `limits`; `generated` (a program the agent wrote) caps them at the defaults.
+   */
+  async validate(source, { generated = false } = {}) {
     const checked = await this.check(source);
     const inputError = checked.ok ? entryInputError(checked.entry?.input) : null;
     if (inputError) return { ...checked, ok: false, diagnostics: [{ line: 1, column: 1, code: 'SHOUT006', message: inputError }] };
-    return checked;
+    const header = parseHeader(source);
+    const problems = header.limitErrors.map(({ line, message }) => ({ line, column: 1, code: 'SHOUT008', message }));
+    const limits = resolveLimits(header, { generated });
+    if (checked.ok) {
+      const effects = checked.entry?.effects ?? [];
+      for (const [key, uses, what] of contradictions) {
+        if (limits[key] === 0 && key in header.limits && effects.some(uses)) problems.push({ line: header.limitLines[key], column: 1, code: 'SHOUT009', message: `${key}=0, but the entry ${what}. Raise the limit or remove the effect` });
+      }
+    }
+    if (problems.length) return { ...checked, ok: false, diagnostics: [...(checked.diagnostics ?? []), ...problems] };
+    return checked.ok ? { ...checked, limits } : checked;
   }
   /** All skills visible to a workspace; earlier scopes shadow later ones. Files are re-read every call. */
   async list(workspacePath) {
@@ -97,7 +153,7 @@ export class SkillRegistry {
     let source;
     try { source = await readFile(skill.path, 'utf8'); }
     catch (error) { return { ...skill, description: '', args: '', ok: false, diagnostics: [{ line: 1, column: 1, code: 'SHOUT004', message: error.message }], capabilities: [], tools: [] }; }
-    const header = parseHeader(source);
+    const { limits: _limits, limitLines: _lines, limitErrors: _errors, ...header } = parseHeader(source);
     let checked;
     try { checked = await this.validate(source); }
     catch (error) { checked = { ok: false, diagnostics: [{ line: 1, column: 1, code: 'SHOUT005', message: `Checker unavailable: ${error.message}` }] }; }
@@ -106,6 +162,7 @@ export class SkillRegistry {
       ok: checked.ok,
       diagnostics: checked.diagnostics ?? [],
       capabilities: checked.capabilities ?? [], tools: checked.tools ?? [], entry: checked.entry ?? null,
+      limits: checked.limits ?? null,
       ...(withSource ? { source } : {}),
     };
   }

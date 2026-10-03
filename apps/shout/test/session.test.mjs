@@ -571,3 +571,45 @@ export async fn main() returns Bool effects [task.spawn, user.ask, model.request
   assert.deepEqual([session.data.runs.at(-1).state, session.data.question], ['stopped', null]);
   assert.ok(!session.data.events.some(event => event.type === 'user.answered'), 'no answer was recorded');
 });
+
+test('a skill header limits its run: the judgment budget fails with a hint to raise it, the question budget at the next question', async t => {
+  const judge = `// Judge twice.
+// limits: judgments=1 minutes=3
+manifest { language: "0.1" entry: main capabilities: [model.request] }
+record Answer { answer: Bool }
+export async fn main(args: String) returns Bool effects [model.request] {
+  let a = match await model.request<Answer>(prompt { system: "First" output: Answer }) { Ok(v) => v.answer Err(_) => false };
+  let b = match await model.request<Answer>(prompt { system: "Second" output: Answer }) { Ok(v) => v.answer Err(_) => false };
+  a && b
+}
+`;
+  const ask = `// Ask twice.
+// limits: questions=1
+manifest { language: "0.1" entry: main capabilities: [user.ask] }
+export async fn main(args: String) returns Bool effects [user.ask] {
+  let a = match await user.ask<Bool>(prompt { system: "First?" output: Bool }) { Ok(v) => v Err(_) => false };
+  let b = match await user.ask<Bool>(prompt { system: "Second?" output: Bool }) { Ok(v) => v Err(_) => false };
+  a && b
+}
+`;
+  const provider = { judge: async () => ({ answer: true }) };
+  const dir = await mkdtemp(resolve(tmpdir(), 'shout-session-'));
+  const store = await new SessionStore({ stateRoot: dir, agent: new ScriptedAgent(), providerFactory: () => provider }).init();
+  const previousHome = process.env.SHOUT_HOME; process.env.SHOUT_HOME = resolve(dir, 'home');
+  t.after(async () => { await store.close(); if (previousHome === undefined) delete process.env.SHOUT_HOME; else process.env.SHOUT_HOME = previousHome; await rm(dir, { recursive: true, force: true }); });
+  const workspace = resolve(dir, 'project');
+  await mkdir(resolve(workspace, '.shout', 'skills'), { recursive: true });
+  await writeFile(resolve(workspace, '.shout', 'skills', 'judge.allen'), judge);
+  await writeFile(resolve(workspace, '.shout', 'skills', 'ask.allen'), ask);
+  const session = await store.create({ workspace });
+  store.send(session.data.id, '/judge'); await session.task;
+  const judged = session.data.runs.at(-1);
+  assert.deepEqual([judged.state, judged.limits, judged.counters.modelJudgments], ['failed', { judgments: 1, tools: 128, questions: 8, minutes: 3 }, 1]);
+  assert.equal(session.data.messages.at(-1).content, '`/judge` failed at line 7: Model judgment budget exhausted (1 per run). Raise it with `// limits: judgments=N` in the skill header (at most 32).');
+  store.send(session.data.id, '/ask');
+  const first = await waitFor(() => session.data.question);
+  session.answer(first.id, true); await session.task;
+  const asked = session.data.runs.at(-1);
+  assert.deepEqual([asked.state, asked.limits.questions, asked.failedAt?.line], ['failed', 1, 6]);
+  assert.match(session.data.messages.at(-1).content, /^`\/ask` failed at line 6: User question budget exhausted \(1 per run\). Raise it with `\/\/ limits: questions=N`/);
+});

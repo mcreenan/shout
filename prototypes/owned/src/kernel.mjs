@@ -61,11 +61,12 @@ function withRetryNote(prompt, attempt, issues, unparseable) {
 export const DEFAULT_RUN_WALL_MS = 30 * 60 * 1000;
 
 export class Run extends EventEmitter {
-  constructor({ provider, source, input, scratchRoot, wallMs = DEFAULT_RUN_WALL_MS, tools = [tool], toolHandler, maxModelJudgments = 3, maxToolCalls = 16 }) {
+  constructor({ provider, source, input, scratchRoot, wallMs = DEFAULT_RUN_WALL_MS, tools = [tool], toolHandler, maxModelJudgments = 3, maxToolCalls = 16, maxUserQuestions = 8 }) {
     super();
     if (wallMs !== null && (!Number.isInteger(wallMs) || wallMs < 1 || wallMs > 2 * 60 * 60 * 1000)) throw new Error('Wall-time budget must be 1–7200000 ms or null');
-    if (!Number.isInteger(maxModelJudgments) || maxModelJudgments < 0 || maxModelJudgments > 16) throw new Error('Model budget must be 0–16');
+    if (!Number.isInteger(maxModelJudgments) || maxModelJudgments < 0 || maxModelJudgments > 64) throw new Error('Model budget must be 0–64');
     if (!Number.isInteger(maxToolCalls) || maxToolCalls < 0 || maxToolCalls > 256) throw new Error('Tool budget must be 0–256');
+    if (!Number.isInteger(maxUserQuestions) || maxUserQuestions < 0 || maxUserQuestions > 64) throw new Error('Question budget must be 0–64');
     if (!Array.isArray(tools) || tools.length > 256) throw new Error('Invalid host tool catalog');
     this.tools = structuredClone(tools).sort((a, b) => Buffer.compare(Buffer.from(a.name), Buffer.from(b.name)));
     this.toolMap = new Map();
@@ -80,7 +81,7 @@ export class Run extends EventEmitter {
     }
     if (toolHandler !== undefined && typeof toolHandler !== 'function') throw new Error('Tool handler must be a function');
     if (this.tools.some(definition => definition.name !== tool.name) && !toolHandler) throw new Error('Custom tools require a tool handler');
-    this.toolHandler = toolHandler; this.maxModelJudgments = maxModelJudgments; this.maxToolCalls = maxToolCalls;
+    this.toolHandler = toolHandler; this.maxModelJudgments = maxModelJudgments; this.maxToolCalls = maxToolCalls; this.maxUserQuestions = maxUserQuestions;
     this.id = `run-${randomUUID()}`; this.state = 'starting'; this.provider = provider;
     this.source = source; this.input = input; this.wallMs = wallMs;
     this.scratch = resolve(scratchRoot, this.id); this.effects = new Map(); this.events = [];
@@ -243,7 +244,7 @@ export class Run extends EventEmitter {
         this.respond(effect, { outcome: 'ok', value });
       } else if (method === 'user/ask') {
         effect.codec = callbackCodec(params.response_schema.descriptor); effect.schema = effect.codec.schema;
-        if (this.counters.userQuestions >= 8) throw new Error('User question budget exhausted (8 per run)');
+        if (this.counters.userQuestions >= this.maxUserQuestions) throw new Error(`User question budget exhausted (${this.maxUserQuestions} per run)`);
         this.counters.userQuestions++; this.state = 'waiting_user';
         this.event('user.question', { id, prompt: params.prompt, schema: effect.schema, ...origin, ...retry });
       } else {

@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { SessionStore, parseCommand } from '../src/session.mjs';
-import { parseHeader, buildInput, renderOutput } from '../src/skills.mjs';
+import { parseHeader, resolveLimits, buildInput, renderOutput, RUN_LIMIT_DEFAULTS } from '../src/skills.mjs';
 
 const manifest = (tools = [], capabilities = []) => `manifest {
   language: "0.1"
@@ -60,7 +60,7 @@ test('command parsing, header metadata, entry input and output rendering', () =>
   assert.deepEqual(parseCommand('/test'), { name: 'test', args: '' });
   assert.equal(parseCommand('please /test'), null);
   assert.equal(parseCommand('/Path/to/file'), null);
-  assert.deepEqual(parseHeader('// Do a thing.\n// More help.\n// args: <file>\nmanifest {'), { description: 'Do a thing.', help: 'Do a thing.\nMore help.', args: '<file>' });
+  assert.deepEqual(parseHeader('// Do a thing.\n// More help.\n// args: <file>\nmanifest {'), { description: 'Do a thing.', help: 'Do a thing.\nMore help.', args: '<file>', limits: {}, limitLines: {}, limitErrors: [] });
   assert.equal(buildInput({ type: 'void' }, { args: 'x' }), null);
   assert.equal(buildInput({ type: 'string' }, { args: 'x' }), 'x');
   assert.deepEqual(buildInput({ type: 'record', fields: { args: {}, workspace: {} } }, { args: 'a', workspace: '/w', history: 'h' }), { args: 'a', workspace: '/w' });
@@ -250,6 +250,64 @@ test('every built-in skill compiles and has a description', async t => {
     assert.equal(skill.ok, true, `${skill.name}: ${JSON.stringify(skill.diagnostics)}`);
     assert.ok(skill.description, `${skill.name} needs a // description line`);
   }
+});
+
+test('header limits: any subset, spacing and commas; duplicates, bad values and values over the ceiling are reported at their line', () => {
+  const subset = parseHeader('// Count things.\n// args: <text>\n// limits: judgments=0  minutes = 5,questions=2\nmanifest {');
+  assert.deepEqual([subset.description, subset.help, subset.limits, subset.limitLines, subset.limitErrors],
+    ['Count things.', 'Count things.', { judgments: 0, minutes: 5, questions: 2 }, { judgments: 3, minutes: 3, questions: 3 }, []]);
+  assert.deepEqual(resolveLimits(subset), { judgments: 0, tools: 128, questions: 2, minutes: 5 });
+  assert.deepEqual(resolveLimits(parseHeader('// None.\nmanifest {')), RUN_LIMIT_DEFAULTS);
+  const bad = parseHeader('// Bad.\n// limits: judgments=4 judgments=5\n// limits: tools=1.5 questions=17 minutes=0 minutes=121 speed=3 tools\n// limits:\nmanifest {');
+  assert.deepEqual(bad.limits, { judgments: 4 });
+  assert.deepEqual(bad.limitErrors.map(error => [error.line, error.message.split(/[,.(]/)[0]]), [
+    [2, 'The judgments limit is set twice'],
+    [3, 'The tools limit must be a whole number from 0 to 256 '],
+    [3, 'The questions limit must be a whole number from 0 to 16 '],
+    [3, 'The minutes limit must be a whole number from 1 to 120 '],
+    [3, 'The minutes limit is set twice'],
+    [3, 'Unknown limit "speed"'],
+    [3, '"tools" is not key=value'],
+    [4, 'The limits line sets nothing'],
+  ]);
+  // Only the leading comment block is the header.
+  assert.deepEqual(parseHeader('// Doc.\nmanifest {\n// limits: judgments=99\n').limitErrors, []);
+});
+
+test('invalid limits are SHOUT008 and a zero limit for a declared effect is SHOUT009; a generated program cannot raise its limits', async t => {
+  const judging = `${manifest([], ['model.request'])}
+record Answer { answer: Bool }
+export async fn main(args: String) returns Bool effects [model.request] {
+  match await model.request<Answer>(prompt { system: "Judge" output: Answer }) { Ok(v) => v.answer Err(_) => false }
+}
+`;
+  const { store, session } = await setup(t, {
+    over: `// Over the ceiling\n// limits: judgments=33 tools=8\n${manifest()}\nexport fn main() returns String { "x" }\n`,
+    judging: `// Judges with no judgments\n// args: <x>\n// limits: tools=0 judgments=0\n${judging}`,
+    asking: `// Asks with no questions\n// limits: questions=0\n${askSkill}`,
+    editing: `// Edits with no tool calls\n// limits: tools=0\n${editSkill.split('\n').slice(2).join('\n')}`,
+    quiet: `// Fine\n// limits: judgments=0 questions=0 tools=3 minutes=2\n${manifest(['workspace.edit'])}\nexport fn main() returns String { "x" }\n`,
+  });
+  const skills = Object.fromEntries((await store.skills.list(session.data.workspace)).map(skill => [skill.name, skill]));
+  const codes = name => skills[name].diagnostics.map(d => [d.code, d.line]);
+  assert.deepEqual([skills.over.ok, codes('over'), skills.over.limits], [false, [['SHOUT008', 2]], null]);
+  assert.match(skills.over.diagnostics[0].message, /judgments limit must be a whole number from 0 to 32/);
+  assert.deepEqual([skills.judging.ok, codes('judging')], [false, [['SHOUT009', 3]]], 'only the zero limit the entry contradicts');
+  assert.match(skills.judging.diagnostics[0].message, /judgments=0, but the entry makes model.request calls/);
+  assert.deepEqual(codes('asking'), [['SHOUT009', 2]]);
+  assert.deepEqual(codes('editing'), [['SHOUT009', 2]]);
+  assert.deepEqual([skills.quiet.ok, skills.quiet.limits], [true, { judgments: 0, tools: 3, questions: 0, minutes: 2 }]);
+  assert.deepEqual(skills.test.limits, { ...RUN_LIMIT_DEFAULTS, judgments: 0, questions: 0 }, 'built-ins declare theirs');
+  // /skills marks them; running one says it does not compile.
+  store.send(session.data.id, '/skills'); await session.task;
+  assert.match(session.data.messages.at(-1).content, /`\/judging <x>` Judges with no judgments \(has errors\)/);
+  // A generated program keeps lower limits and is held to the defaults above them.
+  const raised = `// limits: judgments=32 tools=256 questions=16 minutes=120\n${manifest()}\nexport fn main() returns String { "x" }\n`;
+  assert.deepEqual((await store.skills.validate(raised)).limits, { judgments: 32, tools: 256, questions: 16, minutes: 120 });
+  assert.deepEqual((await store.skills.validate(raised, { generated: true })).limits, RUN_LIMIT_DEFAULTS);
+  const lowered = raised.replace('judgments=32', 'judgments=2');
+  assert.equal((await store.skills.validate(lowered, { generated: true })).limits.judgments, 2);
+  assert.deepEqual((await store.skills.validate(`// limits: judgments=0\n${judging}`, { generated: true })).diagnostics.map(d => d.code), ['SHOUT009']);
 });
 
 test('git.run refuses branch writes, --no-index and paths outside the workspace', async t => {

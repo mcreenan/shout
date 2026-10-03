@@ -1,5 +1,6 @@
 // Write a new SHOUT skill (an ALLEN slash command) from a description, compile-check it with up to 3 repairs, and save it to .shout/skills/ after your approval. Use when asked to create, automate or add a slash command or repeatable workflow.
 // args: <what the skill should do>
+// limits: questions=0
 manifest {
   language: "0.1"
   entry: main

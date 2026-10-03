@@ -362,6 +362,7 @@ body.dragging-tab .resizer{pointer-events:none}
 .skill-facts dd{margin:0;min-width:0;overflow-wrap:anywhere}
 .skill-path{font:var(--fs-sm) var(--mono)}
 .skill-none{color:var(--text-3)}
+.skill-limits{font:var(--fs-sm) var(--mono);color:var(--text-2)}
 .chips{display:flex;flex-wrap:wrap;gap:4px}
 .chip{--c:var(--text-3);font:var(--fs-xs)/20px var(--mono);padding:0 7px;border-radius:var(--radius-sm);background:color-mix(in srgb,var(--c) 12%,var(--surface));color:color-mix(in srgb,var(--c) 75%,var(--text))}
 .chip.tool{--c:var(--tool)}.chip.model{--c:var(--model)}.chip.user{--c:var(--user)}.chip.vm{--c:var(--vm)}

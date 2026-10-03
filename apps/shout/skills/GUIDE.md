@@ -10,6 +10,7 @@ A skill is one ALLEN source file, `<name>.allen`, run in chat as `/<name> argume
   2. user: `~/.config/shout/skills/`
   3. built-in: `apps/shout/skills/` (these files are good examples)
 - Leading `//` comment lines form the header. The first line is the one-line description shown in `/skills`. SHOUT's agent reads it when deciding whether to run your skill for a plain-language request, so say what the skill does and when it applies. A line `// args: <hint>` gives the argument hint.
+- A line `// limits: judgments=4 tools=32 questions=0 minutes=10` sets the run's budgets; give any subset, and the rest keep their defaults. See [Run limits](#run-limits).
 - After the header comes the inline `manifest { ... }`. It is required.
 
 ## A complete skill
@@ -143,7 +144,20 @@ async fn judge(diff: String, focus: String) returns Findings effects [model.requ
 - Keep `data` bounded. Truncate long text with `string.slice(text, 0, 40000) ?? text` and cap lists with `items[0..20] ?? items`.
 - Output types can use any ALLEN data type: `String`, `Int`, `Float`, `Bool`, `Bytes`, `Void`, records, `List<...>`, `Map<K, V>`, tuples, `Option<T>`, `Result<T, E>`, enums (with or without payloads) and newtypes, nested as deep as you need. Records of strings, numbers, booleans and payload-free enums are the most reliable for a model. The model answers an `Option` as `{"tag": "Some", "value": ...}` or `{"tag": "None"}` and a payload-free enum as one of its variant names, and SHOUT translates tuples and maps for it.
 - Enforce constraints in code, not just in the prompt. Filter model-chosen paths to ones that exist, cap list lengths and check name formats. For a repair loop, run `for attempt in 0..3 { ... }` and put the previous problem into `data`.
-- A run may make at most 16 model calls, 128 tool calls and 8 `user.ask` questions, and last at most 30 minutes including waits for the user (unless the thread has No time limits on).
+- A run has budgets for model calls, tool calls, questions and time; see [Run limits](#run-limits).
+
+## Run limits
+
+| Limit | Counts | Default | At most |
+|---|---|---|---|
+| `judgments` | `model.request` attempts (a re-asked answer counts again) | 16 | 32 |
+| `tools` | host tool calls | 128 | 256 |
+| `questions` | `user.ask` questions | 8 | 16 |
+| `minutes` | wall time, including waits for the user (off when the thread has No time limits on) | 30 | 120 |
+
+Set them in the header with `// limits: judgments=0 questions=0 minutes=5`. Spaces or commas separate the pairs. Set a limit to what the skill actually needs: `/find` uses `judgments=0 questions=0 minutes=5`, `/code` `judgments=8 questions=0` (one file choice and three repair rounds, each allowed two attempts). A value that is not a whole number, is set twice, is unknown or is over the ceiling is error `SHOUT008` at that line, and the skill shows "(has errors)". A zero limit for an effect the entry declares (`judgments=0` with `model.request`, `questions=0` with `user.ask`, `tools=0` with any tool) is error `SHOUT009`. A program the agent writes for `run_program` may only lower its limits; values above the defaults are cut to the defaults.
+
+An exhausted budget ends the run, at the line of the call that went over: "`/name` failed at line 12: Model judgment budget exhausted (4 per run). Raise it with `// limits: judgments=N` in the skill header (at most 32)."
 
 ## Asking the user: `user.ask`
 
@@ -228,6 +242,7 @@ fn by_line(items: List<Hit>) returns List<Hit> {
 | `nested patterns are not implemented` | Match one level at a time, e.g. `Some(item) => item.name`, not `Some(Item { name: n })`. |
 | `SHOUT007` the ALLEN compiler crashed | A compiler bug, not your error. Restructure the code around the construct you last changed, for example by moving a loop or branch body into an `async fn` helper with its own `effects [...]`. |
 | `'any' is forbidden` | `any` is reserved; rename the variable. |
+| `SHOUT008` or `SHOUT009` at the `// limits:` line | Fix the value, or raise a zero limit for an effect the program uses. See [Run limits](#run-limits). |
 | A judgment returns `Err` with `model.validation_failed` | Every attempt returned an answer of the wrong type. Say in `system` what each output field holds, simplify the output type, or allow more attempts with `policy: { max_attempts: 3 }`. |
 | `tool call is not in the frozen catalog` | Add the tool to the manifest `tools.required`, and check the spelling against the catalog below. |
 | `function 'x' requires undeclared effects [...]` | Add those effects to that function's `effects [...]`, and to every caller up to `main`. |

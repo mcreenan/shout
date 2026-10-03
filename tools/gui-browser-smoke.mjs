@@ -100,6 +100,7 @@ try {
   await page.locator('.run-card').getByRole('button', { name: 'Open skill /code' }).click();
   await page.getByRole('tab', { name: '/code', exact: true }).waitFor();
   assert.match(await page.locator('#dock .skill-view').innerText(), /manifest/);
+  assert.equal(await page.locator('#dock .skill-limits').innerText(), '8 judgments · 128 tool calls · 0 questions · 30 min', 'the header limits show as a fact');
   // Flow mode: the chat pane becomes a canvas of phase cards; the composer stays underneath.
   await page.getByRole('tab', { name: 'Chat' }).click();
   await page.locator('.run-card').getByRole('button', { name: 'Flow', exact: true }).click();
