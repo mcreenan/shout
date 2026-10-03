@@ -1,5 +1,5 @@
-// SHOUT's skill checker and JOSH's program/load compile through one path, so a skill that
-// does not compile shows the same diagnostics in the skill list and in a failed run.
+// SHOUT checks skills with JOSH's program/check, and program/check and program/load compile through
+// one path, so a skill that does not compile shows the same diagnostics in the skill list and in a failed run.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -32,10 +32,10 @@ export fn main() returns fn(Int) returns Int { fn(x: Int) returns Int { x } }
 `,
 };
 
-test('the skill checker and a failed program/load report identical diagnostics', async t => {
+test('program/check through the registry and a failed program/load report identical diagnostics', async t => {
   const stateRoot = await mkdtemp(resolve(tmpdir(), 'shout-diagnostics-'));
-  t.after(() => rm(stateRoot, { recursive: true, force: true }));
-  const registry = new SkillRegistry({ stateRoot });
+  const registry = new SkillRegistry();
+  t.after(async () => { registry.close(); await rm(stateRoot, { recursive: true, force: true }); });
   assert.ok(catalogParams().tools.length > 0);
   for (const [name, source] of Object.entries(sources)) {
     const checked = await registry.check(source);

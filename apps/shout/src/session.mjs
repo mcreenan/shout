@@ -14,6 +14,7 @@ import { shoutTools, createToolHandler } from './tools.mjs';
 import { SkillRegistry, commands, buildInput, renderOutput, skillGuide, builtinSkillsDir, RUN_LIMIT_DEFAULTS, RUN_LIMIT_CEILINGS } from './skills.mjs';
 import { Workspace, scenarios, createScenario } from './workspace.mjs';
 import { ProjectStore } from './projects.mjs';
+import { JoshHost } from './josh-host.mjs';
 
 export const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const MAX_AGENT_TOOL_CALLS = 60;
@@ -96,9 +97,12 @@ const isApprovalSchema = schema => schema?.type === 'object' && JSON.stringify(O
 export const parseCommand = text => { const match = /^\/([a-z][a-z0-9-]*)(?:\s+([\s\S]*))?$/.exec(text.trim()); return match ? { name: match[1], args: (match[2] ?? '').trim() } : null; };
 
 export class CodingSession extends EventEmitter {
-  /** `agentFor(providerId)` and `providerFor(data, providerId)` supply the agent and the model.request provider for the session's model. */
-  constructor({ data, workspace, agentFor, providerFor, stateRoot, skills }) {
-    super(); this.data = data; this.workspace = workspace; this.agentFor = agentFor; this.providerFor = providerFor; this.stateRoot = stateRoot; this.skills = skills;
+  /**
+   * `agentFor(providerId)` and `providerFor(data, providerId)` supply the agent and the model.request provider for the session's model.
+   * `josh` (a JoshHost) lends runs a pooled JOSH connection; without it each run starts its own `josh serve`.
+   */
+  constructor({ data, workspace, agentFor, providerFor, stateRoot, skills, josh = null }) {
+    super(); this.data = data; this.workspace = workspace; this.agentFor = agentFor; this.providerFor = providerFor; this.stateRoot = stateRoot; this.skills = skills; this.josh = josh;
     this.data.timeBudgetsEnabled ??= true;
     this.pendingApproval = null; this.approvalQueue = Promise.resolve();
     this.controller = null; this.run = null; this.generation = 0; this.saveQueue = Promise.resolve(); this.closed = false; this.pendingTools = new Set();
@@ -519,6 +523,7 @@ export class CodingSession extends EventEmitter {
     this.data.status = 'running';
     const run = new Run({ provider: this.provider, source: programSource, input, scratchRoot: resolve(this.stateRoot, 'runs'), wallMs: this.data.timeBudgetsEnabled === false ? null : limits.minutes * 60 * 1000, tools,
       maxModelJudgments: limits.judgments, maxToolCalls: limits.tools, maxUserQuestions: limits.questions,
+      ...(this.josh ? { connection: () => this.josh.acquire() } : {}),
       toolHandler: (name, toolInput, context) => {
         const operation = Promise.resolve().then(() => toolHandler(name, toolInput, context));
         this.pendingTools.add(operation);
@@ -653,7 +658,9 @@ export class SessionStore extends EventEmitter {
     this.defaultWorkspace = resolve(defaultWorkspace); this.providerFactory = providerFactory;
     this.agent = agent ?? null; this.agents = { ...agents };
     this.sessions = new Map();
-    this.skills = new SkillRegistry({ stateRoot: this.stateRoot });
+    // One checker and a pool of run connections serve every session; see josh-host.mjs.
+    this.josh = new JoshHost({ tools: shoutTools });
+    this.skills = new SkillRegistry({ josh: this.josh });
     this.projects = new ProjectStore({ stateRoot: this.stateRoot });
     this.startModel = startModel; this.modelAvailable = modelAvailable;
     this.notify = () => this.emit('change');
@@ -727,7 +734,7 @@ export class SessionStore extends EventEmitter {
     data.model ??= defaultModel.model; data.effort ??= defaultModel.effort;
     data.modelLocked ??= data.messages.length > 0; // Sessions saved before the model lock.
     delete data.mode; // Sessions saved before fixture mode was removed.
-    const session = new CodingSession({ data, workspace, agentFor: provider => this.agentFor(provider), providerFor: (item, provider) => this.providerFor(item, provider), stateRoot: this.stateRoot, skills: this.skills });
+    const session = new CodingSession({ data, workspace, agentFor: provider => this.agentFor(provider), providerFor: (item, provider) => this.providerFor(item, provider), stateRoot: this.stateRoot, skills: this.skills, josh: this.josh });
     session.on('storageError', error => {
       data.storageError = `Session could not be saved: ${error.message}`;
       console.error(data.storageError); session.emit('snapshot', session.snapshot());
@@ -833,5 +840,9 @@ export class SessionStore extends EventEmitter {
     return session.send(text);
   }
   list() { return [...this.sessions.values()].map(s => s.summary()).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)); }
-  async close() { await Promise.all([...this.sessions.values()].map(s => s.close())); for (const agent of [this.agent, ...Object.values(this.agents)]) agent?.close?.(); }
+  async close() {
+    await Promise.all([...this.sessions.values()].map(s => s.close()));
+    for (const agent of [this.agent, ...Object.values(this.agents)]) agent?.close?.();
+    this.josh.close();
+  }
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the pinned JOSH/ALLEN revision plus SHOUT's patches (tools/josh-patches/*.patch, applied in
-# name order) and SHOUT's skill checker. Prints the josh binary path on stdout and nothing else.
+# name order). Prints the josh binary path on stdout and nothing else.
 set -euo pipefail
 
 repo_root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
@@ -83,18 +83,5 @@ toolchain=$(cd "$source_dir" && rustc --version)
 if [ ! -x "$target_dir/debug/josh" ] || [ ! -x "$target_dir/debug/allen" ] || [ "$(cat "$cache_root/built-revision" 2>/dev/null || true)" != "$build_stamp $toolchain" ]; then
   (cd "$source_dir" && CARGO_TARGET_DIR="$target_dir" cargo build --locked -p josh -p allen-cli >&2)
   printf '%s\n' "$build_stamp $toolchain" > "$cache_root/built-revision"
-fi
-# SHOUT's catalog-aware skill checker links the same patched compiler and host crates.
-checker_src="$repo_root/tools/allen-check"
-checker_dir="$cache_root/shout-allen-check"
-checker_stamp="$build_stamp $(cat "$checker_src/Cargo.toml.in" "$checker_src/src/main.rs" | sha256 | cut -d' ' -f1)"
-if [ ! -x "$target_dir/debug/shout-allen-check" ] || [ "$(cat "$checker_dir/built-stamp" 2>/dev/null || true)" != "$checker_stamp" ]; then
-  mkdir -p "$checker_dir"
-  sed -e "s|@ALLEN_SRC@|$source_dir|g" -e "s|@SHOUT_SRC@|$checker_src/src|g" "$checker_src/Cargo.toml.in" > "$checker_dir/Cargo.toml"
-  cp "$source_dir/rust-toolchain.toml" "$checker_dir/rust-toolchain.toml"
-  # The source lock pins every crate the checker links, so resolution needs no registry update.
-  cp "$source_dir/Cargo.lock" "$checker_dir/Cargo.lock"
-  (cd "$checker_dir" && CARGO_TARGET_DIR="$target_dir" cargo build --manifest-path "$checker_dir/Cargo.toml" >&2)
-  printf '%s\n' "$checker_stamp" > "$checker_dir/built-stamp"
 fi
 printf '%s\n' "$target_dir/debug/josh"

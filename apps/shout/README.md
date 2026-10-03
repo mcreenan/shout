@@ -7,7 +7,7 @@ SHOUT is a local coding agent. A Node server owns your projects and threads, run
 From the repository root:
 
 ```sh
-npm run setup      # dependencies, the pinned JOSH/ALLEN build with SHOUT's patches, the skill checker
+npm run setup      # dependencies, the pinned JOSH/ALLEN build with SHOUT's patches
 npm run desktop    # the desktop app: attaches to a running server or starts its own
 npm start          # the server alone; open a printed URL in a browser
 ```
@@ -38,13 +38,12 @@ The server listens on `0.0.0.0:4310` so other devices on your LAN or tailnet can
 | `CODEX_HOME` | `~/.codex` | Where SHOUT finds the Codex login (`auth.json`) to link |
 | `CLAUDE_BIN` | the SDK's bundled Claude Code | Claude Code executable |
 | `JOSH_BIN` | `.cache/josh-allen/target/debug/josh` | JOSH binary |
-| `SHOUT_ALLEN_CHECK` | `shout-allen-check` next to `JOSH_BIN` | Skill checker binary |
 | `JOSH_CACHE_DIR` | `.cache/josh-allen` | Where `tools/setup-josh.sh` clones and builds |
 | `CHROMIUM_BIN` | `/usr/bin/chromium` | Browser for `npm run test:browser` |
 
 The desktop app adds `SHOUT_SERVER_URL`, `SHOUT_ELECTRON_FLAGS` and `SHOUT_DESKTOP_TITLEBAR`; see the [desktop README](../desktop/README.md).
 
-State lives under `SHOUT_STATE_DIR`, ignored by Git: `sessions/<id>.json` (one file per thread), `projects.json`, `workspaces/` (sample copies), `codex-home/` (SHOUT's own Codex home), `runs/` (run scratch) and `shout-tool-catalog.json`.
+State lives under `SHOUT_STATE_DIR`, ignored by Git: `sessions/<id>.json` (one file per thread), `projects.json`, `workspaces/` (sample copies), `codex-home/` (SHOUT's own Codex home), and `runs/` (run scratch).
 
 ## Projects and threads
 
@@ -233,13 +232,14 @@ Server modules (`src/`):
 | `agent.mjs` | `CodexAgent`: one `codex app-server` process, a thread per session, SHOUT's dynamic tools |
 | `claude-agent.mjs` | `ClaudeAgent`: one Claude Code session per thread through the Agent SDK, and the isolation options |
 | `claude-provider.mjs` | `ClaudeProvider`: `model.request` judgments on Claude |
-| `skills.mjs` | Skill discovery, headers and run limits, compile checks with `shout-allen-check`, entry input, output rendering, the authoring guide with the generated catalog |
+| `skills.mjs` | Skill discovery, headers and run limits, compile checks (through `JoshHost`), entry input, output rendering, the authoring guide with the generated catalog |
+| `josh-host.mjs` | `JoshHost`: SHOUT's long-lived `josh serve` processes, one checker for `program/check` (results in SHOUT's shape, `SHOUT001`/`SHOUT007`) and a pool of run connections reused after a clean finish |
 | `tools.mjs` | The host tool catalog for skills and programs, and its handlers (approval gates, the per-subcommand `git` option lists and git environment, result size limits) |
 | `workspace.mjs` | Workspace confinement, reads, search, edit planning, checking change sets before approval, applying them, test and shell processes; the sample scenarios |
 | `network.mjs` | The allowed host set, request host/origin validation, the printed URLs |
 | `catalog.mjs` | The original three-tool catalog, used only by `test/engine.test.mjs` with `workflows/*.allen` |
 
-From the owned prototype, SHOUT uses `kernel.mjs` (`Run`: the JOSH handshake, provider dispatch and typed re-asks), `transport.mjs` (`josh serve` framing), `provider.mjs` (`CodexProvider`, the Codex judgment worker) and `schema.mjs` (`callbackCodec`: a JSON Schema for every ALLEN answer type, and the translation of answers to JOSH's encoding). Skill checking uses `shout-allen-check` (`tools/allen-check/`), built by `tools/setup-josh.sh` against the same patched crates, so it reports the same diagnostics as JOSH.
+From the owned prototype, SHOUT uses `kernel.mjs` (`Run`: program load and execution, provider dispatch and typed re-asks), `connection.mjs` (`JoshConnection`: the JOSH handshake, a program cache, one attached run at a time), `transport.mjs` (`josh serve` framing), `provider.mjs` (`CodexProvider`, the Codex judgment worker) and `schema.mjs` (`callbackCodec`: a JSON Schema for every ALLEN answer type, and the translation of answers to JOSH's encoding). Skill checking uses JOSH's own `program/check`, which compiles through the same path as `program/load`, so it reports the same diagnostics as a failed run.
 
 Browser modules (`public/`):
 
@@ -315,6 +315,6 @@ npm run test:browser  # the real UI in Chromium: sample → chat → diff → ap
 npm run test:desktop  # the Electron shell and apps/desktop/test: attach/own/remote modes, bridge, menus, crash and restart handling, client bundle
 ```
 
-The app tests run the real patched compiler and VM, real file and test tools, and a scripted agent and scripted judgments (`test/doubles.mjs`). They cover sessions and approvals, projects and migration, the Claude adapters with a fake SDK, sub-agents, typed re-asks through the real VM (`retries.test.mjs`), the host tools and `git` hardening (`tools.test.mjs`), event-stream backpressure and shutdown (`server.test.mjs`), `/review`'s file limit (`review.test.mjs`), the ask form (`ask-form.test.mjs`), effect origins from a real run, identical diagnostics from the checker and `program/load`, the Flow graph and card rendering over recorded real runs (`test/fixtures/flow-real-*.json`, `flow-retry-real.json`), the sidebar logic, layout, Markdown, network checks and workspace confinement.
+The app tests run the real patched compiler and VM, real file and test tools, and a scripted agent and scripted judgments (`test/doubles.mjs`). They cover sessions and approvals, projects and migration, the Claude adapters with a fake SDK, sub-agents, typed re-asks through the real VM (`retries.test.mjs`), the host tools and `git` hardening (`tools.test.mjs`), event-stream backpressure and shutdown (`server.test.mjs`), `/review`'s file limit (`review.test.mjs`), the ask form (`ask-form.test.mjs`), effect origins from a real run, identical diagnostics from `program/check` and `program/load`, the JOSH checker and run-connection pool (`josh-host.test.mjs`), the Flow graph and card rendering over recorded real runs (`test/fixtures/flow-real-*.json`, `flow-retry-real.json`), the sidebar logic, layout, Markdown, network checks and workspace confinement.
 
 Live checks need signed-in providers and cost a little: `npm run claude:smoke` (`--parts judge,agent,kernel`: one Claude judgment; a two-turn resumed thread; ALLEN programs through JOSH with every answer shape and a forced re-ask; `--model`, `--effort`), and `JOSH_BIN=… node tools/subagents-live-smoke.mjs --provider codex|claude|both` (checks a–f: fan-out, a five-minute tool call, four children at once, cancel, snapshot weight, and a message sent right after a cancel). Results and the earlier live runs are recorded in [GUI verification](../../docs/GUI-VERIFICATION.md).

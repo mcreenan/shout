@@ -8,20 +8,27 @@ SHOUT's agent does not run inside JOSH. The agent is a Codex or Claude thread th
 
 ### Before a run: checking
 
-Skills are listed and checked without starting JOSH. `SkillRegistry.check` in `apps/shout/src/skills.mjs` pipes the source to `shout-allen-check <catalog.json>` (`tools/allen-check/`), a small Rust binary that links the same patched compiler and host crates. It prints one JSON object: `ok`, `diagnostics`, the manifest's `capabilities` and `tools`, the `entry` (name, input and output types, declared effects), and the static debug tables. Results are cached by source digest. SHOUT adds its own entry-input rules (`SHOUT006`) and turns a compiler panic into `SHOUT007`. `run_program` checks the agent's program the same way before running it, so compile errors go back to the agent as diagnostics.
+Skills are checked with JOSH's `program/check`. `SkillRegistry.check` in `apps/shout/src/skills.mjs` calls `JoshHost.check` (`apps/shout/src/josh-host.mjs`), which sends the source to the server's long-lived **checker** connection: one `josh serve`, handshaken once with SHOUT's catalog, serving one check at a time with a 30 s timeout. `JoshHost` turns JOSH's result into SHOUT's shape: `ok`, `diagnostics`, the manifest's `capabilities` and `tools`, the `entry` (name, input and output types, declared effects) and the static debug tables. Results are cached by source digest. SHOUT adds its own entry-input rules (`SHOUT006`), reports a source without an inline manifest as `SHOUT001` (JOSH compiles one with an empty manifest), and turns a compiler panic into `SHOUT007`. A panic takes the whole `josh serve` down, because JOSH compiles on its request loop without `catch_unwind`; checks are serial so the panic is traced to its source, and the checker is opened again on the next check. `run_program` checks the agent's program the same way before running it, so compile errors go back to the agent as diagnostics.
 
-The checker exists because `allen check` compiles without a tool catalog, and because JOSH's `program/load` used to fail without diagnostics. Since patch 0008 both paths call `josh_host::compile_source_bundle`, and `apps/shout/test/diagnostics.test.mjs` checks they report identical diagnostics.
+`program/check` returns the entry's boundary descriptors and declared effects but not the manifest, so `JoshHost` reads the declared capabilities from the source's inline manifest, which the compiler has just accepted. Since patch 0008 `program/check` and `program/load` both call `josh_host::compile_source_bundle`, and `apps/shout/test/diagnostics.test.mjs` checks they report identical diagnostics. Until 2026-10-03 checks went through `shout-allen-check`, a separate Rust binary linking the same crates; `program/check` gave identical results for every built-in skill, workflow, fixture and test source when it was retired.
 
 ### A run
 
-One `Run` is one `josh serve` process, started by `JoshTransport` (`prototypes/owned/src/transport.mjs`) and spoken to over stdin/stdout in `Content-Length` framed JSON, at most 1 MiB per frame. The sequence:
+A run speaks to a `josh serve` process through a `JoshConnection` (`prototypes/owned/src/connection.mjs`), which wraps `JoshTransport` (`prototypes/owned/src/transport.mjs`): stdin/stdout in `Content-Length` framed JSON, at most 1 MiB per frame. A connection is handshaken once:
 
 1. Wait for the `runtime/ready` notification.
-2. `initialize`: protocol `josh/1.8` (JOSH accepts exactly one), language `>=0.1.0, <0.2.0`, `execution_mode: 'unattended'`, and limits: 1 MiB frames, 64 active requests, **one loaded program and one execution per connection**, catalog size.
+2. `initialize`: protocol `josh/1.8` (JOSH accepts exactly one), language `>=0.1.0, <0.2.0`, `execution_mode: 'unattended'`, and limits: 1 MiB frames, 64 active requests, the catalog size, and the programs and executions the connection may hold. JOSH grants the lower of each request and its own ceiling (32 loaded programs, 1,024 executions per connection).
 3. `host/project`: an honest projection saying the host offers only tools.
 4. `catalog/set`: SHOUT's frozen catalog of 13 host tools (`apps/shout/src/tools.mjs`). The same catalog is the compiler's tool contract; programs call `tools.workspace.read.call(...)` and declare `tool.workspace.read@1`.
-5. `program/load`: the source as `src/main.allen`. The reply has the program ID, artifact digest, required tools (checked against the catalog) and, with debug information, the static tables (`debug.constructs`, `debug.effect_sites`, `debug.truncated`). The kernel records `program.loaded` with `sites` and `constructs`.
-6. `execution/start`: entry `main`, SHOUT's input record, the required tools granted, and the wall-time limit (the skill's `minutes`, 30 by default, or none under "No time limits"). The request stays open until the program ends.
+
+SHOUT's `SessionStore` owns one `JoshHost`, shared by the skill registry and every session. Besides the checker it keeps a **pool of run connections** (limits: 32 programs, 1,024 executions), and `CodingSession.runProgram` gives each `Run` one from `JoshHost.acquire()`. JOSH allows one active execution per connection and has no `program/unload`, so a connection serves one run at a time, and concurrent runs in different threads get different connections. A run then sends:
+
+5. `program/load`: the source as `src/main.allen`, unless this connection has loaded the same source before (the connection caches programs by source sha256). The reply has the program ID, artifact digest, required tools (checked against the catalog) and, with debug information, the static tables (`debug.constructs`, `debug.effect_sites`, `debug.truncated`). The kernel records `program.loaded` with `sites` and `constructs`.
+6. `execution/start`: entry `main`, SHOUT's input record, the required tools granted, and the wall-time limit (the skill's `minutes`, 30 by default, or none under "No time limits"). The request stays open until the program ends. JOSH sends an execution's result just before it frees the connection's execution slot, so a start that finds the slot still taken (`request.invalid_state`, nothing started) is sent again after a short wait.
+
+A connection goes back to the pool only when JOSH returned the execution's result (completed, stopped or failed), it has loaded fewer than 31 programs and started fewer than 1,000 executions, and fewer than two connections are idle; anything else retires it. The first check opens a run connection too, and one is reopened whenever the pool is empty, so a run in a warm server starts without spawning a process; after first use two `josh serve` processes stay running (the checker and one run connection). Idle connections don't keep Node running, and `SessionStore.close()` ends them all. A frame naming another execution than the attached run's is dropped and logged.
+
+The prototypes don't use the pool: without a `connection` factory, `Run` opens its own one-shot connection (one program, one execution) and closes it when the run ends.
 
 While the program runs, JOSH sends provider requests to the host:
 
@@ -42,7 +49,7 @@ Approvals are not `user.ask`. They live in SHOUT's tool handlers: `workspace.edi
 
 ### Terminal states
 
-`completed` with the program's output; `stopped` from `stop("reason")`, shown as "`/name` stopped: reason"; `failed` for a runtime trap, a provider failure or a budget, shown as "`/name` failed at line N: message" when the failure has a position in the program (a trap's `error.span`, or for a provider failure or budget the effect's `origin.site`, which the kernel adds to the result as `span`); `cancelled`; `interrupted` when JOSH exits unexpectedly. When the run ends the kernel closes stdin, sends SIGTERM and, after 300 ms, SIGKILL. Nothing about a run survives a server restart; unfinished runs are marked interrupted.
+`completed` with the program's output; `stopped` from `stop("reason")`, shown as "`/name` stopped: reason"; `failed` for a runtime trap, a provider failure or a budget, shown as "`/name` failed at line N: message" when the failure has a position in the program (a trap's `error.span`, or for a provider failure or budget the effect's `origin.site`, which the kernel adds to the result as `span`); `cancelled`; `interrupted` when JOSH exits unexpectedly. A run that ends any other way than with JOSH's result (a cancel, the host's wall-time budget, a provider failure, a lost connection) retires its connection: the kernel closes stdin, sends SIGTERM and, after 300 ms, SIGKILL, as it does for every one-shot connection. Nothing about a run survives a server restart; unfinished runs are marked interrupted.
 
 ## What was wrong or awkward
 
@@ -73,7 +80,7 @@ Nine patches, applied by `tools/setup-josh.sh` onto `abb8a97` (46 files, about 6
 | 0008 compile diagnostics and `program/check` | Load failures had no diagnostics | `program/load` fails with `program.invalid` and `data.diagnostics`; the new `program/check` compiles without loading. The kernel puts the first five diagnostics in the failure message and the full list on the result. Checker and JOSH share one compile path. Protocol `josh/1.8` |
 | 0009 execution-wide operation IDs | `operation_id` was only unique per family | `op-<n>` is unique per execution. SHOUT does not use it yet |
 
-The protocol literal `josh/1.8` appears in `prototypes/owned/src/kernel.mjs` and `prototypes/native/src/josh.mjs`; both native and owned prototypes pass their tests against the patched build.
+The protocol literal `josh/1.8` appears in `prototypes/owned/src/connection.mjs` (in `kernel.mjs` before 2026-10-03) and `prototypes/native/src/josh.mjs`; both native and owned prototypes pass their tests against the patched build.
 
 ### Typed responses (2026-09-28, SHOUT only)
 
@@ -153,29 +160,28 @@ Tests: `prototypes/owned/test/kernel.test.mjs` checks that origins, tables and d
 
 ## What remains awkward
 
-- **A process and a full handshake per run.** Each run spawns `josh serve` and makes four requests before the program starts; the negotiated limits allow one program and one execution per connection. Cheap on this machine, but it is also why nothing can be kept warm or shared.
-- **Two compile paths to keep built.** Checking still needs the separate `shout-allen-check` binary (a 140 MB debug build) even though `program/check` now exists.
-- **Exact-version lockstep.** The pin, nine patches, two protocol literals and the checker must change together, because JOSH accepts one protocol version and rejects unknown fields.
+- **One execution per connection, and no unloading.** JOSH runs one execution at a time on a connection and cannot unload a program, so SHOUT keeps a pool instead of one shared process, and retires a connection after 31 loaded programs. A cancelled or timed-out run still costs a process, because killing it is the only way to be sure nothing of the run continues.
+- **A compiler panic kills the checker.** JOSH compiles on its request loop without `catch_unwind`, so `SHOUT007` costs a process restart, and checks are serial so the panic can be traced to its source.
+- **Exact-version lockstep.** The pin, nine patches and two protocol literals must change together, because JOSH accepts one protocol version and rejects unknown fields.
 - **Nothing survives a restart.** JOSH has replay journals; SHOUT does not use them, so an interrupted run cannot resume.
 - **Record fields arrive in alphabetical order.** JOSH's response descriptor keeps a record's fields in a sorted map, so the ask form lists them by name, not in declaration order. Keeping the declared order needs a change to JOSH's schema descriptor.
 - **Worker failures fail the run, not the call.** Worker transport failures, timeouts and budgets fail the run on purpose: JOSH's recoverable form (`model.unavailable`) would hide the actionable message behind the program's own `Err` handling. Unusable answers are different: both workers report them so that JOSH asks again.
 - **ALLEN programs cannot call agents.** The kernel rejects `agent/*`, `sub_agent/*` and `permission/request`; sub-agents exist only as the SHOUT agent's `spawn_agents` tool.
 - **Effect events cover tools only.** `execution/event` emits `effect_started/completed/failed` for tool calls; model, user and agent requests are visible only as provider requests.
 - **An untyped event contract.** Kernel events are plain objects spread into the session log; nothing checks their shape between kernel, session and UI. The effect `origin` shares its name with `user.answered`'s `origin` (who answered), which is confusing though they never meet on one event.
-- **Debug tables can be truncated** for a large program (over 256 KiB of tables). Origins still arrive with every request, so grouping still works, but `match` chips read `arm N` instead of the pattern, chip tooltips fall back to the source line, and the Program tab cannot dim sites missing from the table.
+- **Debug tables can be truncated** for a large program (over 256 KiB of tables, in `program/load` and `program/check` alike; `shout-allen-check` had no cap, but nothing in SHOUT reads the check's tables). Origins still arrive with every request, so grouping still works, but `match` chips read `arm N` instead of the pattern, chip tooltips fall back to the source line, and the Program tab cannot dim sites missing from the table.
 
 ## Next steps, in priority order
 
 Effort figures are rough estimates for one person familiar with both codebases.
 
-1. **One long-lived `josh serve` per server, and `program/check` instead of the checker** (2–3 days). Raise the per-connection program and execution limits, unload programs after use, keep one connection per session or one shared, and retire `tools/allen-check`. Saves a process and a handshake per run and one of the two builds.
-2. **Resume from replay journals** (a week or more). Persist each run's journal, replay on restart, and define what happens to effects that were pending (an approval shown before the restart must be asked again; a half-applied write must not be repeated).
-3. **Effect events for every provider** (1–2 days in JOSH). Emit `effect_*` events for model, user and agent requests, so the event log does not depend on the host's own bookkeeping.
-4. **Upstream the patches and bump the pin** (half a day plus review). Independent of the items above and worth doing early, since every further JOSH change otherwise adds another local patch. See below.
+1. **Resume from replay journals** (a week or more). Persist each run's journal, replay on restart, and define what happens to effects that were pending (an approval shown before the restart must be asked again; a half-applied write must not be repeated). Planned in [`docs/proposals/runtime/IMPLEMENTATION-PLAN.md`](proposals/runtime/IMPLEMENTATION-PLAN.md) (phase 4).
+2. **Effect events for every provider** (1–2 days in JOSH). Emit `effect_*` events for model, user and agent requests, so the event log does not depend on the host's own bookkeeping.
+3. **Upstream the patches and bump the pin** (half a day plus review). Independent of the items above and worth doing early, since every further JOSH change otherwise adds another local patch. See below.
 
 ## Regenerating and upstreaming the patches
 
-The development branch is `shout/effect-origin` in `.worktrees/josh-allen`, one commit per logical change on top of `abb8a97`. **It exists only in that local clone; it has not been pushed.** `.worktrees/` is ignored by Git, so a fresh clone of SHOUT has only the patch files. [`tools/josh-patches/README.md`](../tools/josh-patches/README.md) lists the boundary commits for each patch, the exact `git diff` invocation that regenerates one, the Rust checks to run first, and how to try a clone's build in SHOUT with `JOSH_BIN` and `SHOUT_ALLEN_CHECK` before switching the shared cache.
+The development branch is `shout/effect-origin` in `.worktrees/josh-allen`, one commit per logical change on top of `abb8a97`. **It exists only in that local clone; it has not been pushed.** `.worktrees/` is ignored by Git, so a fresh clone of SHOUT has only the patch files. [`tools/josh-patches/README.md`](../tools/josh-patches/README.md) lists the boundary commits for each patch, the exact `git diff` invocation that regenerates one, the Rust checks to run first, and how to try a clone's build in SHOUT with `JOSH_BIN` before switching the shared cache.
 
 To upstream:
 

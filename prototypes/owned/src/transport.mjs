@@ -78,6 +78,7 @@ export class JoshTransport {
   send(message) { this.write(this.encode(message)); }
   request(method, params) {
     const id = `host-${++this.nextId}`;
+    this.lastRequestId = id;
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
       try { this.send({ kind: 'request', id, method, params }); }

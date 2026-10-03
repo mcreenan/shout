@@ -4,13 +4,10 @@ import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Ajv from 'ajv';
-import { JoshTransport } from './transport.mjs';
+import { JoshConnection, limits } from './connection.mjs';
 import { callbackCodec, validate, schemaErrors, SchemaRejection, record, textField, chatSchema } from './schema.mjs';
 
 export const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const host = { name: 'owned-allen-prototype', version: '0.1.0' };
-const limits = { max_frame_bytes: 1048576, max_active_requests: 64, max_loaded_programs: 1,
-  max_total_executions: 1, max_catalog_tools: 1, max_catalog_bytes: 1048576 };
 const tool = { name: 'review_draft', version: '1.0.0', description: 'Write one synthetic review draft into this run scratch directory. No external issue is changed.',
   input_schema: record({ ticket_id: textField, reason: textField }), output_schema: record({ text: textField }),
   error_schema: record({ message: textField }), effects: [], idempotency: 'non_idempotent' };
@@ -61,8 +58,14 @@ function withRetryNote(prompt, attempt, issues, unparseable) {
 export const DEFAULT_RUN_WALL_MS = 30 * 60 * 1000;
 
 export class Run extends EventEmitter {
-  constructor({ provider, source, input, scratchRoot, wallMs = DEFAULT_RUN_WALL_MS, tools = [tool], toolHandler, maxModelJudgments = 3, maxToolCalls = 16, maxUserQuestions = 8 }) {
+  /**
+   * `connection`, if given, returns (a promise of) a handshaken JoshConnection for this run's tools, which
+   * the run releases when it ends. Without it the run opens its own one-shot connection and closes it.
+   */
+  constructor({ provider, source, input, scratchRoot, wallMs = DEFAULT_RUN_WALL_MS, tools = [tool], toolHandler, maxModelJudgments = 3, maxToolCalls = 16, maxUserQuestions = 8, connection }) {
     super();
+    if (connection !== undefined && typeof connection !== 'function') throw new Error('Connection factory must be a function');
+    this.connectionFactory = connection;
     if (wallMs !== null && (!Number.isInteger(wallMs) || wallMs < 1 || wallMs > 2 * 60 * 60 * 1000)) throw new Error('Wall-time budget must be 1–7200000 ms or null');
     if (!Number.isInteger(maxModelJudgments) || maxModelJudgments < 0 || maxModelJudgments > 64) throw new Error('Model budget must be 0–64');
     if (!Number.isInteger(maxToolCalls) || maxToolCalls < 0 || maxToolCalls > 256) throw new Error('Tool budget must be 0–256');
@@ -111,7 +114,7 @@ export class Run extends EventEmitter {
     try {
       await mkdir(this.scratch, { recursive: true });
       if (terminal(this.state)) return;
-      this.transport = new JoshTransport({ onRequest: frame => this.dispatch(frame),
+      const handlers = { executionId: this.id, onRequest: frame => this.dispatch(frame),
         onNotification: frame => {
           if (terminal(this.state)) return;
           if (frame.kind === 'cancel') {
@@ -121,26 +124,28 @@ export class Run extends EventEmitter {
               this.event('effect.cancelled', { id: effect.id });
             }
           } else this.event('vm.event', { method: frame.method, detail: frame.params });
-        }, onFailure: error => this.finish('interrupted', { outcome: 'interrupted', error: error.message }) });
-      await this.transport.ready;
-      await this.transport.request('initialize', { host, protocol_versions: ['josh/1.8'], language_versions: ['>=0.1.0, <0.2.0'],
-        execution_mode: 'unattended', invoking_session_id: null, standard_capabilities: [], limits: { ...limits, max_catalog_tools: Math.max(1, this.tools.length) }, extensions: [] });
-      const metadata = { source: host.name, source_revision: host.version, observed_at_unix_ms: Date.now(), freshness: 'current', complete: true };
-      await this.transport.request('host/project', { profile: 'josh.host-projection/0.1', projection_id: this.id,
-        host, session_binding: 'none', sections: ['tools', 'resources', 'attachments', 'transcript', 'models', 'user_interaction', 'agents', 'roots', 'permissions', 'telemetry'].map(kind => ({
-          kind, ...metadata, item_count: kind === 'tools' ? this.tools.length : 0 })) });
-      await this.transport.request('catalog/set', { schema_dialect: 'https://json-schema.org/draft/2020-12/schema', metadata, tools: this.tools });
-      const loaded = await this.transport.request('program/load', { format: 'source_bundle', files: [{ path: 'src/main.allen', encoding: 'utf8', content: this.source }] });
+        }, onFailure: error => this.finish('interrupted', { outcome: 'interrupted', error: error.message }) };
+      let connection;
+      if (this.connectionFactory) {
+        connection = await this.connectionFactory();
+        // Ended while it waited: an unused connection is still clean.
+        if (terminal(this.state)) { connection.release({ clean: true }); return; }
+      } else connection = new JoshConnection({ tools: this.tools, projectionId: this.id });
+      this.connection = connection; this.transport = connection.transport;
+      connection.attach(handlers);
+      await connection.ready;
+      const loaded = await connection.load(this.source);
       if (!Array.isArray(loaded.required_tools) || loaded.required_tools.some(name => !this.toolMap.has(name))) throw new Error('Program requests an unauthorized tool');
       // With debug information JOSH also returns the program's static construct and effect-site
       // tables; `origin.scope[].construct` and `origin.site.id` refer to them.
       const tables = loaded.debug ? { sites: loaded.debug.effect_sites, constructs: loaded.debug.constructs } : {};
       this.state = 'running'; this.event('program.loaded', { artifactDigest: loaded.artifact_digest, tools: loaded.required_tools, ...tables });
-      const result = await this.transport.request('execution/start', { execution_id: this.id, program_id: loaded.program_id,
+      const result = await connection.start({ execution_id: this.id, program_id: loaded.program_id,
         artifact_digest: loaded.artifact_digest, entry: 'main', input: this.input, working_directory: null,
         granted_capabilities: [], granted_tools: loaded.required_tools, allowed_http_origins: [], granted_exec: [], granted_exec_environment: [], limits: this.wallMs === null ? {} : { wall_ms: this.wallMs } });
       const state = result.outcome === 'completed' ? 'completed' : result.outcome === 'cancelled' ? 'cancelled' : result.outcome === 'stopped' ? 'stopped' : 'failed';
-      this.finish(state, result);
+      // JOSH finished the execution, so the connection can serve another run.
+      this.finish(state, result, { clean: true });
     } catch (error) {
       // A source program that does not compile fails program/load with the compiler's diagnostics.
       const diagnostics = error.wire?.data?.diagnostics;
@@ -269,20 +274,20 @@ export class Run extends EventEmitter {
   // run, and answer() leaves the question open for another answer.
   respond(effect, result) {
     if (!this.isPending(effect)) return;
-    this.commit(effect, this.transport.encode({ kind: 'response', id: effect.wireId, result }));
+    this.commit(effect, this.connection.encode({ kind: 'response', id: effect.wireId, result }));
   }
   commit(effect, frame) {
     this.effects.delete(effect.id); this.counters.automaticProviderReplies++;
-    this.transport.write(frame);
+    this.connection.write(frame);
     this.settleState();
     this.event('effect.resolved', { id: effect.id, method: effect.method });
   }
   rejectEffect(effect, code, message) {
     if (!this.isPending(effect)) return;
     const text = String(message).slice(0, 1024);
-    const frame = this.transport.encode({ kind: 'response', id: effect.wireId, error: { code, message: text } });
+    const frame = this.connection.encode({ kind: 'response', id: effect.wireId, error: { code, message: text } });
     this.effects.delete(effect.id);
-    this.transport.write(frame);
+    this.connection.write(frame);
     this.event('effect.rejected', { id: effect.id, code, message: text });
   }
   answer(id, value, origin = 'user') {
@@ -292,7 +297,7 @@ export class Run extends EventEmitter {
     // being asked again by JOSH.
     validate(effect.schema, value);
     let frame;
-    try { frame = this.transport.encode({ kind: 'response', id: effect.wireId, result: { value: effect.codec ? effect.codec.toWire(value) : value } }); }
+    try { frame = this.connection.encode({ kind: 'response', id: effect.wireId, result: { value: effect.codec ? effect.codec.toWire(value) : value } }); }
     catch (error) { throw new Error(`Answer not sent: ${error.message}. The question is still open.`); }
     const interaction = this.interactions.get(effect.params.interaction_id);
     if (interaction) Object.assign(interaction, { codec: effect.codec, answer: value });
@@ -303,11 +308,12 @@ export class Run extends EventEmitter {
     this.finish('cancelled', { outcome: 'cancelled', reason: 'Cancelled by session owner' });
     return this.snapshot();
   }
-  finish(state, result) {
+  // `clean` only when JOSH returned the execution's result; every other end retires the connection.
+  finish(state, result, { clean = false } = {}) {
     if (terminal(this.state)) return;
     this.state = state; this.result = result; clearTimeout(this.timer); this.abort.abort();
     for (const effect of this.effects.values()) effect.abort.abort();
-    this.effects.clear(); this.transport?.close();
+    this.effects.clear(); this.connection?.release({ clean });
     this.event('run.terminal', { state, result, counters: { ...this.counters } });
     this.resolveDone(this.snapshot());
   }

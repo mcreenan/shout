@@ -9,7 +9,7 @@ SHOUT explores a unified agent harness and programming runtime, building on the 
 SHOUT is a local coding agent that runs as a desktop app and serves the same UI to browsers on your LAN and Tailscale. You add project folders, talk to an agent in threads, and approve every file change and command it proposes. Deterministic work (reading, searching, looping, applying edits, running tests) runs as ALLEN programs in the JOSH VM; the model is asked only for typed judgments, and an answer of the wrong type is asked for again. The Flow view and Program tab show what each program did and on which source lines.
 
 ```sh
-npm run setup      # dependencies, the pinned JOSH/ALLEN build with SHOUT's patches, the skill checker
+npm run setup      # dependencies, the pinned JOSH/ALLEN build with SHOUT's patches
 npm run desktop    # the desktop app; it attaches to a running server or starts its own
 npm start          # or only the server: open a printed LAN or Tailscale URL in any browser
 ```
@@ -29,7 +29,7 @@ Full usage, architecture, HTTP API, limits and the security model: **[SHOUT app]
 
 ```sh
 export JOSH_BIN="$(bash tools/setup-josh.sh)"
-npm run verify        # syntax checks, 55 prototype tests, 4 interactive CLI scenarios, 198 app tests
+npm run verify        # syntax checks, 55 prototype tests, 4 interactive CLI scenarios, 206 app tests
 npm run test:browser  # the real UI in Chromium, with a scripted agent and judgments
 npm run test:desktop  # the Electron shell, including remote mode and the client bundle
 npm run claude:smoke  # live: a Claude judgment, a resumed two-turn thread and ALLEN programs with re-asks (costs a little)

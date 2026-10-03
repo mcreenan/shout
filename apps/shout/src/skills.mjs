@@ -1,10 +1,9 @@
-import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readdir, readFile, writeFile, mkdir, stat } from 'node:fs/promises';
+import { readdir, readFile, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { joshBinary } from '../../../prototypes/owned/src/transport.mjs';
+import { JoshHost } from './josh-host.mjs';
 import { shoutTools } from './tools.mjs';
 
 // fileURLToPath decodes the URL: `.pathname` keeps spaces and other characters percent-encoded.
@@ -90,26 +89,19 @@ const contradictions = [
 ];
 
 export class SkillRegistry {
-  constructor({ stateRoot, checker = process.env.SHOUT_ALLEN_CHECK } = {}) {
-    this.stateRoot = stateRoot; this.checker = checker; this.cache = new Map();
+  /** `josh` is the JoshHost whose checker compiles skills; without one the registry opens (and closes) its own. */
+  constructor({ josh } = {}) {
+    this.ownsJosh = !josh; this.josh = josh ?? new JoshHost({ tools: shoutTools }); this.cache = new Map();
   }
-  checkerPath() { return this.checker ?? join(dirname(joshBinary()), 'shout-allen-check'); }
-  async catalogFile() {
-    this.catalogPath ??= (async () => {
-      const path = join(this.stateRoot, 'shout-tool-catalog.json');
-      await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-      await writeFile(path, JSON.stringify(catalogParams()), { mode: 0o600 });
-      return path;
-    })();
-    return this.catalogPath;
-  }
-  /** Compiles source against SHOUT's catalog. Cached by source digest. */
+  /** Ends the registry's own JOSH processes (a shared JoshHost is closed by its owner). */
+  close() { if (this.ownsJosh) this.josh.close(); }
+  /** Compiles source against SHOUT's catalog with JOSH's program/check. Cached by source digest. */
   async check(source) {
     if (Buffer.byteLength(source) > MAX_SOURCE_BYTES) return { ok: false, diagnostics: [{ line: 1, column: 1, code: 'SHOUT003', message: 'Skill source exceeds 64 KiB' }] };
     const key = createHash('sha256').update(source).digest('hex');
     if (!this.cache.has(key)) {
       if (this.cache.size > 200) this.cache.clear();
-      this.cache.set(key, runChecker(this.checkerPath(), await this.catalogFile(), source).catch(error => { this.cache.delete(key); throw error; }));
+      this.cache.set(key, this.josh.check(source).catch(error => { this.cache.delete(key); throw error; }));
     }
     return this.cache.get(key);
   }
@@ -170,24 +162,6 @@ export class SkillRegistry {
     const skill = (await this.list(workspacePath)).find(candidate => candidate.name === name);
     return skill && options?.withSource ? this.load(skill, options) : skill;
   }
-}
-
-function runChecker(binary, catalog, source) {
-  return new Promise((resolveCheck, reject) => {
-    const child = execFile(binary, [catalog], { timeout: 30_000, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
-      // A compiler panic is a property of this source, not an unavailable checker.
-      const panic = /panicked at [^\n]*\n([^\n]*)/.exec(stderr);
-      if (panic) return resolveCheck({ ok: false, diagnostics: [{ line: 1, column: 1, code: 'SHOUT007', message: `The ALLEN compiler crashed on this source (a compiler bug, not your error): ${panic[1].trim()}. Restructuring the program usually avoids it.` }] });
-      if (error) return reject(new Error(stderr.trim() || error.message));
-      let result;
-      try { result = JSON.parse(stdout); } catch { return reject(new Error('Checker returned invalid JSON')); }
-      for (const diagnostic of result.diagnostics ?? []) {
-        if (/not in the frozen catalog/.test(diagnostic.message)) diagnostic.message += '. Add the tool to the manifest tools.required list, and check its name against the SHOUT tool catalog.';
-      }
-      resolveCheck(result);
-    });
-    child.stdin.end(source);
-  });
 }
 
 export function catalogParams() {
