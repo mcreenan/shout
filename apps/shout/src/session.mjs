@@ -74,6 +74,12 @@ const toolActivity = (tool, input = {}) => {
 const noUsage = () => ({ input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 });
 const usageRecord = usage => ({ input_tokens: usage.inputTokens ?? 0, cached_input_tokens: usage.cachedInputTokens ?? 0, output_tokens: usage.outputTokens ?? 0 });
 const failure = outcome => outcome.result?.error?.message ?? outcome.result?.error ?? outcome.result?.reason ?? JSON.stringify(outcome.result);
+// Where a failed run failed in its own source: a trap's error span, or the span the kernel gives a host
+// failure (an exhausted budget, a provider failure) at the effect's site. Null without a line in the program.
+const failureSpan = outcome => {
+  const span = outcome.result?.error?.span ?? outcome.result?.span;
+  return span?.source === 'src/main.allen' && Number.isInteger(span.line) ? span : null;
+};
 const clip = text => (text.length > RESULT_CHARS ? `${text.slice(0, RESULT_CHARS)}\n[truncated at ${RESULT_CHARS} characters]` : text);
 // An answer's value in its chat echo: as given, or cut to 500 characters of text (its JSON unless it is a string).
 const echoValue = value => { const json = JSON.stringify(value); return json.length <= 500 ? { value } : { value: `${(typeof value === 'string' ? value : json).slice(0, 499)}…`, truncated: true }; };
@@ -315,7 +321,12 @@ export class CodingSession extends EventEmitter {
       outcome = await this.runGenerated(input.program, input.args || text, controller, current);
     }
     if (!outcome) throw new Error('The task was cancelled');
-    if (outcome.state !== 'completed') throw new Error(`${label} ${outcome.state}: ${failure(outcome)}`);
+    if (outcome.state !== 'completed') {
+      // The agent can fix its own program from the failing line, like the compile diagnostics above.
+      const line = this.data.runs.find(run => run.id === outcome.id)?.failedAt?.line;
+      const quote = line && tool === 'run_program' ? `\n  ${input.program.split('\n')[line - 1].trim()}` : '';
+      throw new Error(`${label} ${outcome.state}${line ? ` at line ${line}` : ''}: ${failure(outcome)}${quote}`);
+    }
     return `${label} completed. Its result, as shown to the user:\n\n${renderOutput(outcome.result?.output)}`;
   }
   // One read tool call, recorded as a tool step by `emit` (into the session's events or a sub-agent's).
@@ -530,10 +541,14 @@ export class CodingSession extends EventEmitter {
     if (this.run === run) this.run = null;
     if (!current()) return;
     Object.assign(item, outcome);
+    // A failure inside the program names its line; the message links to it in the Program tab.
+    const span = outcome.state === 'failed' ? failureSpan(outcome) : null;
+    const line = span && span.line >= 1 && span.line <= programSource.split('\n').length ? span.line : null;
+    if (line) item.failedAt = { line, column: span.column, end_line: span.end_line, end_column: span.end_column };
     this.data.question = null; this.data.status = after ?? outcome.state;
     const output = outcome.result?.output;
     if (outcome.state === 'completed') this.messageRecord('assistant', format(output));
-    else this.messageRecord('assistant', `${skill ? `\`/${skill}\`` : generated ? 'The program' : 'Workflow'} ${outcome.state}: ${failure(outcome)}`);
+    else this.messageRecord('assistant', `${skill ? `\`/${skill}\`` : generated ? 'The program' : 'Workflow'} ${outcome.state}${line ? ` at line ${line}` : ''}: ${failure(outcome)}`, line ? { failure: { run: run.id, line } } : {});
     this.changed();
     return outcome;
   }

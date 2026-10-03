@@ -376,6 +376,9 @@ body.dragging-tab .resizer{pointer-events:none}
 .diag-message{font-family:var(--font);color:var(--text);overflow-wrap:anywhere}
 .code-line.diag{background:var(--danger-soft)}
 .code-line.diag .ln{color:var(--danger);font-weight:600}
+/* The line a failed run failed at, in the Program tab: the diagnostic tint, with the error beside it. */
+.code-line.error-line{background:var(--danger-soft)}
+.code-line.error-line .ln{color:var(--danger);font-weight:600}
 .diag-inlay{flex-shrink:1;max-width:45%;margin:2px 12px 0 8px;padding:0 8px;border:1px solid var(--danger-border);border-radius:10px;background:var(--surface);color:var(--danger);font:500 11px/18px var(--font);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
 /* Run cards in the chat: icon, name and status dot; the steps trail off in one muted line until expanded. */
@@ -391,6 +394,10 @@ body.dragging-tab .resizer{pointer-events:none}
 .state-dot.completed{background:var(--ok)}.state-dot.failed,.state-dot.interrupted{background:var(--danger)}.state-dot.question{background:var(--warn)}
 .state-dot.active{background:var(--accent-text);animation:pulse 1.2s infinite}
 .run-state{font-size:var(--fs-sm);color:var(--danger);white-space:nowrap}
+/* "failed at line N" and a failure message's "line N" open the Program tab there; they read as links. */
+.run-failed-at,.message-line{border-radius:var(--radius-xs);text-underline-offset:3px}
+.run-failed-at:hover,.message-line:hover{text-decoration:underline}
+.message-line{margin-top:4px;font:500 var(--fs-sm) var(--mono);color:var(--danger)}
 /* Collapsed: the latest six steps in one muted line. Expanded: every step as a chip on its own row. */
 .run-steps{display:flex;flex:1;min-width:0;list-style:none;margin:0;padding:0;overflow:hidden;white-space:nowrap;-webkit-mask-image:linear-gradient(to right,#000 85%,transparent);mask-image:linear-gradient(to right,#000 85%,transparent)}
 .run-step{font:var(--fs-xs)/20px var(--mono);color:var(--text-3)}

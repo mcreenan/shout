@@ -344,6 +344,21 @@ export function stepFailed(step) {
   return Number.isInteger(code) && code !== 0;
 }
 
+/**
+ * Where a failed run failed, as `{ line, column, message }`, or null: the session's `failedAt`, else (for
+ * sessions saved before it) the error span the run's result carries. Only a span in the program's own source
+ * whose line exists counts.
+ */
+export function runFailure(run) {
+  if (run?.state !== 'failed') return null;
+  const result = run.result || {};
+  const message = String(result.error?.message ?? result.error ?? '');
+  const at = run.failedAt ?? [result.error?.span, result.span].find((span) => span?.source === 'src/main.allen');
+  if (!at || !Number.isInteger(at.line) || at.line < 1) return null;
+  if (typeof run.source === 'string' && at.line > run.source.split('\n').length) return null;
+  return { line: at.line, column: Number.isInteger(at.column) ? at.column : null, message };
+}
+
 const lineCache = { source: null, lines: [] };
 /** A 1-based line of a program's source, or ''. */
 export function sourceLine(source, line) {

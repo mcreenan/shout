@@ -39,6 +39,12 @@ function rejectedAnswer(error, schema) {
   if (error?.code === 'invalid_answer') return 'value' in error ? error.value : UNPARSEABLE;
   return null;
 }
+// `{ span }` at an effect's source site (from its origin), in the shape of a runtime error's span; else {}.
+const siteSpan = origin => {
+  const site = origin?.site;
+  if (!site || typeof site !== 'object' || !Number.isInteger(site.line)) return {};
+  return { span: Object.fromEntries(['source', 'start', 'end', 'line', 'column', 'end_line', 'end_column'].filter(key => key in site).map(key => [key, site[key]])) };
+};
 const issueText = { type: 'wrong type', required: 'missing', unknown: 'not allowed here', range: 'out of range',
   fields: 'wrong set of fields', length: 'wrong number of items', encoding: 'not valid base64', tag: 'unknown variant tag',
   // The kernel sorts map entries into JOSH's key order, so an order issue is a repeated key.
@@ -246,8 +252,9 @@ export class Run extends EventEmitter {
     } catch (error) {
       if (this.isPending(effect)) {
         this.event('effect.failed', { id, message: error.message });
-        // Provider failures fail this run. No guessed values and no silent fallback.
-        this.finish('failed', { outcome: 'failed', error: error.message });
+        // Provider failures fail this run. No guessed values and no silent fallback. The span is the
+        // effect's source site, like a trap's error span.
+        this.finish('failed', { outcome: 'failed', error: error.message, ...siteSpan(params.origin) });
       }
     }
   }

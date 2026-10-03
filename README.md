@@ -29,7 +29,7 @@ Full usage, architecture, HTTP API, limits and the security model: **[SHOUT app]
 
 ```sh
 export JOSH_BIN="$(bash tools/setup-josh.sh)"
-npm run verify        # syntax checks, 55 prototype tests, 4 interactive CLI scenarios, 189 app tests
+npm run verify        # syntax checks, 55 prototype tests, 4 interactive CLI scenarios, 195 app tests
 npm run test:browser  # the real UI in Chromium, with a scripted agent and judgments
 npm run test:desktop  # the Electron shell, including remote mode and the client bundle
 npm run claude:smoke  # live: a Claude judgment, a resumed two-turn thread and ALLEN programs with re-asks (costs a little)

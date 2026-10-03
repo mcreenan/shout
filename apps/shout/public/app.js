@@ -4,7 +4,7 @@ import { codeBlock, renderMarkdown } from './markdown-dom.js';
 import { createFlowCanvas } from './flow-canvas.js';
 import { createFlowDetail } from './flow-detail.js';
 import { createAgentPane } from './flow-agent.js';
-import { programActivity } from './flow.js';
+import { programActivity, runFailure } from './flow.js';
 import { popover, renderModels, renderEfforts, renderMenu } from './model-picker.js';
 import { askForm, kindOf } from './ask-form.js';
 import * as shell from './desktop.js';
@@ -126,7 +126,15 @@ function runCard(run) {
   }
   title.append(icon(run.skill ? 'i-skill' : 'i-code'), name, runDot(run));
   card.append(title);
-  if (['failed', 'interrupted', 'cancelled'].includes(run.state)) card.append(el('span', 'run-state', stateText(run.state)));
+  // A run that failed inside its program opens the Program tab on the failing line.
+  const failure = runFailure(run);
+  if (failure) {
+    const at = el('button', 'run-state run-failed-at', `failed at line ${failure.line}`);
+    at.type = 'button';
+    if (failure.message) at.title = failure.message;
+    at.addEventListener('click', () => showProgramLine(run.id, failure.line));
+    card.append(at);
+  } else if (['failed', 'interrupted', 'cancelled'].includes(run.state)) card.append(el('span', 'run-state', stateText(run.state)));
   const all = runSteps(run);
   const actions = el('div', 'run-card-actions');
   if (all.length) {
@@ -187,6 +195,15 @@ function messageItem(message) {
   const content = el('div', 'message-text');
   if (role === 'assistant') appendMarkdown(content, message.content); else appendContent(content, message.content);
   body.append(content);
+  // A run's failure message links to the failing line.
+  const failure = message.failure;
+  if (failure && typeof failure.run === 'string' && Number.isInteger(failure.line)) {
+    const link = el('button', 'message-line', `line ${failure.line}`);
+    link.type = 'button';
+    link.setAttribute('aria-label', `Open the program at line ${failure.line}`);
+    link.addEventListener('click', () => showProgramLine(failure.run, failure.line));
+    body.append(link);
+  }
   item.append(body, stamp);
   return item;
 }
@@ -199,7 +216,7 @@ function renderMessages() {
   $('flow-stage').hidden = !flow;
   $('chat-pane').classList.toggle('flow-mode', flow);
   if (flow) return syncFlowCanvas();
-  const signature = JSON.stringify([state.session?.id, messages, runs.map((run) => [run.id, run.state, runSteps(run).map((step) => step.label)])]);
+  const signature = JSON.stringify([state.session?.id, messages, runs.map((run) => [run.id, run.state, runFailure(run)?.line, runSteps(run).map((step) => step.label)])]);
   if (signature === state.messageSignature) return;
   state.messageSignature = signature;
   const list = $('messages');
@@ -822,6 +839,12 @@ function renderProgram(tab) {
   pane.marks = target.run ? programMarks(pane, events, activity, active) : new Map();
   pane.calls = activity.calls;
   if (tab.focusLine) { pane.focusLine = tab.focusLine; tab.focusLine = null; pane.rows[pane.focusLine - 1]?.scrollIntoView({ block: 'center' }); }
+  // The line a failed run failed at, with the error beside it. It is scrolled to once, unless a line has focus.
+  const failure = target.run ? runFailure(target.run) : null;
+  const failed = failure && pane.rows[failure.line - 1] ? failure : null;
+  const shown = failed ? `${key}:${failed.line}` : '';
+  if (failed && pane.failureShown !== shown && !pane.focusLine) pane.rows[failed.line - 1].scrollIntoView({ block: 'center' });
+  pane.failureShown = shown;
   let currentLine = null;
   pane.rows.forEach((row, i) => {
     const line = i + 1;
@@ -837,6 +860,15 @@ function renderProgram(tab) {
     row.classList.toggle('unreached', !!mark && !mark.count && !active);
     row.classList.toggle('loop-line', !!loop);
     row.classList.toggle('focus', line === pane.focusLine);
+    const failedHere = line === failed?.line;
+    row.classList.toggle('error-line', failedHere);
+    let errorInlay = row.querySelector(':scope > .error-inlay');
+    if (failedHere && !errorInlay) errorInlay = row.appendChild(el('span', 'diag-inlay error-inlay'));
+    if (errorInlay) {
+      errorInlay.hidden = !failedHere;
+      errorInlay.textContent = failedHere ? failed.message || 'failed here' : '';
+      row.title = failedHere ? errorInlay.textContent : '';
+    }
     // A helper's call line counts the effects beneath it, more quietly than an effect site.
     const call = target.run && !mark ? activity.calls.get(line) : null;
     const counted = mark && (mark.count || mark.state) ? mark : call;

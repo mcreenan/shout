@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { buildFlow, formatDuration, modelTask, modelOutput, toolResult, originOf, programShape, programActivity, loopTitle, branchLabel, scopePath, spanText, stepFailed, plural, issueLabel } from '../public/flow.js';
+import { buildFlow, formatDuration, modelTask, modelOutput, toolResult, originOf, programShape, programActivity, loopTitle, branchLabel, scopePath, spanText, stepFailed, plural, issueLabel, runFailure } from '../public/flow.js';
 
 let sequence = 0;
 const at = (ms, type, fields = {}) => ({ id: `e${++sequence}`, sequence, time: new Date(Date.UTC(2026, 0, 1) + ms).toISOString(), type, ...fields });
@@ -256,4 +256,22 @@ test('program activity counts effects by site line and loops by header line', ()
   const review = programActivity(runOf(skills, 'review').events);
   assert.equal(review.lines.get(30).count, 40);
   assert.deepEqual([review.calls.get(80).count, review.calls.get(213).count, review.calls.get(199).count, review.loops.get(79).total], [36, 37, 1, 36]);
+});
+
+test('a failed run fails at its recorded line, else at its result span in the program source', () => {
+  const source = 'manifest {}\nfn main() {\n  10 / 0\n}\n';
+  const span = { source: 'src/main.allen', line: 3, column: 3, end_line: 3, end_column: 9 };
+  const failedAt = { line: 3, column: 3, end_line: 3, end_column: 9 };
+  assert.deepEqual(runFailure({ state: 'failed', source, failedAt, result: { outcome: 'failed', error: { code: 'arithmetic.division_by_zero', message: 'division by zero', span } } }),
+    { line: 3, column: 3, message: 'division by zero' });
+  // Sessions saved before failedAt: the trap's error span, or the span the kernel gives a host failure.
+  assert.deepEqual(runFailure({ state: 'failed', source, result: { error: { message: 'division by zero', span } } }), { line: 3, column: 3, message: 'division by zero' });
+  assert.deepEqual(runFailure({ state: 'failed', source, result: { error: 'Model judgment budget exhausted (16 per run)', span: { ...span, line: 2 } } }),
+    { line: 2, column: 3, message: 'Model judgment budget exhausted (16 per run)' });
+  // No line, a foreign source, a line past the end, or a run that did not fail: no position.
+  assert.equal(runFailure({ state: 'failed', source, result: { error: { message: 'x', span: { source: 'src/main.allen' } } } }), null);
+  assert.equal(runFailure({ state: 'failed', source, result: { error: { message: 'x', span: { ...span, source: 'std/list.allen' } } } }), null);
+  assert.equal(runFailure({ state: 'failed', source, result: { error: { message: 'x', span: { ...span, line: 40 } } } }), null);
+  for (const state of ['stopped', 'cancelled', 'interrupted']) assert.equal(runFailure({ state, source, failedAt, result: { error: { message: 'x', span } } }), null, state);
+  assert.equal(runFailure(null), null);
 });

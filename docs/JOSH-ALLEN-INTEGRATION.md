@@ -40,7 +40,7 @@ Approvals are not `user.ask`. They live in SHOUT's tool handlers: `workspace.edi
 
 ### Terminal states
 
-`completed` with the program's output; `stopped` from `stop("reason")`, shown as "`/name` stopped: reason"; `failed` for a runtime trap, a provider failure or a budget; `cancelled`; `interrupted` when JOSH exits unexpectedly. When the run ends the kernel closes stdin, sends SIGTERM and, after 300 ms, SIGKILL. Nothing about a run survives a server restart; unfinished runs are marked interrupted.
+`completed` with the program's output; `stopped` from `stop("reason")`, shown as "`/name` stopped: reason"; `failed` for a runtime trap, a provider failure or a budget, shown as "`/name` failed at line N: message" when the failure has a position in the program (a trap's `error.span`, or for a provider failure or budget the effect's `origin.site`, which the kernel adds to the result as `span`); `cancelled`; `interrupted` when JOSH exits unexpectedly. When the run ends the kernel closes stdin, sends SIGTERM and, after 300 ms, SIGKILL. Nothing about a run survives a server restart; unfinished runs are marked interrupted.
 
 ## What was wrong or awkward
 
@@ -63,7 +63,7 @@ Nine patches, applied by `tools/setup-josh.sh` onto `abb8a97` (46 files, about 6
 |---|---|---|
 | 0001 if-branch statement effects | The "effect sets are interned" panic | The `SHOUT007` workaround row left the authoring guide |
 | 0002 effect origin | Nothing told the host where an effect came from | Provider requests carry `origin`; `program/load` returns the static tables. Flow draws loops, branches and parallel tasks; the Program tab counts exact lines. Protocol `josh/1.7`, bytecode 20 |
-| 0003 runtime error spans | `error.span` was `null` | Traps carry source, byte span and line/column. SHOUT keeps it in the run result but does not show it yet |
+| 0003 runtime error spans | `error.span` was `null` | Traps carry source, byte span and line/column. SHOUT records the line as the run's `failedAt`, says "failed at line N" and links it to the Program tab |
 | 0004 loop control-branch joins | Loops ending in all-`break`/`continue` branches did not compile | The pattern works in skills |
 | 0005 constants with catalog tools | `const` failed beside tool calls | `skills/code.allen` uses a `const` again; the guide's workaround was removed |
 | 0006 idle provider wait | The busy loop | JOSH sleeps while requests are pending (50 µs growing to 10 ms) and josh-host wakes it on a response. An oversized or malformed frame closes the connection with a specific message on stderr |
@@ -158,7 +158,6 @@ Tests: `prototypes/owned/test/kernel.test.mjs` checks that origins, tables and d
 - **Coarse, hard-coded limits.** Every skill gets the same 16 judgments, 128 tool calls, 8 questions and 30 minutes; `/find` needs no judgments and a large refactor may need more.
 - **Record fields arrive in alphabetical order.** JOSH's response descriptor keeps a record's fields in a sorted map, so the ask form lists them by name, not in declaration order. Keeping the declared order needs a change to JOSH's schema descriptor.
 - **Worker failures fail the run, not the call.** Worker transport failures, timeouts and budgets fail the run on purpose: JOSH's recoverable form (`model.unavailable`) would hide the actionable message behind the program's own `Err` handling. Unusable answers are different: both workers report them so that JOSH asks again.
-- **Runtime error positions are dropped.** Since 0003 traps carry a span, but the failure message shows only the text.
 - **ALLEN programs cannot call agents.** The kernel rejects `agent/*`, `sub_agent/*` and `permission/request`; sub-agents exist only as the SHOUT agent's `spawn_agents` tool.
 - **Effect events cover tools only.** `execution/event` emits `effect_started/completed/failed` for tool calls; model, user and agent requests are visible only as provider requests.
 - **An untyped event contract.** Kernel events are plain objects spread into the session log; nothing checks their shape between kernel, session and UI. The effect `origin` shares its name with `user.answered`'s `origin` (who answered), which is confusing though they never meet on one event.
@@ -172,8 +171,7 @@ Effort figures are rough estimates for one person familiar with both codebases.
 2. **Resume from replay journals** (a week or more). Persist each run's journal, replay on restart, and define what happens to effects that were pending (an approval shown before the restart must be asked again; a half-applied write must not be repeated).
 3. **Per-skill limits** (about a day). Let a skill's manifest or header declare its judgment, tool, question and time budgets within server-wide ceilings.
 4. **Effect events for every provider** (1–2 days in JOSH). Emit `effect_*` events for model, user and agent requests, so the event log does not depend on the host's own bookkeeping.
-5. **Show runtime error positions** (hours). Put "failed at line N" in the failure message and link it to the Program tab.
-6. **Upstream the patches and bump the pin** (half a day plus review). Independent of the items above and worth doing early, since every further JOSH change otherwise adds another local patch. See below.
+5. **Upstream the patches and bump the pin** (half a day plus review). Independent of the items above and worth doing early, since every further JOSH change otherwise adds another local patch. See below.
 
 ## Regenerating and upstreaming the patches
 

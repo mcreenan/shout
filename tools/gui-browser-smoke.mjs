@@ -345,6 +345,29 @@ export async fn main(args: String) returns Pick effects [user.ask] {
   await ask.getByRole('button', { name: 'Submit' }).click();
   await page.waitForFunction(() => document.querySelector('#status-text').textContent.includes('completed'));
   assert.deepEqual(asking.data.runs.at(-1).result.output, { owner: { tag: 'Some', value: 'Ada' }, shape: { tag: 'Line', value: [7, 'seven'] }, ratio: 0.5, counts: [['a', 1], ['b', 2]] });
+  // A run that traps says where: "failed at line 3" on its card opens the Program tab with that row marked.
+  const trapProject = resolve(stateRoot, 'trap-project');
+  await mkdir(resolve(trapProject, '.shout', 'skills'), { recursive: true });
+  await writeFile(resolve(trapProject, '.shout', 'skills', 'divide.allen'), `manifest { language: "0.1" entry: main capabilities: [] }
+export fn main(args: String) returns Int {
+  10 / length(args)
+}
+`);
+  const trapping = await app.store.create({ workspace: trapProject });
+  app.store.send(trapping.data.id, '/divide'); await trapping.task;
+  await page.goto(`${app.url}/#${trapping.data.id}`);
+  await page.reload();
+  if (await page.getByRole('radio', { name: 'Chat' }).getAttribute('aria-checked') !== 'true') await page.getByRole('radio', { name: 'Chat' }).click();
+  assert.match(await page.locator('#messages .message').last().innerText(), /failed at line 3: division by zero/);
+  await page.locator('.run-card').getByRole('button', { name: 'failed at line 3' }).click();
+  const failedRow = page.locator('#dock .program-view .code-line.error-line');
+  await failedRow.waitFor();
+  assert.equal(await failedRow.count(), 1);
+  assert.equal(await failedRow.locator('.ln').innerText(), '3');
+  assert.equal(await failedRow.locator('.error-inlay').innerText(), 'division by zero');
+  await page.screenshot({ path: resolve(screenshotDir, 'session-failed-line.png') });
+  await page.getByRole('tab', { name: 'Chat' }).click();
+  assert.ok(await page.locator('#messages .message').last().getByRole('button', { name: 'Open the program at line 3' }).isVisible());
   await page.setViewportSize({ width: 390, height: 844 }); await page.reload();
   await page.getByRole('button', { name: 'Toggle sidebar' }).click();
   await page.locator('#sidebar .sb-thread').first().waitFor();
